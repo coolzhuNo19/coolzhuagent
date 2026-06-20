@@ -1,0 +1,27 @@
+[
+  {
+    "content": "规划论坛网站架构和技术选型",
+    "activeForm": "规划论坛网站架构",
+    "status": "in_progress"
+  },
+  {
+    "content": "创建项目结构和基础文件",
+    "activeForm": "创建项目结构",
+    "status": "pending"
+  },
+  {
+    "content": "实现论坛核心功能（帖子列表、发帖、详情页）",
+    "activeForm": "实现论坛核心功能",
+    "status": "pending"
+  },
+  {
+    "content": "添加 coolzhu agent 主题样式",
+    "activeForm": "添加主题样式",
+    "status": "pending"
+  },
+  {
+    "content": "配置本地部署并验证功能",
+    "activeForm": "配置本地部署并验证",
+    "status": "pending"
+  }
+]

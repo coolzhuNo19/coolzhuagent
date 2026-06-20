@@ -1,0 +1,41 @@
+# Rust 构建产物（GB 级）
+/target/
+**/target/
+
+# 发布包（二进制，GB 级）
+/package/
+
+# 临时脚本 / 日志 / 备份 / 分析中间产物
+/tmp/
+
+# E2E / Playwright 输出
+/output/
+
+# 大模型权重
+/models/
+**/*.pth
+**/*.gguf
+**/*.onnx
+**/*.safetensors
+
+# 运行期会话 / 数据存储
+**/*.sqlite3
+**/*.sqlite3-wal
+**/*.sqlite3-shm
+.coolzhu/web-sessions.json
+.coolzhu/ide-index/
+
+# 各 module 有独立 git 仓，根仓不重复跟踪
+/modules/
+
+# 依赖 / 工具缓存 / 测试输出 / 运行期数据
+node_modules/
+.playwright-cli/
+test-results/
+goal-artifacts/
+.coolzhu/
+
+# OS / 编辑器
+Thumbs.db
+.DS_Store
+*.pdb

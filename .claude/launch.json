@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web-console",
+      "runtimeExecutable": "C:\\Users\\zhupu\\Desktop\\codex\\target\\debug\\coolzhu-web-console.exe",
+      "runtimeArgs": [],
+      "port": 8765,
+      "autoPort": false
+    }
+  ]
+}
