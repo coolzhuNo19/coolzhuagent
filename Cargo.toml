@@ -23,6 +23,7 @@ members = [
     "modules/gui-desktop/packages/desktop-console",
     "modules/cli/packages/command-line",
     "modules/diagnostics/packages/diagnostics",
+    "packages/app-launcher",
     ".coolzhu/plugins/coolzhu-tdd-runner",
     ".coolzhu/plugins/coolzhu-git-workflow",
     ".coolzhu/plugins/coolzhu-code-review",

@@ -71,9 +71,24 @@
         "args": ["build", "--manifest-path", "modules/gui-desktop/packages/tauri-shell/src-tauri/Cargo.toml", "--bin", "coolzhu-tauri-shell", "--offline", "--target-dir", "modules/gui-desktop/target/tauri-shell"],
         "working_dir": "."
       }
+    },
+    {
+      "id": "package.app-launcher",
+      "source": "target/{profile}/COOLZHU-AGENT.exe",
+      "target": "COOLZHU-AGENT.exe",
+      "build": {
+        "command": "cargo",
+        "args": ["build", "-p", "coolzhu-app-launcher", "--bin", "COOLZHU-AGENT", "--offline"],
+        "working_dir": "."
+      }
     }
   ],
   "resources": [
+    {
+      "id": "package.launcher-config",
+      "source": "config",
+      "target": "config"
+    },
     {
       "id": "gui-web.tools",
       "source": "modules/gui-web/packages/web-console/tools",

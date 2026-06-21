@@ -767,6 +767,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "coolzhu-app-launcher"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "coolzhu-code-review"
 version = "0.1.0"
 
