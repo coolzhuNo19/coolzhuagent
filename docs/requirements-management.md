@@ -2,7 +2,7 @@
 
 项目名称：COOLZHU AGENT  
 版本：v0.2  
-更新日期：2026-05-22  
+更新日期：2026-06-25
 维护范围：`C:\Users\zhupu\Desktop\codex`
 
 ## 管理规则
@@ -179,7 +179,7 @@
 | REQ-WEB-OFFICE-001 | 折叠态 3D 像素 robot 办公室 | UI/API | P0 | 测试中 | 所有窗口折叠后，下部分展开区域显示 imagegen 生成的马里奥风格 FC 像素办公室背景；robot 不烘焙进背景，由前端可控层按 `/api/office/scene` 状态渲染 agent/tool/memory/chat worker；robot 形象使用 imagegen 生成动作帧 sprite sheet，状态包含 idle/active/waiting/warning/archiving/chatting；无角色眼睛朝向、裁切或错位问题 | 2026-05-18 完成二次视觉修订：生成透明 `office-robot-sprites.png` 动作帧图并替换 CSS 拼装 robot；随后按 alpha bbox 裁剪角色视窗并以可见脚底为锚点，修复脚不着地；自动验证通过，Edge CDP 截图 `tmp/web-ui-office-scene-1920x1080.png` 通过 |
 | REQ-WEB-WIN-001 | 工程目录 / IDE 独立窗口 | UI/API | P0 | 测试中 | 文件树可展开，文件预览支持文本分页/二进制保护，Diff View 支持 worktree/staged/head 只读查看，workspace 切换后清空选中文件状态 | 2026-06-19 V3 Batch 2：搜索、Diff、刷新和差异参数收敛到左侧命令栏；选择文件自动预览并删除重复 Preview 动作；右侧改为全高内容/Diff 区。Computer Use 已在 packaged Tauri 中验证布局 |
 | REQ-WEB-WIN-002 | 设置独立窗口 | UI/API | P0 | 测试中 | 会话/模型/Custom provider/视觉 Agent/TTS-STT/工具目录分区清晰；工具与审批栏默认按设计图显示本地模型、CLI、MCP、Skill、compute-use、Semantic Dispatch 六行状态清单，旧详情仅在“管理/启用/计划配置”后按需展开；工具调用状态以红/绿/灰状态灯表达，聊天流不展示工具调用细节 | 前端窗口首版已接现有会话、工具、音频和视觉 Agent 配置；2026-05-18 工具区补齐 `/api/tools/{tool_id}` 详情、`/api/tools/dispatch` 语义派发 dry-run 和场景/权限矩阵；2026-06-20 工具与审批栏完成设计图对齐，保留真实目录与语义派发能力但默认折叠详细控制区，Computer Use 已验证管理面板展开/收起与计划配置切换 |
-| REQ-WEB-WIN-003 | 聊天室独立窗口 | UI | P0 | 测试中 | 左侧会话栏紧凑有界，主消息流优先占据可视区，底部输入区固定且高度约 10%；引用/附件/手工转交入口不遮挡消息流；不得重复显示“Communication Bay”或“通讯发射台”等页内标题 | 2026-06-19 V3 Batch 2：左栏按聊天室、频道/模型、接收者、紧凑会话操作重排；composer 收紧为 62~76px；删除重复标题和说明条。Computer Use 已在 packaged Tauri 中验证真实聊天记录与输入区布局 |
+| REQ-WEB-WIN-003 | 聊天室独立窗口 | UI | P0 | 测试中 | 左侧会话栏紧凑有界，主消息流优先占据可视区，底部输入区固定且高度约 10%；引用/附件/手工转交入口不遮挡消息流；不得重复显示“Communication Bay”或“通讯发射台”等页内标题；发送对象按 workspace + 聊天室持久化，重开 Web Console 不得被当前激活会话覆盖 | 2026-06-19 V3 Batch 2：左栏按聊天室、频道/模型、接收者、紧凑会话操作重排；composer 收紧为 62~76px；删除重复标题和说明条。2026-06-25 修复发送对象启动时被 GLM5.2 重置：有效持久值优先，当前激活会话仅作无持久值时的回退；待 Windows 重启后人工确认 |
 | REQ-WEB-WIN-004 | 任务 / 授权 / Goals 独立窗口 | UI/API | P0 | 测试中 | 三列呈现待审批/定时任务、默认与外部目录/full access 权限配置、真实模块自检；full access 必须显示会话级时效与撤销口径；模块状态不得使用静态假数据 | 2026-06-19 V3 Batch 2：诊断 health/check/suggestions 已迁入模块自检列，日志窗口保留审计与 tail；Computer Use 实测自检为 `WARN / ok 10 / warn 1 / error 0`，full access 文案与后端 TTL 保持一致。2026-06-20 Round3：按批准设计图重构任务授权窗口，左侧待审批+Goal，中间授权配置，右侧模块自检；模块自检映射 Web Console/Desktop Pet/Local Model/Vision/TTS-STT/MCP/Plugin/Packaging/Logs 九行真实 health checks，隐藏旧 suggestions/self-update 首屏文本，Computer Use 已在 packaged Tauri 中点击验证。 |
 | REQ-WEB-WIN-005 | 记忆 / 知识独立窗口 | UI/API | P1 | 测试中 | beads 支持检索、kind/layer/pinned/source 筛选、详情、来源追踪、pin/edit/delete 操作；窗口显示 summary、prompt preview、context preview，并保证当前 session/workspace 边界一致 | 2026-05-18 已接入真实 `/beads/summary`、`/beads/prompt`、`/context-preview`，详情区补齐 pin/edit/delete 治理动作；自动验证与 Edge CDP 截图 `tmp/web-ui-memory-window-1920x1080.png` 通过，待人工确认视觉与交互手感 |
 | REQ-WEB-WIN-006 | 多媒体播放器独立窗口 | UI/API | P1 | 测试中 | 基于附件索引展示图片/音频/视频媒体库，支持预览播放和前端播放列表 | 前端首版完成：附件媒体库、类型过滤、Now Playing、播放列表；不做视频理解/关键帧 VLM 首版 |
@@ -413,6 +413,7 @@
 
 | 日期 | 变更 | 内容 |
 | --- | --- | --- |
+| 2026-06-25 | 修复 | `REQ-WEB-WIN-003` Web Console 发送对象持久化：定位到 `/api/agents.active_agent_ids` 被前端每次加载当作已选接收者，导致当前激活的 GLM5.2 覆盖用户选择；新增按 workspace + chat room 隔离的 localStorage 状态，恢复时过滤已删除/不可选 Agent，仅在没有有效持久值时回退当前激活会话或首个可选 Agent；新增回归契约，Web Console 全量 541 tests、Node 语法、格式、cargo check 与 package all 均通过，人工视觉/重启验证待用户执行。 |
 | 2026-06-20 | 更新 | `REQ-WEB-WIN-004` 任务授权窗口按批准设计图完成三栏重构：待审批与 Goal 保留左栏，workspace/外目录授权/Full access 收敛到中栏，真实模块自检进入右栏；新增武侠玻璃风格模块 icon、状态灯、授权模式卡片和模块行布局契约，修复模块自检列表被旧 suggestions/self-update 文本挤占以及“重试”按钮换行问题；package all 完成，并使用 Computer Use 在 packaged Tauri 中点击验证。 |
 | 2026-06-20 | 更新 | `REQ-WEB-WIN-002` 设置窗口工具与审批栏按批准设计图重构：默认呈现本地模型、CLI、MCP、Skill、compute-use、Semantic Dispatch 六行状态清单，详细目录、模型控制、语义派发和审计能力改为按需展开；新增武侠风格工具图标与布局契约测试，117 项前端契约通过，package all 完成，并使用 Computer Use 在 packaged Tauri 中真实点击验证管理面板与计划配置。 |
 | 2026-05-22 | 更新 | MSVC linker 修复后完成四大核心链路回归：最新 Web Console 构建通过；真实会话链路、工具 HTTP 实操、真实 LLM 多 tool_use、Goal API 最小协同均 PASS；compute-use/grounding 接口和真实输入预置 PASS，键鼠视觉命中项保留 CHECK 等人工录屏确认。`REQ-GOAL-010` 更新为测试中，`REQ-GOAL-006` 记录 API 级最小协同回归证据。 |
