@@ -10,6 +10,7 @@
 //! [`LaunchSpawner`] and the closures passed to [`launch`], so the full bring-up
 //! sequence is unit-testable without spawning real processes.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -27,6 +28,58 @@ pub enum ProbeOutcome {
     NotReady,
     /// Probe failed transiently (e.g. connection refused); keep polling.
     Transient,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerOwner {
+    pub pid: u32,
+    pub alive: bool,
+    pub process_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenerRecoveryAction {
+    Free,
+    CleanupOrphan {
+        parent_pid: u32,
+    },
+    CleanupKnownHolder {
+        pid: u32,
+    },
+    Block {
+        pid: u32,
+        process_name: Option<String>,
+    },
+}
+
+pub fn classify_listener_recovery(
+    health_ready: bool,
+    owner: Option<&ListenerOwner>,
+) -> ListenerRecoveryAction {
+    let Some(owner) = owner else {
+        return ListenerRecoveryAction::Free;
+    };
+    if !owner.alive {
+        return ListenerRecoveryAction::CleanupOrphan {
+            parent_pid: owner.pid,
+        };
+    }
+    let known_holder = owner
+        .process_name
+        .as_deref()
+        .map(|name| {
+            let normalized = name.to_ascii_lowercase();
+            normalized == "llama-server.exe" || normalized == "conhost.exe"
+        })
+        .unwrap_or(false);
+    if !health_ready && known_holder {
+        ListenerRecoveryAction::CleanupKnownHolder { pid: owner.pid }
+    } else {
+        ListenerRecoveryAction::Block {
+            pid: owner.pid,
+            process_name: owner.process_name.clone(),
+        }
+    }
 }
 
 /// Errors surfaced when the launcher cannot bring the package online.
@@ -101,11 +154,28 @@ impl LauncherConfig {
     /// Parse from raw JSON text, resolving relative paths against `config_dir`
     /// (the directory that contains `package-launcher.json`).
     pub fn from_json(text: &str, config_dir: &Path) -> Result<Self, LaunchError> {
+        Self::from_json_with_env(text, config_dir, |name| std::env::var_os(name))
+    }
+
+    /// Parse from raw JSON text with an injectable OS environment lookup.
+    ///
+    /// Environment expansion is limited to OS-provided path placeholders such as
+    /// `%LOCALAPPDATA%` so packaged installs can write logs outside
+    /// `Program Files`; business switches still come from the config file.
+    pub fn from_json_with_env<F>(
+        text: &str,
+        config_dir: &Path,
+        mut env_lookup: F,
+    ) -> Result<Self, LaunchError>
+    where
+        F: FnMut(&str) -> Option<OsString>,
+    {
         let value: Value = serde_json::from_str(text)
             .map_err(|e| LaunchError::ConfigInvalid(format!("invalid JSON: {e}")))?;
 
-        let web_console = Self::parse_executable(&value, "web_console", config_dir)?;
-        let tauri = Self::parse_executable(&value, "tauri", config_dir)?;
+        let web_console =
+            Self::parse_executable(&value, "web_console", config_dir, &mut env_lookup)?;
+        let tauri = Self::parse_executable(&value, "tauri", config_dir, &mut env_lookup)?;
         let health_url = value
             .get("health_url")
             .and_then(|v| v.as_str())
@@ -119,7 +189,7 @@ impl LauncherConfig {
             .get("health_poll_interval_ms")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| LaunchError::ConfigInvalid("missing health_poll_interval_ms".into()))?;
-        let log_dir = Self::parse_path(&value, "log_dir", config_dir)?;
+        let log_dir = Self::parse_path(&value, "log_dir", config_dir, &mut env_lookup)?;
         let selfcheck_file = log_dir.join("package-selfcheck-last.json");
 
         Ok(Self {
@@ -137,6 +207,7 @@ impl LauncherConfig {
         value: &Value,
         role: &'static str,
         config_dir: &Path,
+        env_lookup: &mut dyn FnMut(&str) -> Option<OsString>,
     ) -> Result<ExecutableSpec, LaunchError> {
         let entry = value
             .get(role)
@@ -145,7 +216,7 @@ impl LauncherConfig {
             .get("executable")
             .and_then(|v| v.as_str())
             .ok_or_else(|| LaunchError::ConfigInvalid(format!("missing {role}.executable")))?;
-        let path = resolve_config_relative(Path::new(exec_str), config_dir);
+        let path = resolve_config_path_text(exec_str, config_dir, env_lookup)?;
         let args = entry
             .get("args")
             .and_then(|v| v.as_array())
@@ -158,13 +229,60 @@ impl LauncherConfig {
         Ok(ExecutableSpec { path, args })
     }
 
-    fn parse_path(value: &Value, key: &str, config_dir: &Path) -> Result<PathBuf, LaunchError> {
+    fn parse_path(
+        value: &Value,
+        key: &str,
+        config_dir: &Path,
+        env_lookup: &mut dyn FnMut(&str) -> Option<OsString>,
+    ) -> Result<PathBuf, LaunchError> {
         let s = value
             .get(key)
             .and_then(|v| v.as_str())
             .ok_or_else(|| LaunchError::ConfigInvalid(format!("missing {key}")))?;
-        Ok(resolve_config_relative(Path::new(s), config_dir))
+        resolve_config_path_text(s, config_dir, env_lookup)
     }
+}
+
+fn resolve_config_path_text(
+    raw_path: &str,
+    config_dir: &Path,
+    env_lookup: &mut dyn FnMut(&str) -> Option<OsString>,
+) -> Result<PathBuf, LaunchError> {
+    let expanded = expand_os_env_placeholders(raw_path, env_lookup)?;
+    Ok(resolve_config_relative(Path::new(&expanded), config_dir))
+}
+
+fn expand_os_env_placeholders(
+    raw: &str,
+    env_lookup: &mut dyn FnMut(&str) -> Option<OsString>,
+) -> Result<String, LaunchError> {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('%') else {
+            out.push('%');
+            out.push_str(after_start);
+            return Ok(out);
+        };
+        let name = &after_start[..end];
+        if name.is_empty() {
+            out.push_str("%%");
+        } else {
+            let value = env_lookup(name).ok_or_else(|| {
+                LaunchError::ConfigInvalid(format!(
+                    "environment variable %{name}% not set for configured path"
+                ))
+            })?;
+            out.push_str(&value.to_string_lossy());
+        }
+        rest = &after_start[end + 1..];
+    }
+
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Resolve a path from the launcher config.
@@ -275,7 +393,12 @@ pub trait LaunchSpawner {
     ) -> Result<u32, LaunchError>;
     /// Spawn the Tauri shell with the given (already pid-injected) args.
     /// Returns the spawned child PID.
-    fn spawn_tauri(&mut self, spec: &ExecutableSpec, args: &[String]) -> Result<u32, LaunchError>;
+    fn spawn_tauri(
+        &mut self,
+        spec: &ExecutableSpec,
+        args: &[String],
+        log_file: &Path,
+    ) -> Result<u32, LaunchError>;
 }
 
 /// Result of a successful bring-up.
@@ -345,7 +468,8 @@ where
     }
 
     let tauri_args = build_tauri_args(web_pid, &config.tauri.args);
-    let tauri_pid = match spawner.spawn_tauri(&config.tauri, &tauri_args) {
+    let tauri_log_file = config.log_dir.join("tauri.stdout.log");
+    let tauri_pid = match spawner.spawn_tauri(&config.tauri, &tauri_args, &tauri_log_file) {
         Ok(pid) => pid,
         Err(e) => {
             let payload = SelfcheckPayload {
@@ -424,6 +548,10 @@ fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
     Some((host, port, path.to_string()))
 }
 
+pub fn health_endpoint_port(url: &str) -> Option<u16> {
+    parse_http_url(url).map(|(_, port, _)| port)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +627,33 @@ mod tests {
         assert_eq!(cfg.web_console.path, PathBuf::from("C:/abs/web.exe"));
         assert_eq!(cfg.tauri.path, PathBuf::from("C:/abs/tauri.exe"));
         assert_eq!(cfg.log_dir, PathBuf::from("C:/abs/logs"));
+    }
+
+    #[test]
+    fn expands_os_env_placeholders_before_resolving_config_paths() {
+        let config_dir = Path::new("C:/repo/package/config");
+        let cfg_text = r#"{
+            "web_console": {"executable": "../bin/coolzhu-web-console.exe", "args": []},
+            "tauri": {"executable": "../bin/coolzhu-tauri-shell.exe", "args": []},
+            "health_url": "http://127.0.0.1:1/health",
+            "health_timeout_secs": 1,
+            "health_poll_interval_ms": 1,
+            "log_dir": "%LOCALAPPDATA%/CoolzhuAgent/logs/package-launcher"
+        }"#;
+
+        let cfg = LauncherConfig::from_json_with_env(cfg_text, config_dir, |name| {
+            (name == "LOCALAPPDATA").then(|| std::ffi::OsString::from("C:/Users/me/AppData/Local"))
+        })
+        .unwrap();
+
+        assert_eq!(
+            cfg.log_dir,
+            PathBuf::from("C:/Users/me/AppData/Local/CoolzhuAgent/logs/package-launcher")
+        );
+        assert_eq!(
+            cfg.selfcheck_file,
+            cfg.log_dir.join("package-selfcheck-last.json")
+        );
     }
 
     #[test]
@@ -640,6 +795,7 @@ mod tests {
         web_calls: u32,
         tauri_calls: u32,
         last_tauri_args: Vec<String>,
+        last_tauri_log: Option<PathBuf>,
     }
 
     impl FakeSpawner {
@@ -650,6 +806,7 @@ mod tests {
                 web_calls: 0,
                 tauri_calls: 0,
                 last_tauri_args: Vec::new(),
+                last_tauri_log: None,
             }
         }
     }
@@ -667,9 +824,11 @@ mod tests {
             &mut self,
             _spec: &ExecutableSpec,
             args: &[String],
+            log_file: &Path,
         ) -> Result<u32, LaunchError> {
             self.tauri_calls += 1;
             self.last_tauri_args = args.to_vec();
+            self.last_tauri_log = Some(log_file.to_path_buf());
             Ok(self.tauri_pid)
         }
     }
@@ -779,6 +938,10 @@ mod tests {
             spawner.last_tauri_args,
             vec!["--web-console-pid=111".to_string(), "--ui=foo".to_string()]
         );
+        assert_eq!(
+            spawner.last_tauri_log,
+            Some(cfg.log_dir.join("tauri.stdout.log"))
+        );
 
         let v: Value =
             serde_json::from_str(&fs::read_to_string(&cfg.selfcheck_file).unwrap()).unwrap();
@@ -840,5 +1003,36 @@ mod tests {
     fn parse_http_url_rejects_non_http() {
         assert!(parse_http_url("https://x").is_none());
         assert!(parse_http_url("not a url").is_none());
+    }
+
+    #[test]
+    fn stale_listener_owner_requests_orphan_cleanup() {
+        let owner = ListenerOwner {
+            pid: 17300,
+            alive: false,
+            process_name: None,
+        };
+
+        assert_eq!(
+            classify_listener_recovery(false, Some(&owner)),
+            ListenerRecoveryAction::CleanupOrphan { parent_pid: 17300 }
+        );
+    }
+
+    #[test]
+    fn live_listener_owner_is_never_killed_as_a_ghost() {
+        let owner = ListenerOwner {
+            pid: 8188,
+            alive: true,
+            process_name: Some("coolzhu-web-console.exe".into()),
+        };
+
+        assert_eq!(
+            classify_listener_recovery(false, Some(&owner)),
+            ListenerRecoveryAction::Block {
+                pid: 8188,
+                process_name: Some("coolzhu-web-console.exe".into()),
+            }
+        );
     }
 }
