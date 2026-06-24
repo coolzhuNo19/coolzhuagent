@@ -200,9 +200,9 @@
 | REQ-WEB-CTX-001 | LLM 历史上下文装配 | 聊天室/上下文 | P1 | 已完成 | LLM 请求能装配 system、相关 beads、最近历史、当前 user turn，并提供 context preview 与 token 预算 | 2026-05-15 完成：新增 `ContextAssembly/ContextBuildOptions/ContextTokenBudget`，非流式、流式和 tool-loop LLM 请求均使用聊天室历史窗口 + 相关 beads + 当前 user turn；新增 `/api/sessions/{session_id}/context-preview`；`coolzhu-web-console` 全量通过 |
 | REQ-WEB-MEDIA-001 | 多媒体消息展示 | 多媒体 | P1 | 已完成 | 图片、视频、音频、文档、链接可在消息中预览 | 当前以 URL/附件元数据为主 |
 | REQ-WEB-MEDIA-002 | 附件索引 API | 多媒体 | P1 | 已完成 | 房间级和全局附件索引可按类型过滤 | 已有 `/api/attachments/index` |
-| REQ-WEB-MEDIA-003 | 富文本输入与上传 | 多媒体 | P1 | 已完成 | 支持 Markdown、粘贴图片、文件上传、草稿恢复 | Markdown 展示、聊天室草稿、文件选择、剪贴板图片粘贴、发送前上传为持久化附件 URL 均已落地 |
+| REQ-WEB-MEDIA-003 | 富文本输入与上传 | 多媒体 | P1 | 已完成 | 支持 Markdown、粘贴图片、文件上传、草稿恢复；大文件在配置上限内不得被框架默认 body limit 提前拒绝 | 2026-06-24 修复 Axum multipart 默认 2 MiB 限制：路由 body limit 跟随 `[attachment].max_upload_bytes`，3 MiB 实际上传成功，超 32 MiB 业务上限返回 413 |
 | REQ-WEB-MEDIA-004 | 富媒体消息点击与选中解冲突 | 多媒体 | P1 | 已完成 | 链接、图片、视频可点击/播放；点击交互控件不触发消息选中 | 用户已确认富文本内容显示正常 |
-| REQ-WEB-MEDIA-005 | 消息发送文件按钮 | 多媒体 | P1 | 已完成 | 消息发送卡片提供文件选择按钮，选中文件可作为附件随消息发送并进入附件索引 | 多文件选择、附件 chip、`.coolzhu/attachments` 二进制持久化、稳定 `/api/attachments/files/*` URL 与附件索引链路已完成 |
+| REQ-WEB-MEDIA-005 | 消息发送文件按钮 | 多媒体 | P1 | 已完成 | 消息发送卡片提供文件选择按钮，选中文件可作为附件随消息发送并进入附件索引；上传上限由 config 管理 | 2026-06-24 与 `REQ-WEB-MEDIA-003` 同源修复；实际 multipart 上传和附件索引链路通过，前端视觉由用户人工确认 |
 | REQ-WEB-MEDIA-006 | 聊天室音频富文本播放 | 多媒体 | P1 | 已完成 | Markdown/URL/附件中的 mp3、wav、ogg、webm 音频可显示 `<audio controls>` 并不触发消息选中 | 已补 Markdown/裸 URL inline audio control、附件音频预览和点击排除，自动化验证通过 |
 | REQ-WEB-PROJECT-001 | 工程目录路径切换 | 工程管理 | P1 | 已完成 | 工程目录卡片可设置 workspace，刷新目录树；工具执行、记忆、聊天室数据按 workspace 边界隔离 | 已补 `/api/workspace`、allowed roots、双击路径编辑、目录刷新和稳定 `workspace_id`；SQLite 数据跟随 workspace 路径切换 |
 | REQ-WEB-PROJECT-002 | 默认 workspace 与当前聊天室环境隔离 | 工程管理/权限 | P0 | 已完成 | 默认 workspace 为 `C:\Users\<用户名>\coolzhuagent`；用户设置路径后当前聊天室内容、环境和 Agent 默认文件读写权限限制在该路径 | 已补默认目录创建、用户目录内 workspace 设置与 `core.read_file/glob_search/grep_search` 路径边界测试；SQLite 会话/聊天室/bead 数据均随 workspace 切换 |
@@ -330,7 +330,7 @@
 | REQ-DESK-PET-003 | GUI Desktop | 桌宠状态联动 | 桌宠 | P1 | 测试中 | 聊天发送、推理、工具执行成功/失败可驱动桌宠状态 | Web 后端新增 `/api/pet/state`、`/api/pet/event`、`/api/pet/events`；非流式/流式聊天、推理开始、工具执行 Ok/DryRun/Rejected/Failed/Timeout 均映射桌宠状态并触发 Tauri `--pet-state/--pet-message` 单实例命令；待真实桌宠窗口交互验收 |
 | REQ-DESK-PET-004 | GUI Desktop | 桌宠气泡回复 | 桌宠 | P1 | 已完成 | idle/thinking/sleeping/success/warning 状态可显示短气泡 | 2026-05-07 用户复测通过：只显示一个有效气泡，无右侧空白气泡 |
 | REQ-DESK-PET-005 | GUI Desktop | 桌宠动作帧画布与中心锚点一致 | 桌宠 | P0 | 开发中 | idle/blink/thinking/sleeping/warning/success 切换时画布尺寸一致，主体水平居中、底部锚点稳定，不出现跳动或裁切 | 2026-06-18 用户反馈 blink 仍缩小；审计确认活动六帧主体约小 5%、脸部约小 9%，现有测试缺少与 idle 的跨状态尺度断言 |
-| REQ-WEB-LOCAL-MODEL-001 | GUI Web / Vision | 设置窗口本地模型服务切换 | 本地模型 | P0 | 开发中 | Gemma、UI-DETR/ShowUI、全部关闭按钮能进入后端；启动中、ready、degraded、失败均可见；错误不得静默 | 2026-06-18 根因确认：POST 缺少 JSON Content-Type 导致 Axum 415，前端 catch 又吞掉错误；同时补状态语义与有限轮询 |
+| REQ-WEB-LOCAL-MODEL-001 | GUI Web / Vision | 设置窗口本地模型服务切换 | 本地模型 | P0 | 测试中 | Gemma、UI-DETR/ShowUI、全部关闭按钮能进入后端；启动中、ready、degraded、失败均可见；错误不得静默；本地会话预算必须服从服务实际上下文 | 2026-06-24 已修复 45,682 tokens 超出 llama-server `n_ctx=8192`：本地预算强制服从 config，输出限制 2048，小上下文禁用工具，否定式搜索不再误注入工具；真实聊天室返回 `LOCAL_CHAIN_OK`，待用户人工确认前端视觉与切换交互 |
 | REQ-DESK-GUI-001 | GUI Desktop | GUI 主线收敛 | 架构 | P1 | 待开发 | 明确保留 Web GUI + Tauri shell，或证明 desktop-console 已 API 同构 | 推荐不保留两套 GUI；将纳入 `REQ-WEB-UI-010` 布局重构评估 |
 | REQ-DESK-INSTALL-001 | GUI Desktop | Tauri shell 随包安装 | 打包 | P1 | 冻结 | 安装后 Web 后端能找到 Tauri shell 路径并拉起桌宠 | 随打包迁移整体冻结 |
 
@@ -592,3 +592,4 @@
 | 2026-06-18 | 新增 | 用户批准桌宠 blink 尺度、本地模型切换、会话协议和 Agent Reach 推荐整改方案；`REQ-DESK-PET-005` 与 `REQ-LLM-005` 回到开发中，新增 `REQ-WEB-LOCAL-MODEL-001`、`REQ-LLM-006`、`REQ-TOOL-016`；设计文档写入 `docs/superpowers/specs/2026-06-18-pet-local-model-session-protocol-agent-reach-design.md` |
 | 2026-06-18 | 调整 | 用户要求 blink 禁止拉伸，必要时用 Image Gen 参考原图按 idle 尺度重生成；设置窗口扩展为全控件、工具详情和 TTS/STT 链路审计，前端设置参数统一迁入 `coolzhu.toml`，移除隐藏环境变量/global gate；功能验收必须通过 computer-use 操作真实前端；会话协议改采用方案 C 定向架构根治，高风险修改前备份完整源码目录 |
 | 2026-06-19 | 更新 | UI Redesign V3 Batch 2 纳入并完成总览卡、任务卡、聊天室三项主设计目标，同时重排工程目录、浏览器、终端、任务授权和视觉实验；新增静态布局契约并通过 103 项目标测试、package all、HTTP 200 启动和 Computer Use packaged Tauri 前端复验；详细记录见 `docs/work-logs/2026-06-19-ui-redesign-v3-batch2.md` |
+| 2026-06-24 | 修复 | 修复大附件与本地模型会话链路：附件上传路由解除 Axum 默认 2 MiB multipart 限制并改由 `[attachment].max_upload_bytes` 管理；本地模型启动、健康检查、context/output/tool budget 统一服从 `[model]` 配置，否定式搜索不再误开工具；3 MiB 实际上传、540 项串行测试和真实聊天室 `LOCAL_CHAIN_OK` 通过。按用户要求本轮不使用 computer-use，视觉与前端交互改由用户人工确认 |
