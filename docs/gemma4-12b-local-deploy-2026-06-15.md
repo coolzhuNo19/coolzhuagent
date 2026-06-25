@@ -56,7 +56,11 @@ Q4_K_M 权重 7.38 GB > 7.1 GB 空闲 → **不能全量 offload**，须部分�
   - `-ngl 36`：余量仅 157M、warmup 卡死/不可用。**33 是 8GB + 视觉的安全上限**。
 - 不带视觉（去掉 `--mmproj`）可再多放几层（省 ~600M）；换 **Q3_K_M**（6 GB）可 `-ngl 40+` 更快。
 - 调参后看启动日志 `offloaded N/M layers` + `nvidia-smi`，留 ≥400M 余量防 OOM。
-- 上下文 `-c`：8 GB 下建议 4096；KV cache 占显存，调大需相应降 `-ngl`。
+- 模型架构上限与运行上限必须分开理解：Gemma 4 **12B/27B 官方上下文为 256K（262,144 tokens）**，128K 是 E2B/E4B 档；这不代表 8 GB 显存机器适合直接运行 256K。
+- 2026-06-25 本机综合验证采用：`-c 16384 -np 1 --reasoning-budget 1024 -ngl 24`，`max_output_tokens=4096`。该组合在 RTX 3070 Ti Laptop 8 GB + 16 GB RAM 上保留单槽 KV cache，并为最终正文保留约 3K 输出空间。
+- 旧 8K 配置属于硬件保守运行值，不是模型能力上限。旧日志曾出现 `7845 prompt + 347 completion = 8192`、`truncated=1`，因此提升到 16K，并增加 1024 token 协议安全余量和自动上下文压缩。
+- 当前实测 GPU 占用约 6032/8192 MiB；Q4_K_M 仍是 GPU/CPU 混合卸载，不应误判为纯内存推理。
+- 官方依据：[Google Gemma 4 model card](https://ai.google.dev/gemma/docs/core/model_card_4)、[Google Gemma 4 12B README](https://huggingface.co/google/gemma-4-12B/blob/main/README.md)。
 
 ## 6. 接入 coolzhu
 

@@ -109,3 +109,10 @@ cargo test -p <package-name> --offline
 - 新增模块 probe 时优先复用统一自检报告结构：`id/status/detail`，`status` 只允许 `ok/warn/error`；阻断启动的条件必须在方案或 work-log 里说明。
 - 结构化 err 日志最低字段为 `event/module/level/err_kind/message/code_site/trace_id`；用户可见功能失败还应记录对应 API、配置项或前端动作来源。
 - 启动脚本不得新增业务环境变量。当前 package 启动器设置 `COOLZHU_LOG_DIR` 仅作为历史 diagnostics 输出目录的 one-shot 兼容入口；新增业务配置必须进入 `coolzhu.toml`。
+
+## 本地模型容量与 Provider 边界规范（2026-06-25 新增）
+
+- 必须区分“模型架构最大上下文”和“当前硬件安全运行上下文”。不得把模型卡的最大值直接写入启动参数；运行值应结合显存、内存、量化、KV cache、并发槽位和目标输出长度确定，并由 `coolzhu.toml` 配置。
+- 本地模型必须为最终回复预留独立输出空间。支持 thinking 的模型还应限制思考预算，禁止让 `reasoning_content` 吃满 `max_output_tokens` 后返回空正文。
+- 上下文装配必须把系统提示、当前输入、历史、记忆、附件视觉 token、输出预留和 tokenizer/协议安全余量纳入同一硬预算；达到阈值后复用统一上下文压缩与记忆回灌流程，不得为本地模型另建静默截断分支。
+- Data URI、裸 Base64、远端 URL 等附件表示应在通用聊天层保留完整语义，只在具体 Provider adapter 边界转换成目标协议格式；转换前必须本地校验，日志不得输出附件正文或密钥。
