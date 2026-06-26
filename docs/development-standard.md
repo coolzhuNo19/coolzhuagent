@@ -113,6 +113,15 @@ cargo test -p <package-name> --offline
 ## 本地模型容量与 Provider 边界规范（2026-06-25 新增）
 
 - 必须区分“模型架构最大上下文”和“当前硬件安全运行上下文”。不得把模型卡的最大值直接写入启动参数；运行值应结合显存、内存、量化、KV cache、并发槽位和目标输出长度确定，并由 `coolzhu.toml` 配置。
+- 本地文本推理模型文件路径必须从 workspace `coolzhu.toml [model].local_chat_model_path` 读取，并提供前端文件选择/保存入口；不得在启动链路硬编码用户目录、模型文件名或 GGUF 路径。
+- 用户可见的本地模型身份统一为 `coolzhu-model`。聊天室回复、推理卡片、Goal 执行消息和可见错误文案不得暴露原始模型名、GGUF 文件名或模型家族；内部日志可保留必要诊断信息，但不得输出密钥或附件正文。
 - 本地模型必须为最终回复预留独立输出空间。支持 thinking 的模型还应限制思考预算，禁止让 `reasoning_content` 吃满 `max_output_tokens` 后返回空正文。
 - 上下文装配必须把系统提示、当前输入、历史、记忆、附件视觉 token、输出预留和 tokenizer/协议安全余量纳入同一硬预算；达到阈值后复用统一上下文压缩与记忆回灌流程，不得为本地模型另建静默截断分支。
 - Data URI、裸 Base64、远端 URL 等附件表示应在通用聊天层保留完整语义，只在具体 Provider adapter 边界转换成目标协议格式；转换前必须本地校验，日志不得输出附件正文或密钥。
+
+## Goal 长任务 Skills 约束规范（2026-06-26 新增）
+
+- Goal 长任务执行前必须加载项目内置 baseline Skills：`coolzhu-goal-session-chain`、`coolzhu-goal-model-reasoning`、`coolzhu-goal-tool-execution`；phase 自带 skills 只能追加，不得替代 baseline。
+- 这三类 Skills 分别约束“会话链路/上下文边界”“模型推理/预算/证据”和“工具执行/路径/日志/超时”。后续复盘 GLM5.2 或其它 Goal 模型的失败案例时，优先沉淀到对应 Skill，而不是只写 work-log。
+- Goal prompt 中必须包含已加载 Skill 的正文或明确的 missing 提示；不得只列 skill 名称后让执行模型自行猜测约束。
+- 修改 Goal Skills 后至少运行 skill 校验脚本和一条 Goal prompt 契约测试，确认 baseline skill 名称与正文被注入执行提示。
