@@ -11,6 +11,9 @@
 # E2E / Playwright 输出
 /output/
 
+# Superpowers 隔离开发 worktree
+/.worktrees/
+
 # 大模型权重
 /models/
 **/*.pth
