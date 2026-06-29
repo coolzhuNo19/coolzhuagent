@@ -241,12 +241,18 @@ Desktop Adapter 不负责理解网页 DOM，也不得穿透 WebView2 点击网�
 
 职责：
 
-- 管理应用内浏览器页面句柄和页面 generation；
+- 控制系统默认 Chrome 或 Edge 的现有真实浏览器会话，而不是把应用内 iframe/WebView2 当作产品闭环；
+- 通过随安装包分发的 Manifest V3 扩展采集当前标签页 DOM，并经 Native Messaging Host 与 Coolzhu 建立本机桥接；
+- 管理 browser profile、window、tab、frame、document 和 observation generation；
 - 提供 DOM、可访问性树、语义定位器和页面截图；
 - 支持导航、点击、双击、文本输入、选择、勾选、提交、滚动和历史操作；
 - 元素失效后重新观察和定位；
 - 把页面内容视为不可信数据；
+- 只接受白名单结构化动作，禁止模型或页面提交任意 JavaScript；
+- 每次 Native Messaging 连接使用 Coolzhu 进程签发的一次性会话令牌，并校验扩展 id、用户 profile 和调用 id；
 - 在执行前依据 `capabilities()` 拒绝未实现操作。
+
+系统默认浏览器不属于 Chrome 或 Edge、扩展未安装、扩展未启用、Native Messaging 注册丢失或页面禁止扩展时，Browser Adapter 返回稳定的 `unsupported_browser`、`extension_unavailable`、`native_host_unavailable` 或 `restricted_page`，不得退化为桌面坐标盲点。CDP 只允许用于受控诊断或测试浏览器，不作为接管用户普通浏览器会话的产品路径。
 
 首版能力声明：
 
@@ -254,6 +260,8 @@ Desktop Adapter 不负责理解网页 DOM，也不得穿透 WebView2 点击网�
 - 滑块拖动：`unsupported`；
 - 组合键和 Enter 注入：`unsupported`；
 - 多标签页：`unsupported`。
+
+真实网页首版必须支持：当前标签页观察、导航、基于 role/name/label/text 的定位、点击、文本输入、页面与容器滚动、重新定位 stale DOM、动作后 DOM 验证。浏览器菜单、下载对话框、文件选择器和权限弹窗属于原生桌面表面，必须显式切换到 Desktop Adapter 并重新审批风险。
 
 修复并通过真实前端测评后，才能改变能力声明。
 
@@ -463,6 +471,10 @@ block_webview2_surface_conflict = true
 
 [computer_use.browser]
 enabled = true
+transport = "native-messaging"
+supported_browsers = ["chrome", "edge"]
+require_extension = true
+allow_arbitrary_javascript = false
 allow_drag = false
 allow_key_combinations = false
 allow_multiple_tabs = false
@@ -530,7 +542,8 @@ allow_multiple_tabs = false
 
 ### 阶段 C：Browser Adapter
 
-- 实现页面句柄、DOM 定位、页面代际、支持动作和能力声明。
+- 实现 Chrome/Edge 扩展、Native Messaging Host、一次性握手、页面句柄、DOM 定位、页面代际、支持动作和能力声明。
+- 安装包包含扩展与 Native Messaging Host 注册素材，但不包含浏览器 profile、Cookie、模型会话配置或任何用户凭据。
 - 对未支持操作在规划前返回 `unsupported_action`。
 
 ### 阶段 D：审批暂停与恢复
@@ -633,6 +646,8 @@ allow_multiple_tabs = false
 | P14 | 重启恢复 | 等待审批时重启后恢复或明确返回中断失败 |
 | P15 | 表面隔离 | Browser 与 Desktop 不能互相穿透 |
 | P16 | 验证真实性 | 动作后状态未达成时不得报告成功 |
+| P17 | 系统默认浏览器真实网页 | 在用户默认 Chrome/Edge 的普通会话中通过 DOM 完成真实网页点击、输入和滚动 |
+| P18 | 浏览器桥接失败 | 扩展或 Native Host 不可用时明确失败并停止，不退化为盲坐标点击 |
 
 代码测试保持行为聚焦，不设计大规模硬编码自然语言用例；真实前端 Computer Use 闭环是最终功能证据。
 
@@ -649,6 +664,7 @@ allow_multiple_tabs = false
 - 相同失败和无进展能在预算内硬停止；
 - legacy 语义执行和模型调用后 fallback 不再参与产品路径；
 - P01-P16 在真实 COOLZHU 前端完成并保存证据；
+- P17-P18 在系统默认浏览器真实网页完成并保存 DOM 前后证据；
 - 所有非 PASS 项记录精确错误、失败层、已知事实和最小修复方向。
 
 ## 21. 主要风险与缓解
