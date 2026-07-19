@@ -1,0 +1,166 @@
+{
+  "package_root": "package",
+  "backup_keep": 10,
+  "artifacts": [
+    {
+      "id": "gui-web.web-console",
+      "source": "modules/gui-web/target/{profile}/coolzhu-web-console.exe",
+      "target": "bin/coolzhu-web-console.exe",
+      "build": {
+        "command": "cargo",
+        "args": ["build", "-p", "coolzhu-web-console", "--bin", "coolzhu-web-console", "--offline", "--target-dir", "modules/gui-web/target"],
+        "working_dir": "."
+      }
+    },
+    {
+      "id": "gui-web.browser-native-host",
+      "source": "modules/gui-web/target/{profile}/coolzhu-browser-native-host.exe",
+      "target": "bin/coolzhu-browser-native-host.exe",
+      "build": {
+        "command": "cargo",
+        "args": ["build", "-p", "coolzhu-web-console", "--bin", "coolzhu-browser-native-host", "--offline", "--target-dir", "modules/gui-web/target"],
+        "working_dir": "."
+      }
+    },
+    {
+      "id": "gui-web.clawbot-sidecar",
+      "source": "modules/gui-web/target/{profile}/coolzhu-clawbot-sidecar.exe",
+      "target": "bin/coolzhu-clawbot-sidecar.exe",
+      "build": {
+        "command": "cargo",
+        "args": ["build", "-p", "coolzhu-clawbot-sidecar", "--bin", "coolzhu-clawbot-sidecar", "--offline", "--target-dir", "modules/gui-web/target"],
+        "working_dir": "."
+      }
+    },
+    {
+      "id": "gui-desktop.desktop-console",
+      "source": "modules/gui-desktop/target/{profile}/coolzhu-desktop-console.exe",
+      "target": "bin/coolzhu-desktop-console.exe",
+      "build": {
+        "command": "cargo",
+        "args": ["build", "-p", "coolzhu-desktop-console", "--bin", "coolzhu-desktop-console", "--offline", "--target-dir", "modules/gui-desktop/target"],
+        "working_dir": "."
+      }
+    },
+    {
+      "id": "cli.command-line",
+      "source": "modules/cli/target/{profile}/coolzhu-cli.exe",
+      "target": "bin/coolzhu-cli.exe",
+      "build": {
+        "command": "cargo",
+        "args": ["build", "-p", "coolzhu-command-line", "--bin", "coolzhu-cli", "--offline", "--target-dir", "modules/cli/target"],
+        "working_dir": "."
+      }
+    },
+    {
+      "id": "computer-use.preflight-check",
+      "source": "modules/computer-use/target/{profile}/coolzhu-computer-use-check.exe",
+      "target": "bin/coolzhu-computer-use-check.exe",
+      "build": {
+        "command": "cargo",
+        "args": ["build", "-p", "coolzhu-computer-use-core", "--bin", "coolzhu-computer-use-check", "--offline", "--target-dir", "modules/computer-use/target"],
+        "working_dir": "."
+      }
+    },
+    {
+      "id": "vision.smoke",
+      "source": "modules/vision/target/{profile}/coolzhu-vision-smoke.exe",
+      "target": "bin/coolzhu-vision-smoke.exe",
+      "build": {
+        "command": "cargo",
+        "args": ["build", "-p", "coolzhu-vision-service", "--bin", "coolzhu-vision-smoke", "--offline", "--target-dir", "modules/vision/target"],
+        "working_dir": "."
+      }
+    },
+    {
+      "id": "vision.latest-desktop",
+      "source": "modules/vision/target/{profile}/coolzhu-latest-desktop-vision.exe",
+      "target": "bin/coolzhu-latest-desktop-vision.exe",
+      "build": {
+        "command": "cargo",
+        "args": ["build", "-p", "coolzhu-vision-service", "--bin", "coolzhu-latest-desktop-vision", "--offline", "--target-dir", "modules/vision/target"],
+        "working_dir": "."
+      }
+    },
+    {
+      "id": "gui-desktop.tauri-shell",
+      "source": "modules/gui-desktop/target/tauri-shell/{profile}/coolzhu-tauri-shell.exe",
+      "target": "bin/coolzhu-tauri-shell.exe",
+      "build": {
+        "command": "cargo",
+        "args": ["build", "--manifest-path", "modules/gui-desktop/packages/tauri-shell/src-tauri/Cargo.toml", "--bin", "coolzhu-tauri-shell", "--offline", "--target-dir", "modules/gui-desktop/target/tauri-shell"],
+        "working_dir": "."
+      }
+    },
+    {
+      "id": "package.app-launcher",
+      "source": "target/{profile}/COOLZHU-AGENT.exe",
+      "target": "COOLZHU-AGENT.exe",
+      "build": {
+        "command": "cargo",
+        "args": ["build", "-p", "coolzhu-app-launcher", "--bin", "COOLZHU-AGENT", "--offline"],
+        "working_dir": "."
+      }
+    }
+  ],
+  "resources": [
+    {
+      "id": "package.launcher-config",
+      "source": "config/package-launcher.json",
+      "target": "config/package-launcher.json"
+    },
+    {
+      "id": "package.manifest",
+      "source": "config/package-manifest.json",
+      "target": "config/package-manifest.json"
+    },
+    {
+      "id": "gui-web.tools",
+      "source": "modules/gui-web/packages/web-console/tools",
+      "target": "modules/gui-web/packages/web-console/tools",
+      "optional": true
+    },
+    {
+      "id": "gui-web.bin-tools",
+      "source": "modules/gui-web/packages/web-console/tools",
+      "target": "bin/tools",
+      "optional": true
+    },
+    {
+      "id": "gui-web.stt-models",
+      "source": "modules/gui-web/packages/web-console/models",
+      "target": "bin/models",
+      "optional": true
+    },
+    {
+      "id": "gui-web.assets",
+      "source": "modules/gui-web/packages/web-console/assets",
+      "target": "modules/gui-web/packages/web-console/assets",
+      "optional": true
+    },
+    {
+      "id": "browser.extension",
+      "source": "modules/browser-extension",
+      "target": "modules/browser-extension",
+      "optional": true
+    },
+    {
+      "id": "vision.local-vlm",
+      "source": "modules/vision/resources/local-vlm",
+      "target": "modules/vision/resources/local-vlm",
+      "optional": true
+    },
+    {
+      "id": "vision.uidetr",
+      "source": "modules/vision/resources/uidetr",
+      "target": "modules/vision/resources/uidetr",
+      "optional": true
+    },
+    {
+      "id": "gui-desktop.tauri-ui",
+      "source": "modules/gui-desktop/packages/tauri-shell/ui",
+      "target": "modules/gui-desktop/packages/tauri-shell/ui",
+      "optional": true
+    }
+  ]
+}

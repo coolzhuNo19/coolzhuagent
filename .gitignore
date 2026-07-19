@@ -1,0 +1,47 @@
+# Rust / build outputs
+/target/
+**/target/
+/package/
+/dist/
+/output/
+/tmp/
+/backups/
+/backup/
+node_modules/
+**/node_modules/
+test-results/
+goal-artifacts/
+
+# Model weights and binary artifacts
+/models/
+**/*.pth
+**/*.gguf
+**/*.onnx
+**/*.safetensors
+*.msi
+*.zip
+*.7z
+*.exe
+*.dll
+*.pdb
+
+# Private runtime state
+.coolzhu/*
+!.coolzhu/plugins/
+!.coolzhu/plugins/**
+.claw-agents/
+**/.claw-agents/
+**/web-sessions.json
+**/*.sqlite
+**/*.sqlite3
+**/*.sqlite3-wal
+**/*.sqlite3-shm
+**/*.db
+**/coolzhu.toml
+**/.env
+**/.env.*
+**/logs/
+
+# OS / editor
+Thumbs.db
+.DS_Store

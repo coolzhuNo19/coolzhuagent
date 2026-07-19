@@ -1,0 +1,23 @@
+[package]
+name = "coolzhu-computer-use-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+
+[lib]
+name = "computer_use"
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[[bin]]
+name = "coolzhu-computer-use-check"
+path = "src/bin/check.rs"
+
+[lints]
+workspace = true

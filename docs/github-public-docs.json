@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "documents": [
+    "docs/github-public-index.md",
+    "docs/repository-structure.md",
+    "docs/development-standard.md",
+    "docs/testing-standard.md",
+    "docs/interface-contracts.md",
+    "docs/packaging-and-device-migration.md",
+    "docs/testing/computer-use-evaluation-matrix.md",
+    "docs/superpowers/specs/2026-06-28-realtime-full-stream-design.md",
+    "docs/superpowers/plans/2026-06-28-realtime-full-stream.md",
+    "docs/superpowers/specs/2026-06-28-computer-use-evaluation-design.md",
+    "docs/plans/2026-07-07-web-console-ui-redesign-execution-plan.md",
+    "docs/superpowers/specs/2026-07-03-clawbot-provider-sidecar-design.md",
+    "docs/superpowers/specs/2026-07-03-clawbot-http-provider-adapter-design.md",
+    "docs/superpowers/plans/2026-07-03-weixin-clawbot-channel-architecture.md"
+  ]
+}
