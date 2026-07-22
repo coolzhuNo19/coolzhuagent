@@ -161,7 +161,9 @@ impl<'a> ComputerUseExecutor<'a> {
     }
 
     pub(crate) fn handles(&self, tool_name: &str) -> bool {
-        tool_name == "computer_use.perform"
+        // 正式名是 `computer_use_perform`（OpenAI 兼容协议要求 ^[a-zA-Z0-9_-]+$）；
+        // 历史会话里持久化的是旧的点号写法，回放时同样要认。
+        tool_name == crate::COMPUTER_USE_TOOL_NAME || tool_name == "computer_use.perform"
     }
 
     pub(crate) async fn execute(
@@ -911,9 +913,12 @@ mod tests {
         let factory = factory(true);
         let executor =
             ComputerUseExecutor::new(&planner, &factory, &store, ComputerUseBudgets::default());
+        // 正式名（协议合法）与历史会话里的旧点号写法都要认。
+        assert!(executor.handles(crate::COMPUTER_USE_TOOL_NAME));
         assert!(executor.handles("computer_use.perform"));
+        // 其它工具一律不接管。
         assert!(!executor.handles("tools_semantic_dispatch"));
-        assert!(!executor.handles("computer_use_perform"));
+        assert!(!executor.handles("computer.left_click"));
     }
 
     #[tokio::test]

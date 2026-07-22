@@ -80,7 +80,7 @@ mod tests {
         let definition = crate::computer_use_tool_definition();
         let schema = definition.input_schema;
 
-        assert_eq!(definition.name, "computer_use.perform");
+        assert_eq!(definition.name, crate::COMPUTER_USE_TOOL_NAME);
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(
             schema["properties"]["target"]["additionalProperties"],
@@ -119,7 +119,7 @@ mod tests {
             .expect("compact GUI tool remains available");
 
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].name, "computer_use.perform");
+        assert_eq!(selected[0].name, crate::COMPUTER_USE_TOOL_NAME);
     }
 
     #[test]
