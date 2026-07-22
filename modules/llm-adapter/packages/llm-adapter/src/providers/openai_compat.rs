@@ -906,11 +906,13 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
                     InputContentBlock::ImageUrl { .. } => {}
+                    // 历史里的工具名同样要过一遍协议归一，否则与 tools 定义中的名字对不上，
+                    // 模型会认为自己调用过一个未声明的工具。
                     InputContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                         "id": id,
                         "type": "function",
                         "function": {
-                            "name": name,
+                            "name": sanitize_openai_tool_name(name),
                             "arguments": input.to_string(),
                         }
                     })),
@@ -1045,11 +1047,30 @@ fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
         .join("\n")
 }
 
+/// OpenAI Chat Completions 协议（含 DeepSeek / 百炼 / 智谱等兼容端）要求工具名满足
+/// `^[a-zA-Z0-9_-]+$`。上游若用点号做命名空间（如 `computer_use.perform`），服务端会直接
+/// 返回 `400 Invalid 'tools[i].function.name'`，整轮请求失败、上层降级成本地回退文案，
+/// 用户视角就是"会话没有回复内容"。故在协议边界统一把非法字符替换为 `_`。
+///
+/// 注意这是**兜底**：替换不可逆（`a.b` 与 `a_b` 会撞名），模型回传的也是替换后的名字。
+/// 正确做法仍是上游直接用合法工具名，此处只保证请求不会因为命名被整体拒绝。
+fn sanitize_openai_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn openai_tool_definition(tool: &ToolDefinition) -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": tool.name,
+            "name": sanitize_openai_tool_name(&tool.name),
             "description": tool.description,
             "parameters": tool.input_schema,
         }
@@ -1062,7 +1083,7 @@ fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
         ToolChoice::Any => Value::String("required".to_string()),
         ToolChoice::Tool { name } => json!({
             "type": "function",
-            "function": { "name": name },
+            "function": { "name": sanitize_openai_tool_name(name) },
         }),
     }
 }
@@ -1335,6 +1356,62 @@ mod tests {
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tool_choice"], json!("auto"));
         assert_eq!(payload["reasoning_effort"], json!("high"));
+    }
+
+    #[test]
+    fn tool_names_with_illegal_chars_are_sanitized_for_protocol() {
+        // 带点号的工具名（如 computer_use.perform）不满足 OpenAI 兼容端要求的
+        // ^[a-zA-Z0-9_-]+$，直接下发会被 400 拒绝，整轮请求失败。
+        let payload = build_chat_completion_request(&MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::ToolUse {
+                    id: "cu-1".to_string(),
+                    name: "computer_use.perform".to_string(),
+                    input: json!({}),
+                }],
+            }],
+            system: None,
+            tools: Some(vec![
+                ToolDefinition {
+                    name: "tools_semantic_dispatch".to_string(),
+                    description: None,
+                    input_schema: json!({"type": "object"}),
+                },
+                ToolDefinition {
+                    name: "computer_use.perform".to_string(),
+                    description: None,
+                    input_schema: json!({"type": "object"}),
+                },
+            ]),
+            tool_choice: Some(ToolChoice::Tool {
+                name: "computer_use.perform".to_string(),
+            }),
+            reasoning_effort: None,
+            stream: false,
+        });
+
+        // 合法名原样保留，非法名的点号归一成下划线。
+        assert_eq!(payload["tools"][0]["function"]["name"], json!("tools_semantic_dispatch"));
+        assert_eq!(payload["tools"][1]["function"]["name"], json!("computer_use_perform"));
+        assert_eq!(payload["tool_choice"]["function"]["name"], json!("computer_use_perform"));
+        // 历史 tool_calls 也要一致，否则模型会看到未声明的工具名。
+        assert_eq!(
+            payload["messages"][0]["tool_calls"][0]["function"]["name"],
+            json!("computer_use_perform")
+        );
+
+        // 出站的每个工具名都必须满足协议正则。
+        for tool in payload["tools"].as_array().expect("tools") {
+            let name = tool["function"]["name"].as_str().expect("name");
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "illegal tool name leaked to protocol: {name}"
+            );
+        }
     }
 
     #[test]

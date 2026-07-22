@@ -22820,7 +22820,7 @@ const AGENT_GUIDE_INLINE: &str = "Tool & working guide (follow on every task):\n
 - Autonomous (Goal) contexts: proceed with sensible defaults instead of waiting for input; confirm first only for destructive or outward-facing actions (delete, overwrite, push).";
 
 const COMPUTER_USE_OPERATION_CONSTRAINTS: &str = "Computer-use operation constraints:\n\
-- Use `computer_use.perform` as the only model-facing entry point for desktop or browser actions. Never fall back to `tools_semantic_dispatch`, `computer.left_click`, or another legacy computer tool.\n\
+- Use `computer_use_perform` as the only model-facing entry point for desktop or browser actions. Never fall back to `tools_semantic_dispatch`, `computer.left_click`, or another legacy computer tool.\n\
 - A `failed`, `blocked`, `timed_out`, `cancelled`, or error ToolResult is terminal for computer use in the current user turn. Report its exact status and error code; do not retry through a different tool name.\n\
 - Declare `surface=desktop|browser` before acting and use the tool for that surface only.\n\
 - Obtain a fresh screenshot immediately before every coordinate-based action. Never guess coordinates or reuse coordinates after the UI changes.\n\
@@ -26854,9 +26854,17 @@ fn messages_have_computer_use_intent(messages: &[InputMessage]) -> bool {
     text_has_computer_use_intent(&last_user_text)
 }
 
+/// 用户文本是否显式点名了 computer-use 入口。
+/// 正式名是 `computer_use_perform`，同时兼容历史/口语写法里的点号形式。
+fn text_mentions_computer_use_entry(lower: &str) -> bool {
+    lower.contains(COMPUTER_USE_TOOL_NAME)
+        || lower.contains("computer_use.perform")
+        || lower.contains("computer-use.perform")
+}
+
 fn text_has_computer_use_intent(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    if lower.contains("computer_use.perform") || lower.contains("computer-use.perform") {
+    if text_mentions_computer_use_entry(&lower) {
         return true;
     }
     vision_request_has_action_intent(&lower)
@@ -26885,8 +26893,7 @@ fn text_has_computer_use_intent(text: &str) -> bool {
 
 fn formal_computer_use_tool_request_from_intent(text: &str) -> Option<(String, String, JsonValue)> {
     let lower = text.to_ascii_lowercase();
-    if !lower.contains("computer_use.perform")
-        && !lower.contains("computer-use.perform")
+    if !text_mentions_computer_use_entry(&lower)
         && contains_any(
             &lower,
             &[
@@ -26942,14 +26949,14 @@ fn formal_computer_use_tool_request_from_intent(text: &str) -> Option<(String, S
     }
     Some((
         format!("formal-computer-use-{:016x}", hash_bytes(text.as_bytes())),
-        "computer_use.perform".to_string(),
+        COMPUTER_USE_TOOL_NAME.to_string(),
         json!({
             "objective": text.trim().chars().take(1200).collect::<String>(),
             "surface": surface,
             "target": JsonValue::Object(target),
             "success_criteria": success_criteria,
             "constraints": [
-                "Use computer_use.perform as the only execution path",
+                "Use computer_use_perform as the only execution path",
                 "Use DOM references for browser work and UIA references for desktop work",
                 "Do not use desktop coordinates for browser content",
                 "Report the terminal tool result exactly; do not invent success or failure"
@@ -27241,7 +27248,7 @@ mod intent_gate_tests {
                 role: "assistant".into(),
                 content: vec![InputContentBlock::ToolUse {
                     id: "cu-1".into(),
-                    name: "computer_use.perform".into(),
+                    name: COMPUTER_USE_TOOL_NAME.into(),
                     input: serde_json::json!({}),
                 }],
             },
@@ -27300,11 +27307,11 @@ fn agent_message_request_build_with_system(
     let has_computer_use_tool = tools.as_ref().is_some_and(|definitions| {
         definitions
             .iter()
-            .any(|definition| definition.name == "computer_use.perform")
+            .any(|definition| definition.name == COMPUTER_USE_TOOL_NAME)
     });
     let tool_choice = if force_computer_use && has_computer_use_tool {
         Some(ToolChoice::Tool {
-            name: "computer_use.perform".to_string(),
+            name: COMPUTER_USE_TOOL_NAME.to_string(),
         })
     } else if tool_count > 0 {
         Some(ToolChoice::Auto)
@@ -27323,7 +27330,7 @@ fn agent_message_request_build_with_system(
         llm_tool_exposure_mode(),
         tool_count,
         match &tool_choice {
-            Some(ToolChoice::Tool { .. }) => "computer_use.perform",
+            Some(ToolChoice::Tool { .. }) => COMPUTER_USE_TOOL_NAME,
             Some(ToolChoice::Any) => "any",
             Some(ToolChoice::Auto) => "auto",
             None => "none",
@@ -27356,7 +27363,7 @@ fn select_tools_for_request(
     }
     let mut selected = tools?;
     if context_window > 0 && context_window <= SMALL_CONTEXT_TOOL_CUTOFF_TOKENS {
-        selected.retain(|tool| tool.name == "computer_use.perform");
+        selected.retain(|tool| tool.name == COMPUTER_USE_TOOL_NAME);
     }
     (!selected.is_empty()).then_some(selected)
 }
@@ -27459,6 +27466,15 @@ fn compose_description_with_permission(spec: &tools::ToolSpec) -> String {
     )
 }
 
+/// 模型侧 computer-use 入口的正式工具名。
+///
+/// OpenAI 兼容协议（DeepSeek / 百炼 / 智谱等）要求工具名匹配 `^[a-zA-Z0-9_-]+$`，
+/// 历史上这里用的是带点号的 `computer_use.perform`，会让服务端返回
+/// `400 Invalid 'tools[1].function.name'`，整轮请求失败并降级成本地回退文案
+/// （用户视角＝会话没有回复内容）。分发侧 `run_model_tool_dispatch_*` 与
+/// `is_computer_use_tool_family` 仍同时接受旧的点号写法，保证历史会话可回放。
+const COMPUTER_USE_TOOL_NAME: &str = "computer_use_perform";
+
 /// Phase C-10：`tools_semantic_dispatch` 元工"ToolDefinition。保留原 schema。
 /// 作为一"registry 同级条目继续暴露。
 fn semantic_dispatch_tool_definition() -> ToolDefinition {
@@ -27486,7 +27502,9 @@ fn semantic_dispatch_tool_definition() -> ToolDefinition {
 
 fn computer_use_tool_definition() -> ToolDefinition {
     ToolDefinition {
-        name: "computer_use.perform".to_string(),
+        // 必须满足 OpenAI 兼容端的 ^[a-zA-Z0-9_-]+$：早期的 `computer_use.perform` 含点号，
+        // 会让 DeepSeek / 百炼等直接 400 拒绝整个请求，退化成本地回退文案。
+        name: COMPUTER_USE_TOOL_NAME.to_string(),
         description: Some(
             "Complete one user-authorized desktop or browser task. Describe the goal and observable success criteria; the runtime owns observation, planning, bounded input, and verification."
                 .to_string(),
@@ -54106,7 +54124,7 @@ attach: last_assistant
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         // 必含元工。
         assert!(names.contains(&"tools_semantic_dispatch"));
-        assert!(names.contains(&"computer_use.perform"));
+        assert!(names.contains(&super::COMPUTER_USE_TOOL_NAME));
         // 必含内部协作工具，允许模型在同一聊天室内显式交接任务。
         assert!(names.contains(&"chat_handoff"));
         // 必含若干典型 ReadOnly 工具
@@ -54155,7 +54173,7 @@ attach: last_assistant
         let defs = super::llm_tool_definitions().expect("enabled");
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"tools_semantic_dispatch"));
-        assert!(names.contains(&"computer_use.perform"));
+        assert!(names.contains(&super::COMPUTER_USE_TOOL_NAME));
         assert!(names.contains(&"chat_handoff"));
         assert!(names.contains(&"write_file"));
         assert!(names.contains(&"edit_file"));
@@ -54193,7 +54211,7 @@ attach: last_assistant
         assert_eq!(defs.len(), expected_len);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"tools_semantic_dispatch"));
-        assert!(names.contains(&"computer_use.perform"));
+        assert!(names.contains(&super::COMPUTER_USE_TOOL_NAME));
         assert!(names.contains(&"chat_handoff"));
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"write_file"));
@@ -54226,7 +54244,49 @@ attach: last_assistant
         let defs = super::llm_tool_definitions().expect("enabled");
         assert_eq!(defs.len(), 2);
         assert_eq!(defs[0].name, "tools_semantic_dispatch");
-        assert_eq!(defs[1].name, "computer_use.perform");
+        assert_eq!(defs[1].name, super::COMPUTER_USE_TOOL_NAME);
+
+        let _ = std::mem::replace(&mut *super::workspace_config().lock().expect("lock"), prev);
+    }
+
+    /// 暴露给模型的工具名必须满足 OpenAI 兼容端的 `^[a-zA-Z0-9_-]+$`。
+    /// 历史事故：`computer_use.perform` 含点号，DeepSeek / 百炼直接返回
+    /// `400 Invalid 'tools[1].function.name'`，整轮请求失败并降级成本地回退文案，
+    /// 用户视角就是"会话不显示回复内容"。
+    #[test]
+    fn exposed_llm_tool_names_satisfy_openai_protocol_pattern() {
+        use super::{ConfigModel, ConfigTool, WorkspaceConfig};
+        let _guard = config_test_guard();
+        let _dev_open = DevOpenPermissionsTestGuard::enable();
+        let patched = WorkspaceConfig {
+            model: ConfigModel {
+                enable_llm_tools: true,
+                llm_tool_exposure: None,
+                ..ConfigModel::default()
+            },
+            tool: ConfigTool {
+                dev_open_permissions: true,
+                ..ConfigTool::default()
+            },
+            ..WorkspaceConfig::default()
+        };
+        let prev = {
+            let mut guard = super::workspace_config().lock().expect("lock");
+            std::mem::replace(&mut *guard, patched)
+        };
+        let defs = super::llm_tool_definitions().expect("enabled");
+        assert!(!defs.is_empty(), "dev-open 模式下应暴露完整 registry");
+        for def in &defs {
+            assert!(
+                !def.name.is_empty()
+                    && def
+                        .name
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'),
+                "工具名 `{}` 不满足 OpenAI 兼容协议的 ^[a-zA-Z0-9_-]+$，会导致整轮请求 400",
+                def.name
+            );
+        }
 
         let _ = std::mem::replace(&mut *super::workspace_config().lock().expect("lock"), prev);
     }
@@ -54234,6 +54294,7 @@ attach: last_assistant
     #[test]
     fn computer_use_retry_guard_covers_formal_and_legacy_tool_names() {
         for name in [
+            super::COMPUTER_USE_TOOL_NAME,
             "computer_use.perform",
             "computer-use.perform",
             "computer.left_click",
@@ -54261,7 +54322,7 @@ attach: last_assistant
             "请调用 computer_use.perform，surface=browser，在 https://www.wikipedia.org/ 页面搜索 OpenAI，success_criteria: 页面标题包含 OpenAI",
         )
         .expect("formal computer-use fallback request");
-        assert_eq!(request.1, "computer_use.perform");
+        assert_eq!(request.1, super::COMPUTER_USE_TOOL_NAME);
         assert_eq!(request.2["surface"], "browser");
         assert_eq!(request.2["target"]["url"], "https://www.wikipedia.org/");
         assert!(request.2["success_criteria"][0]
