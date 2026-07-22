@@ -53200,12 +53200,30 @@ attach: last_assistant
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = tmp.path().join("goal-upgrade.sqlite3");
         let connection = super::open_session_connection(&db).expect("open");
-        // 造一个 v12 形态的 goal_phases：只有旧的 11 列。
+        // 造一个 v12 形态的库：goal_phases 只有旧的 11 列。
+        // 表定义照抄线上真实形态——主键是复合的 (goal_id, id) 而不是 id 单列，
+        // 所以同一个 phase id（'plan'/'implement'）会在不同 goal 下重复出现。
         connection
             .execute_batch(
                 r#"
-                CREATE TABLE goal_phases (
+                CREATE TABLE goals (
                     id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL,
+                    chat_room_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    max_iterations INTEGER NOT NULL,
+                    current_iteration INTEGER NOT NULL,
+                    background INTEGER NOT NULL,
+                    originating_user_msg_id TEXT,
+                    completion_condition_json TEXT NOT NULL,
+                    plan_json TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    cancelled_at INTEGER
+                );
+                CREATE TABLE goal_phases (
+                    id TEXT NOT NULL,
                     goal_id TEXT NOT NULL,
                     title TEXT NOT NULL,
                     assigned_role TEXT NOT NULL,
@@ -53215,10 +53233,16 @@ attach: last_assistant
                     output_artifacts_json TEXT NOT NULL,
                     verification_json TEXT,
                     created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (goal_id, id),
+                    FOREIGN KEY (goal_id) REFERENCES goals(id) ON DELETE CASCADE
                 );
+                INSERT INTO goals VALUES
+                    ('g1','ws','room','目标一','running',5,1,0,NULL,'{}',NULL,10,20,NULL),
+                    ('g2','ws','room','目标二','running',5,1,0,NULL,'{}',NULL,10,20,NULL);
                 INSERT INTO goal_phases VALUES
-                    ('p1','g1','实现登录','implementer','completed','[]','[]','[]',NULL,100,200);
+                    ('implement','g1','实现登录','implementer','completed','[]','[]','[]',NULL,100,200),
+                    ('implement','g2','实现下单','implementer','running','[]','[]','[]',NULL,300,400);
                 PRAGMA user_version = 12;
                 "#,
             )
@@ -53226,20 +53250,38 @@ attach: last_assistant
 
         super::initialize_session_schema(&connection).expect("migrate");
 
+        // 两个 goal 下的同名 phase 都必须原样保留。
+        let total: i64 = connection
+            .query_row("SELECT count(*) FROM goal_phases", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(total, 2, "升级不该丢行");
+
         let (title, status, created): (String, String, i64) = connection
             .query_row(
-                "SELECT title, status, created_at FROM goal_phases WHERE id = 'p1'",
+                "SELECT title, status, created_at FROM goal_phases \
+                 WHERE goal_id = 'g1' AND id = 'implement'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .expect("旧行应当还在");
+            .expect("g1 的旧行应当还在");
         assert_eq!(title, "实现登录");
         assert_eq!(status, "completed");
         assert_eq!(created, 100);
 
+        let g2_title: String = connection
+            .query_row(
+                "SELECT title FROM goal_phases WHERE goal_id = 'g2' AND id = 'implement'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("g2 的同名 phase 也应当还在");
+        assert_eq!(g2_title, "实现下单");
+
+        // 所有旧行的新列都落到默认值上。
         let (retry, max_retries, verdict): (i64, i64, Option<String>) = connection
             .query_row(
-                "SELECT retry_count, max_retries, last_verdict FROM goal_phases WHERE id = 'p1'",
+                "SELECT retry_count, max_retries, last_verdict FROM goal_phases \
+                 WHERE goal_id = 'g1' AND id = 'implement'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -53248,6 +53290,15 @@ attach: last_assistant
         assert_eq!(max_retries, 2);
         // 尚未产生结论 → NULL，而不是空串。
         assert!(verdict.is_none());
+
+        let off_default: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM goal_phases WHERE retry_count != 0 OR max_retries != 2",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(off_default, 0, "所有旧行都该是 retry=0 / max=2");
 
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
