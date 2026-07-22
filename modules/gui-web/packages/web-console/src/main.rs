@@ -33526,6 +33526,7 @@ fn initialize_session_schema(connection: &Connection) -> rusqlite::Result<()> {
     apply_session_migration_v10(connection)?;
     computer_use_store::apply_session_migration_v11(connection)?;
     apply_session_migration_v12(connection)?;
+    apply_session_migration_v13(connection)?;
     Ok(())
 }
 
@@ -33543,6 +33544,43 @@ fn apply_session_migration_v12(connection: &Connection) -> rusqlite::Result<()> 
     )?;
     if current < 12 {
         connection.execute_batch("PRAGMA user_version = 12;")?;
+    }
+    Ok(())
+}
+
+/// v13 给 `goal_phases` 补齐的回退路由列，兼作迁移与测试的单一事实源。
+///
+/// `retry_count` / `max_retries` 给重试上限用；`last_verdict` / `last_reason` /
+/// `last_evidence_json` 承载 verifier 的结论与证据；`route_hint` 供路由决策记录
+/// 下一跳意图。后三者可为空——阶段尚未产生结论时就是没有值，用 NULL 表达比用
+/// 空串更诚实。
+const GOAL_PHASE_ROUTING_COLUMNS: &[(&str, &str)] = &[
+    ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("max_retries", "INTEGER NOT NULL DEFAULT 2"),
+    ("last_verdict", "TEXT"),
+    ("last_reason", "TEXT"),
+    ("last_evidence_json", "TEXT"),
+    ("route_hint", "TEXT"),
+];
+
+/// Schema v13（GL-01 · Goal 循环状态图化）：`goal_phases` 增加回退路由所需的 6 列。
+///
+/// 背景见 `DESIGN-GOAL-LOOP-001`：phase 此前只有 status，无法承载
+/// verifier→implementer、implementer→planner 的带证据回退与重试上限，
+/// Goal Runner 因此只能单向前进（`CUR-GOAL-LOOP-001`）。
+///
+/// 刻意逐列 `ALTER TABLE ADD COLUMN` 而不重建表：`goal_phases` 通过外键挂在
+/// `goals` 上，重建会触发级联删除。加列本身不改动既有行的其它字段，旧行落到
+/// `retry_count=0 / max_retries=2` 的默认值上。
+fn apply_session_migration_v13(connection: &Connection) -> rusqlite::Result<()> {
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // 不靠 user_version 短路：即使版本号已被写到 13，也要确认列真的存在，
+    // 免得中途失败的迁移留下"版本已推进但列没加"的库。
+    for (column, column_type) in GOAL_PHASE_ROUTING_COLUMNS {
+        ensure_table_column(connection, "goal_phases", column, column_type)?;
+    }
+    if current < 13 {
+        connection.execute_batch("PRAGMA user_version = 13;")?;
     }
     Ok(())
 }
@@ -34078,14 +34116,27 @@ fn ensure_session_column(
     column: &str,
     column_type: &str,
 ) -> rusqlite::Result<()> {
+    ensure_table_column(connection, "sessions", column, column_type)
+}
+
+/// 幂等加列：列已存在就跳过，否则 `ALTER TABLE ADD COLUMN`。
+///
+/// `table` / `column` / `column_type` 只接受代码内的字面量（PRAGMA 与 ALTER 都
+/// 不支持参数绑定，必须拼字符串），不要把外部输入接进来。
+fn ensure_table_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    column_type: &str,
+) -> rusqlite::Result<()> {
     let exists = connection
-        .prepare("PRAGMA table_info(sessions)")?
+        .prepare(&format!("PRAGMA table_info({table})"))?
         .query_map([], |row| row.get::<_, String>(1))?
         .filter_map(Result::ok)
         .any(|name| name == column);
     if !exists {
         connection.execute(
-            &format!("ALTER TABLE sessions ADD COLUMN {column} {column_type}"),
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
             [],
         )?;
     }
@@ -53115,6 +53166,93 @@ attach: last_assistant
             std::fs::read_to_string(tmp.path().join("semantic-write.txt")).expect("created file"),
             "hello semantic"
         );
+    }
+
+    #[test]
+    fn migration_v13_adds_goal_phase_routing_columns() {
+        // GL-01：全新库初始化后应停在 v13，且 6 个回退路由列都在。
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("goal-routing.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version");
+        assert_eq!(version, 13);
+
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(goal_phases)")
+            .expect("pragma")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query")
+            .filter_map(Result::ok)
+            .collect();
+        for (column, _) in super::GOAL_PHASE_ROUTING_COLUMNS {
+            assert!(columns.contains(&(*column).to_string()), "缺列 {column}");
+        }
+    }
+
+    #[test]
+    fn migration_v13_upgrades_v12_database_without_losing_rows() {
+        // GL-01：v12 旧库升级必须保住既有 phase 行，新列落到默认值。
+        // 用 ALTER ADD COLUMN 而非重建表，正是为了避免 goal_phases 的外键级联。
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("goal-upgrade.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        // 造一个 v12 形态的 goal_phases：只有旧的 11 列。
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE goal_phases (
+                    id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    assigned_role TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    depends_on_json TEXT NOT NULL,
+                    skills_json TEXT NOT NULL,
+                    output_artifacts_json TEXT NOT NULL,
+                    verification_json TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO goal_phases VALUES
+                    ('p1','g1','实现登录','implementer','completed','[]','[]','[]',NULL,100,200);
+                PRAGMA user_version = 12;
+                "#,
+            )
+            .expect("seed v12");
+
+        super::initialize_session_schema(&connection).expect("migrate");
+
+        let (title, status, created): (String, String, i64) = connection
+            .query_row(
+                "SELECT title, status, created_at FROM goal_phases WHERE id = 'p1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("旧行应当还在");
+        assert_eq!(title, "实现登录");
+        assert_eq!(status, "completed");
+        assert_eq!(created, 100);
+
+        let (retry, max_retries, verdict): (i64, i64, Option<String>) = connection
+            .query_row(
+                "SELECT retry_count, max_retries, last_verdict FROM goal_phases WHERE id = 'p1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("新列应当可读");
+        assert_eq!(retry, 0);
+        assert_eq!(max_retries, 2);
+        // 尚未产生结论 → NULL，而不是空串。
+        assert!(verdict.is_none());
+
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version");
+        assert_eq!(version, 13);
     }
 
     #[test]
