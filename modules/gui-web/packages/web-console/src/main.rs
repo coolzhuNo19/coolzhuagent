@@ -35117,7 +35117,8 @@ fn query_goal_phases_connection(
     let mut stmt = connection.prepare(
         r#"
         SELECT id, goal_id, title, assigned_role, status, depends_on_json,
-               skills_json, output_artifacts_json, verification_json, created_at, updated_at
+               skills_json, output_artifacts_json, verification_json, created_at, updated_at,
+               retry_count, max_retries, last_verdict, last_reason, last_evidence_json, route_hint
         FROM goal_phases
         WHERE goal_id = ?1
         ORDER BY created_at, id
@@ -35134,6 +35135,9 @@ fn query_goal_phases_connection(
         let assigned_session_id = assigned_session_target
             .map(|target| target.session_id.clone())
             .or_else(|| goal_phase_assigned_session_id(&assigned_role));
+        // 回退路由列（v13）。retry/max 用 NOT NULL DEFAULT 建列，读回不会是 NULL；
+        // last_evidence_json 落库是 JSON 字符串，这里解析回 JsonValue 交给前端。
+        let last_evidence_json: Option<String> = row.get(15)?;
         Ok(GoalPhaseDto {
             id: row.get(0)?,
             goal_id: row.get(1)?,
@@ -35148,6 +35152,13 @@ fn query_goal_phases_connection(
             skills_required: serde_json::from_str(&skills_json).unwrap_or_default(),
             output_artifacts: serde_json::from_str(&output_artifacts_json).unwrap_or_default(),
             verification: verification_json.and_then(|value| serde_json::from_str(&value).ok()),
+            retry_count: i64_to_u64(row.get::<_, i64>(11)?) as u32,
+            max_retries: i64_to_u64(row.get::<_, i64>(12)?) as u32,
+            last_verdict: row.get(13)?,
+            last_reason: row.get(14)?,
+            last_evidence: last_evidence_json
+                .and_then(|value| serde_json::from_str(&value).ok()),
+            route_hint: row.get(16)?,
             created_at: i64_to_u64(row.get::<_, i64>(9)?),
             updated_at: i64_to_u64(row.get::<_, i64>(10)?),
         })
@@ -39555,6 +39566,15 @@ struct GoalPhaseDto {
     skills_required: Vec<String>,
     output_artifacts: Vec<String>,
     verification: Option<JsonValue>,
+    // GL-02 · Goal 循环状态图化：回退路由字段（对应 v13 迁移新增的 6 列）。
+    // 尚未产生结论时 verdict/reason/evidence/route_hint 为 None，序列化成 JSON null，
+    // 前端据此判断该 phase 还没跑过 verifier。
+    retry_count: u32,
+    max_retries: u32,
+    last_verdict: Option<String>,
+    last_reason: Option<String>,
+    last_evidence: Option<JsonValue>,
+    route_hint: Option<String>,
     created_at: u64,
     updated_at: u64,
 }
@@ -47176,6 +47196,12 @@ mod tests {
                 skills_required: phase.skills_required.clone(),
                 output_artifacts: phase.output_artifacts.clone(),
                 verification: phase.verification.clone(),
+                retry_count: 0,
+                max_retries: 2,
+                last_verdict: None,
+                last_reason: None,
+                last_evidence: None,
+                route_hint: None,
                 created_at: 1,
                 updated_at: 1,
             },
@@ -51040,6 +51066,12 @@ attach: last_assistant
                 "type": "FilesExist",
                 "paths": [artifact.clone()]
             })),
+            retry_count: 0,
+            max_retries: 2,
+            last_verdict: None,
+            last_reason: None,
+            last_evidence: None,
+            route_hint: None,
             created_at: 1,
             updated_at: 1,
         };
@@ -53304,6 +53336,75 @@ attach: last_assistant
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
         assert_eq!(version, 13);
+    }
+
+    /// GL-02：读路径把 v13 的 6 列反序列化进 GoalPhaseDto，并能正确序列化给前端。
+    #[test]
+    fn goal_phase_dto_reads_and_serializes_routing_fields() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("dto.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+
+        // 一个 goal + 两个 phase：p1 尚无结论（全默认），p2 已被 verifier 打回。
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO goals VALUES
+                    ('g1','ws','room','目标','running',5,1,0,NULL,'{}',NULL,10,20,NULL);
+                INSERT INTO goal_phases
+                    (id, goal_id, title, assigned_role, status, depends_on_json,
+                     skills_json, output_artifacts_json, verification_json,
+                     created_at, updated_at)
+                VALUES
+                    ('p1','g1','规划','planner','pending','[]','[]','[]',NULL,100,100);
+                INSERT INTO goal_phases
+                    (id, goal_id, title, assigned_role, status, depends_on_json,
+                     skills_json, output_artifacts_json, verification_json,
+                     created_at, updated_at,
+                     retry_count, max_retries, last_verdict, last_reason,
+                     last_evidence_json, route_hint)
+                VALUES
+                    ('p2','g1','实现','implementer','running','["p1"]','[]','[]',NULL,200,200,
+                     1, 3, 'fail', '缺少单元测试', '{"missing":["tests/foo.rs"]}', 'implementer');
+                "#,
+            )
+            .expect("seed phases");
+
+        let phases = super::query_goal_phases_connection(&connection, "g1").expect("query");
+        assert_eq!(phases.len(), 2);
+
+        // p1：尚无结论 → 默认值 + None。
+        let p1 = phases.iter().find(|p| p.id == "p1").expect("p1");
+        assert_eq!(p1.retry_count, 0);
+        assert_eq!(p1.max_retries, 2);
+        assert!(p1.last_verdict.is_none());
+        assert!(p1.last_reason.is_none());
+        assert!(p1.last_evidence.is_none());
+        assert!(p1.route_hint.is_none());
+
+        // p2：被打回 → 结论与证据完整回读，evidence 解析成 JSON 对象。
+        let p2 = phases.iter().find(|p| p.id == "p2").expect("p2");
+        assert_eq!(p2.retry_count, 1);
+        assert_eq!(p2.max_retries, 3);
+        assert_eq!(p2.last_verdict.as_deref(), Some("fail"));
+        assert_eq!(p2.last_reason.as_deref(), Some("缺少单元测试"));
+        assert_eq!(p2.route_hint.as_deref(), Some("implementer"));
+        assert_eq!(
+            p2.last_evidence,
+            Some(serde_json::json!({"missing": ["tests/foo.rs"]}))
+        );
+
+        // 序列化给前端的 JSON 含新字段，且 evidence 是嵌套对象而非字符串。
+        let json = serde_json::to_value(p2).expect("serialize");
+        assert_eq!(json["retry_count"], serde_json::json!(1));
+        assert_eq!(json["max_retries"], serde_json::json!(3));
+        assert_eq!(json["last_verdict"], serde_json::json!("fail"));
+        assert_eq!(json["last_evidence"]["missing"][0], serde_json::json!("tests/foo.rs"));
+        // p1 的空结论序列化成 JSON null。
+        let json1 = serde_json::to_value(p1).expect("serialize");
+        assert!(json1["last_verdict"].is_null());
+        assert!(json1["last_evidence"].is_null());
     }
 
     #[test]
