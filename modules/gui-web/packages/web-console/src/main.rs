@@ -54639,6 +54639,308 @@ attach: last_assistant
         assert!(unknown.contains("…[truncated]"));
     }
 
+    /// GL-09 辅助：搭一个带 commander + 指定角色会话的 store，供路由端到端测试复用。
+    fn gl09_store_with_roles(
+        temp: &tempfile::TempDir,
+        roles: &[&str],
+    ) -> (super::SessionStore, std::path::PathBuf) {
+        let db_path = temp.path().join("sessions.sqlite3");
+        let now = super::unix_timestamp_millis();
+        let mut base = super::seed_session();
+        base.id = "base".to_string();
+        base.name = "commander".to_string();
+        base.messages = Vec::new();
+        let mut store = super::SessionStore {
+            path: db_path.clone(),
+            legacy_json_path: temp.path().join("sessions.json"),
+            capacity: super::SessionStoreCapacity::default(),
+            state: super::PersistedSessionState {
+                sessions: vec![base],
+                active_session_id: Some("base".to_string()),
+                active_vision_session_id: None,
+                chat_rooms: vec![super::PersistedChatRoom {
+                    id: "room-1".to_string(),
+                    name: "Room 1".to_string(),
+                    created_at: now,
+                    updated_at: now,
+                    messages: Vec::new(),
+                }],
+                active_chat_room_id: Some("room-1".to_string()),
+            },
+        };
+        store.save().expect("save");
+        store
+            .ensure_goal_role_sessions(roles.iter().map(|r| r.to_string()).collect())
+            .expect("bootstrap roles");
+        super::upsert_goal_role_config_sqlite(
+            &db_path,
+            "base",
+            super::GoalRoleConfigUpdateRequest {
+                role: Some("commander".to_string()),
+                responsibility: Some("commander".to_string()),
+                commander: Some(true),
+                heartbeat_timeout_ms: Some(60_000),
+                task_timeout_ms: Some(600_000),
+            },
+        )
+        .expect("commander config");
+        for role in roles {
+            super::upsert_goal_role_config_sqlite(
+                &db_path,
+                &format!("goal-{role}"),
+                super::GoalRoleConfigUpdateRequest {
+                    role: Some((*role).to_string()),
+                    responsibility: Some((*role).to_string()),
+                    commander: Some(false),
+                    heartbeat_timeout_ms: Some(60_000),
+                    task_timeout_ms: Some(600_000),
+                },
+            )
+            .unwrap_or_else(|_| panic!("{role} config"));
+        }
+        (store, db_path)
+    }
+
+    /// GL-09 路径①「pass 前进」：依赖阶段 completed 后，下游阶段变为 ready_to_dispatch；
+    /// 依赖未满足时是 wait_dependency，不会越过依赖抢跑。
+    #[test]
+    fn routing_pass_advances_to_next_dependency_satisfied_phase() {
+        let _guard = config_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, db_path) = gl09_store_with_roles(&temp, &["implementer", "verifier"]);
+        let goal = super::create_goal_sqlite(
+            &db_path,
+            "ws",
+            "room-1",
+            super::CreateGoalRequest {
+                title: "pass 前进".to_string(),
+                chat_room_id: Some("room-1".to_string()),
+                max_iterations: Some(8),
+                background: Some(false),
+                originating_user_msg_id: None,
+                completion_condition: Some(serde_json::json!({ "type": "Manual" })),
+            },
+        )
+        .expect("goal");
+        super::set_goal_plan_sqlite(
+            &db_path,
+            "ws",
+            &goal.id,
+            super::GoalPlanRequest {
+                phases: vec![
+                    super::GoalPlanPhaseRequest {
+                        id: "impl".to_string(),
+                        title: "实现".to_string(),
+                        assigned_role: Some("implementer".to_string()),
+                        depends_on: Vec::new(),
+                        skills_required: Vec::new(),
+                        output_artifacts: Vec::new(),
+                        verification: None,
+                    },
+                    super::GoalPlanPhaseRequest {
+                        id: "verify".to_string(),
+                        title: "验证".to_string(),
+                        assigned_role: Some("verifier".to_string()),
+                        depends_on: vec!["impl".to_string()],
+                        skills_required: Vec::new(),
+                        output_artifacts: Vec::new(),
+                        verification: None,
+                    },
+                ],
+            },
+        )
+        .expect("plan");
+
+        // 取 sessions 作参数（而不是闭包捕获 store），避免与下面的 &mut store 调用冲突。
+        let action_of = |sessions: &[super::PersistedSession], phase_id: &str| -> String {
+            // 刷新角色心跳，避免刚 bootstrap 的会话被判 offline（offline 判定排在依赖判定之前）。
+            super::refresh_goal_runtime_role_heartbeats(&db_path, "ws");
+            let review = super::review_goal_commander_sqlite(&db_path, "ws", &goal.id, sessions)
+                .expect("review");
+            review
+                .phase_reviews
+                .into_iter()
+                .find(|p| p.phase_id == phase_id)
+                .expect("phase review")
+                .action
+        };
+
+        // impl 未完成时，verify 应等待依赖（不抢跑）。
+        assert_eq!(action_of(&store.state.sessions, "verify"), "wait_dependency");
+        assert_eq!(action_of(&store.state.sessions, "impl"), "ready_to_dispatch");
+
+        // codex #1：走真实 pass 链路——impl 置 running，用无失败的模型答复经
+        // record_goal_phase_model_result 完成（而不是直接改库造 completed），
+        // 断言 impl completed + last_verdict=pass，再确认 verify 因依赖满足而前进。
+        let connection = super::open_session_connection(&db_path).expect("open");
+        super::update_goal_phase_status_connection(&connection, "ws", &goal.id, "impl", "running")
+            .expect("mark running");
+        drop(connection);
+        let agent = store
+            .state
+            .sessions
+            .iter()
+            .find(|s| s.id == "goal-implementer")
+            .expect("implementer session")
+            .to_agent_session(false);
+        let result = store
+            .record_goal_phase_model_result(
+                "ws",
+                &goal.id,
+                "impl",
+                &agent,
+                super::AgentModelResponse {
+                    answer_text: "实现完成，产物已就绪。".to_string(),
+                    reasoning_text: String::new(),
+                    tool_requests: Vec::new(),
+                    tool_write_executed: false,
+                    model_tool_calls_executed: false,
+                    turn_id: "t".to_string(),
+                    used_real_model: false,
+                    diagnostic_note: None,
+                    context_footer: None,
+                    context_usage: None,
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("record pass");
+        let impl_phase = result
+            .status
+            .goal
+            .phases
+            .iter()
+            .find(|p| p.id == "impl")
+            .expect("impl");
+        assert_eq!(impl_phase.status, "completed", "无失败的执行应完成 phase");
+        assert_eq!(impl_phase.last_verdict.as_deref(), Some("pass"), "完成即记 pass");
+        assert_eq!(
+            action_of(&store.state.sessions, "verify"),
+            "ready_to_dispatch",
+            "依赖 completed 后应前进"
+        );
+    }
+
+    /// GL-09 路径④「implementer→planner」：implementer 报「无法完成」→ 阶段回 pending、
+    /// goal 暂停、retry_count 递增；累计超上限后置 blocked。
+    #[test]
+    fn routing_implementer_blocked_bounces_to_planner_then_blocks() {
+        let _guard = config_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, db_path) = gl09_store_with_roles(&temp, &["implementer"]);
+        let goal = super::create_goal_sqlite(
+            &db_path,
+            "ws",
+            "room-1",
+            super::CreateGoalRequest {
+                title: "implementer 报阻".to_string(),
+                chat_room_id: Some("room-1".to_string()),
+                max_iterations: Some(20),
+                background: Some(false),
+                originating_user_msg_id: None,
+                completion_condition: Some(serde_json::json!({ "type": "Manual" })),
+            },
+        )
+        .expect("goal");
+        super::set_goal_plan_sqlite(
+            &db_path,
+            "ws",
+            &goal.id,
+            super::GoalPlanRequest {
+                phases: vec![super::GoalPlanPhaseRequest {
+                    id: "impl".to_string(),
+                    title: "实现".to_string(),
+                    assigned_role: Some("implementer".to_string()),
+                    depends_on: Vec::new(),
+                    skills_required: Vec::new(),
+                    output_artifacts: Vec::new(),
+                    verification: None,
+                }],
+            },
+        )
+        .expect("plan");
+        let agent = store
+            .state
+            .sessions
+            .iter()
+            .find(|s| s.id == "goal-implementer")
+            .expect("implementer session")
+            .to_agent_session(false);
+
+        let run_blocked = |store: &mut super::SessionStore| {
+            let connection = super::open_session_connection(&db_path).expect("open");
+            super::update_goal_phase_status_connection(&connection, "ws", &goal.id, "impl", "running")
+                .expect("mark running");
+            drop(connection);
+            store
+                .record_goal_phase_model_result(
+                    "ws",
+                    &goal.id,
+                    "impl",
+                    &agent,
+                    super::AgentModelResponse {
+                        answer_text: "BLOCKED: 依赖的外部接口不存在，无法完成此计划。".to_string(),
+                        reasoning_text: String::new(),
+                        tool_requests: Vec::new(),
+                        tool_write_executed: false,
+                        model_tool_calls_executed: false,
+                        turn_id: "t".to_string(),
+                        used_real_model: false,
+                        diagnostic_note: None,
+                        context_footer: None,
+                        context_usage: None,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .expect("record blocked")
+        };
+
+        let impl_phase = |status: &super::GoalStatusResponse| {
+            status.goal.phases.iter().find(|p| p.id == "impl").cloned().expect("impl")
+        };
+        // codex #3：连续三次真实报阻（每次非终态后模拟 resume），逐次断言，
+        // 让 off-by-one（>= vs >）无处遁形，并验证 retry_count 经 save/重读不丢。
+        // max_retries 默认 2：retry 1、2 保持 pending 重规划，retry 3 才 blocked。
+        let resume_running = || {
+            let c = super::open_session_connection(&db_path).expect("open");
+            c.execute("UPDATE goals SET status='running' WHERE id=?1", super::params![&goal.id])
+                .expect("resume goal");
+        };
+
+        let r1 = run_blocked(&mut store);
+        let p1 = impl_phase(&r1.status);
+        assert_eq!(p1.status, "pending", "报阻应回 pending 交 planner");
+        assert_eq!(p1.retry_count, 1);
+        assert_eq!(r1.status.goal.status, "paused");
+        assert!(r1
+            .status
+            .goal
+            .recent_events
+            .iter()
+            .any(|e| e.event_type == "goal-phase-blocked-needs-replan"));
+
+        resume_running();
+        let r2 = run_blocked(&mut store);
+        let p2 = impl_phase(&r2.status);
+        assert_eq!(p2.status, "pending", "retry 2/2 仍未超限，应保持 pending 而非 blocked");
+        assert_eq!(p2.retry_count, 2);
+
+        resume_running();
+        let r3 = run_blocked(&mut store);
+        let p3 = impl_phase(&r3.status);
+        assert_eq!(p3.status, "blocked", "retry 3 > max 2 才 blocked");
+        assert_eq!(p3.retry_count, 3);
+        // codex #4：终态完整断言，堵住「phase blocked 但 goal 仍 running」这类回归。
+        assert_eq!(r3.status.goal.status, "paused", "blocked 后 goal 应暂停");
+        assert_eq!(p3.last_verdict.as_deref(), Some("fail"));
+        assert!(p3.last_reason.is_some(), "应保留本次阻塞原因");
+        assert!(r3.status.goal.recent_events.iter().any(|e| e.event_type == "goal-phase-blocked"
+            && e.payload["phase_id"] == "impl"
+            && e.payload["retry_count"].as_u64() == Some(3)
+            && e.payload["max_retries"].as_u64() == Some(2)));
+    }
+
     #[test]
     fn memory_edges_roundtrip_via_sqlite() {
         // E 关联图：迁移 v10 建表 → 覆盖式写边 → 一跳邻居按权重降序、剔除自身。
