@@ -850,6 +850,10 @@ fn app() -> Router {
             "/api/goals/{goal_id}/phases/{phase_id}/run",
             post(api_run_goal_phase),
         )
+        .route(
+            "/api/goals/{goal_id}/phases/{phase_id}/resume-from",
+            post(api_resume_goal_from_phase),
+        )
         .route("/api/goals/{goal_id}/pause", post(api_pause_goal))
         .route("/api/goals/{goal_id}/resume", post(api_resume_goal))
         .route("/api/goals/{goal_id}/budget", post(api_update_goal_budget))
@@ -13305,6 +13309,17 @@ async fn api_resume_goal(
     Ok(Json(status))
 }
 
+/// GL-12：从指定 phase 断点续跑——重置该 phase 及其（传递）下游为 pending，goal 置 ready。
+async fn api_resume_goal_from_phase(
+    AxumPath((goal_id, phase_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<GoalStatusResponse>> {
+    let workspace = active_workspace_path();
+    let workspace_id = workspace_identity(&workspace);
+    let db_path = default_session_sqlite_path();
+    let status = resume_goal_from_phase_sqlite(&db_path, &workspace_id, &goal_id, &phase_id)?;
+    Ok(Json(status))
+}
+
 /// GL-08（codex 二轮 #4）：抬高迭代预算。
 ///
 /// 预算耗尽后 resume 会被拒绝，但此前**没有任何接口能改 max_iterations**（只有创建时能设），
@@ -23717,6 +23732,10 @@ struct ChatHandoffRecord {
     depth: u8,
     status: String,
     rejected_reason: Option<String>,
+    // GL-10：结构化交接契约（回退交接才有：verdict/reason/evidence/retry_count 等）。
+    // None 表示普通/历史交接，展示时降级回 intent 文本。
+    #[serde(default)]
+    contract: Option<JsonValue>,
     created_at: u64,
     delivered_at: Option<u64>,
     completed_at: Option<u64>,
@@ -28695,6 +28714,7 @@ fn create_chat_handoff_from_tool_input(
                 originating_user_msg_id: input_string(input, "originating_user_msg_id")
                     .or_else(|| input_string(input, "originating_message_id")),
                 depth,
+                contract: None,
             },
         )
         .map_err(api_error_message)?
@@ -31157,6 +31177,8 @@ impl SessionStore {
             depth,
             status: status.to_string(),
             rejected_reason,
+            // GL-10：结构化契约由调用方（goal 回退派发）通过 payload 传入；普通手工交接为 None。
+            contract: payload.contract.clone(),
             created_at: now,
             delivered_at: None,
             completed_at: None,
@@ -31389,6 +31411,29 @@ impl SessionStore {
                 });
                 continue;
             }
+            // GL-10：被打回重跑的 phase（retry_count>0）产出结构化交接契约，
+            // 让交接记录本身携带 from/to/verdict/reason/evidence/retry，而非只塞进 intent 文本。
+            let contract = (phase.retry_count > 0).then(|| {
+                // codex #3：evidence 存**有界摘要**而非整份 JSON——完整证据已在
+                // goal_phases.last_evidence_json，每次重试复制全文会撑爆 handoff 列表/save/响应。
+                // 需要全文时按 goal_id+phase_id 回查。
+                let evidence_digest = phase
+                    .last_evidence
+                    .as_ref()
+                    .map(goal_phase_evidence_digest);
+                json!({
+                    "kind": "goal-phase-retry",
+                    "goal_id": goal.id,
+                    "phase_id": phase.id,
+                    "from_role": "commander",
+                    "to_role": phase.assigned_role,
+                    "verdict": phase.last_verdict.clone().unwrap_or_else(|| "fail".to_string()),
+                    "reason": phase.last_reason,
+                    "evidence_digest": evidence_digest,
+                    "retry_count": phase.retry_count,
+                    "max_retries": phase.max_retries,
+                })
+            });
             let response = self
                 .create_manual_handoff(
                     &room_id,
@@ -31400,6 +31445,7 @@ impl SessionStore {
                         attach_message_ids: Some(Vec::new()),
                         originating_user_msg_id: Some(originating_user_msg_id.clone()),
                         depth: Some(0),
+                        contract,
                     },
                 )?
                 .0;
@@ -32151,6 +32197,7 @@ impl SessionStore {
                         attach_message_ids: Some(attach_message_ids),
                         originating_user_msg_id: originating_user_msg_id.clone(),
                         depth: Some(depth),
+                        contract: None,
                     },
                 )?
                 .0;
@@ -33623,6 +33670,7 @@ fn initialize_session_schema(connection: &Connection) -> rusqlite::Result<()> {
     computer_use_store::apply_session_migration_v11(connection)?;
     apply_session_migration_v12(connection)?;
     apply_session_migration_v13(connection)?;
+    apply_session_migration_v14(connection)?;
     Ok(())
 }
 
@@ -33677,6 +33725,18 @@ fn apply_session_migration_v13(connection: &Connection) -> rusqlite::Result<()> 
     }
     if current < 13 {
         connection.execute_batch("PRAGMA user_version = 13;")?;
+    }
+    Ok(())
+}
+
+/// Schema v14（GL-10）：chat_handoffs 增 `contract_json`，承载结构化交接契约
+/// （from/to/verdict/reason/evidence/retry_count 等）。可空——旧记录与非回退交接为 NULL，
+/// 读回时降级成原有文本摘要展示，向后兼容。
+fn apply_session_migration_v14(connection: &Connection) -> rusqlite::Result<()> {
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    ensure_table_column(connection, "chat_handoffs", "contract_json", "TEXT")?;
+    if current < 14 {
+        connection.execute_batch("PRAGMA user_version = 14;")?;
     }
     Ok(())
 }
@@ -34483,7 +34543,7 @@ fn query_chat_handoffs_from_connection(
         r#"
         SELECT id, chat_room_id, from_agent_id, to_agent_id, intent, intent_hash,
                attach, attach_message_ids_json, originating_user_msg_id, depth,
-               status, rejected_reason, created_at, delivered_at, completed_at
+               status, rejected_reason, created_at, delivered_at, completed_at, contract_json
         FROM chat_handoffs
         WHERE chat_room_id = ?1 AND created_at >= ?2
         ORDER BY created_at DESC, id DESC
@@ -34505,7 +34565,7 @@ fn query_all_chat_handoffs_from_connection(
         r#"
         SELECT id, chat_room_id, from_agent_id, to_agent_id, intent, intent_hash,
                attach, attach_message_ids_json, originating_user_msg_id, depth,
-               status, rejected_reason, created_at, delivered_at, completed_at
+               status, rejected_reason, created_at, delivered_at, completed_at, contract_json
         FROM chat_handoffs
         ORDER BY created_at, id
         "#,
@@ -34533,6 +34593,11 @@ fn chat_handoff_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatHandof
         depth: row.get::<_, i64>(9)?.max(0) as u8,
         status: row.get(10)?,
         rejected_reason: row.get(11)?,
+        // GL-10（codex #2）：NULL → None；合法 JSON → 解析；非法 JSON → 原样保留成字符串，
+        // 不静默丢弃（否则 save() 的全量重写会把它永久抹成 NULL）。
+        contract: row
+            .get::<_, Option<String>>(15)?
+            .map(|value| serde_json::from_str(&value).unwrap_or(JsonValue::String(value))),
         created_at: i64_to_u64(row.get::<_, i64>(12)?),
         delivered_at: row.get::<_, Option<i64>>(13)?.map(i64_to_u64),
         completed_at: row.get::<_, Option<i64>>(14)?.map(i64_to_u64),
@@ -34552,14 +34617,15 @@ fn insert_chat_handoff_connection(
 ) -> rusqlite::Result<usize> {
     let attach_message_ids_json =
         serde_json::to_string(&record.attach_message_ids).unwrap_or_else(|_| "[]".to_string());
+    let contract_json = record.contract.as_ref().map(|value| value.to_string());
     connection.execute(
         r#"
         INSERT OR REPLACE INTO chat_handoffs(
             id, chat_room_id, from_agent_id, to_agent_id, intent, intent_hash,
             attach, attach_message_ids_json, originating_user_msg_id, depth, status,
-            rejected_reason, created_at, delivered_at, completed_at
+            rejected_reason, created_at, delivered_at, completed_at, contract_json
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         "#,
         params![
             &record.id,
@@ -34577,6 +34643,7 @@ fn insert_chat_handoff_connection(
             u64_to_i64(record.created_at),
             record.delivered_at.map(u64_to_i64),
             record.completed_at.map(u64_to_i64),
+            contract_json,
         ],
     )
 }
@@ -34860,6 +34927,138 @@ fn update_goal_budget_sqlite(
             "current_iteration": existing.current_iteration,
         }),
     );
+    goal_status_sqlite(path, workspace_id, goal_id)
+}
+
+/// GL-12：从指定 phase 断点续跑。
+///
+/// 把目标 phase 及其**传递下游**（直接/间接依赖它的所有 phase）重置为 pending、清空各自的
+/// 回退路由状态（retry/verdict/reason/evidence），goal 置回可运行态；上游已完成的 phase 保持不动。
+/// 用途：崩溃重启或人工修正后，只从某个检查点重跑该及后续阶段，不必从头再来。
+fn resume_goal_from_phase_sqlite(
+    path: &Path,
+    workspace_id: &str,
+    goal_id: &str,
+    phase_id: &str,
+) -> ApiResult<GoalStatusResponse> {
+    let now = unix_timestamp_millis();
+    let mut connection = open_session_connection(path).map_err(sqlite_api_error)?;
+    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+    let event;
+    {
+        // codex 审查 #1：读 goal/phases + 算闭包 + 写入全部放进同一 Immediate 事务，
+        // 避免与并发 cancel / set_goal_plan 竞态（否则可能基于旧 DAG 算闭包、或对已取消的
+        // goal 写 resumed 事件）。
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_api_error)?;
+        let (status, current_iteration, max_iterations): (String, i64, i64) = tx
+            .query_row(
+                "SELECT status, current_iteration, max_iterations FROM goals \
+                 WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, goal_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(sqlite_api_error)?
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Goal does not exist."))?;
+        if status == "cancelled" {
+            return Err(api_error(StatusCode::BAD_REQUEST, "Cannot resume a cancelled goal."));
+        }
+        // codex 审查 #2：与普通 resume 一致——预算耗尽先抬高 max_iterations，否则续跑出来的
+        // running goal 实际跑不动（commander 拦派发、原子占用也会拒）。不清零 current_iteration，
+        // 免得绕过全局刹车。
+        if current_iteration >= max_iterations {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Goal iteration budget exhausted ({current_iteration}/{max_iterations}); raise max_iterations via /api/goals/{{goal_id}}/budget before resuming."
+                ),
+            ));
+        }
+        // 事务内读 phase 依赖图。
+        let phases: Vec<(String, Vec<String>)> = {
+            let mut stmt = tx
+                .prepare("SELECT id, depends_on_json FROM goal_phases WHERE goal_id = ?1")
+                .map_err(sqlite_api_error)?;
+            let rows = stmt
+                .query_map(params![goal_id], |row| {
+                    let id: String = row.get(0)?;
+                    let deps_json: String = row.get(1)?;
+                    Ok((id, deps_json))
+                })
+                .map_err(sqlite_api_error)?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, deps_json) = row.map_err(sqlite_api_error)?;
+                let deps: Vec<String> = serde_json::from_str(&deps_json).unwrap_or_default();
+                out.push((id, deps));
+            }
+            out
+        };
+        if !phases.iter().any(|(id, _)| id == phase_id) {
+            return Err(api_error(StatusCode::NOT_FOUND, "Goal phase does not exist."));
+        }
+        // 传递闭包：从 phase_id 出发，凡 depends_on 命中已入集合的 phase 也纳入。
+        // 反复扫描直到不再新增（phase 有限 + HashSet 单调增长 → 必终止，环也不会死循环）。
+        let mut to_reset: HashSet<String> = HashSet::new();
+        to_reset.insert(phase_id.to_string());
+        loop {
+            let mut added = false;
+            for (id, deps) in &phases {
+                if to_reset.contains(id) {
+                    continue;
+                }
+                if deps.iter().any(|dep| to_reset.contains(dep)) {
+                    to_reset.insert(id.clone());
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        {
+            let mut stmt = tx
+                .prepare(
+                    "UPDATE goal_phases SET status = 'pending', retry_count = 0, \
+                     last_verdict = NULL, last_reason = NULL, last_evidence_json = NULL, \
+                     route_hint = NULL, updated_at = ?1 WHERE goal_id = ?2 AND id = ?3",
+                )
+                .map_err(sqlite_api_error)?;
+            for id in &to_reset {
+                stmt.execute(params![u64_to_i64(now), goal_id, id])
+                    .map_err(sqlite_api_error)?;
+            }
+        }
+        // goal 置回 running，让 dispatch/commander 重新接管。
+        tx.execute(
+            "UPDATE goals SET status = 'running', updated_at = ?1 \
+             WHERE workspace_id = ?2 AND id = ?3 AND status != 'cancelled'",
+            params![u64_to_i64(now), workspace_id, goal_id],
+        )
+        .map_err(sqlite_api_error)?;
+        // 事件 payload 里 phase id 排序，日志/测试稳定（HashSet 顺序不定）。
+        let mut reset_sorted: Vec<String> = to_reset.iter().cloned().collect();
+        reset_sorted.sort();
+        event = insert_goal_event_connection_deferred(
+            &tx,
+            goal_id,
+            "goal-resumed-from-phase",
+            &format!(
+                "Resumed from phase {phase_id}; {} phase(s) reset to pending.",
+                reset_sorted.len()
+            ),
+            json!({
+                "caller": "goal-loop",
+                "from_phase_id": phase_id,
+                "reset_phase_ids": reset_sorted,
+            }),
+        )
+        .map_err(sqlite_api_error)?;
+        tx.commit().map_err(sqlite_api_error)?;
+    }
+    broadcast_goal_event(event);
     goal_status_sqlite(path, workspace_id, goal_id)
 }
 
@@ -40469,6 +40668,10 @@ struct ManualHandoffRequest {
     attach_message_ids: Option<Vec<String>>,
     originating_user_msg_id: Option<String>,
     depth: Option<u8>,
+    // GL-10（codex #1）：结构化交接契约只由服务端内部（goal 回退派发）构造，
+    // #[serde(skip)] 让它无法从 HTTP 请求体伪造——手工交接接口拿不到、也不接受它。
+    #[serde(skip)]
+    contract: Option<JsonValue>,
 }
 
 #[derive(Debug, Serialize)]
@@ -49089,6 +49292,7 @@ attach: last_assistant
             depth,
             status: "delivered".to_string(),
             rejected_reason: None,
+            contract: None,
             created_at,
             delivered_at: Some(created_at + 10),
             completed_at: None,
@@ -49235,6 +49439,7 @@ attach: last_assistant
                     attach_message_ids: None,
                     originating_user_msg_id: Some("user-1".to_string()),
                     depth: Some(0),
+                    contract: None,
                 },
             )
             .expect("manual handoff")
@@ -49294,6 +49499,7 @@ attach: last_assistant
                     attach_message_ids: None,
                     originating_user_msg_id: Some("user-1".to_string()),
                     depth: Some(0),
+                    contract: None,
                 },
             )
             .expect("first");
@@ -52193,6 +52399,7 @@ attach: last_assistant
                 depth: 0,
                 status: "delivered".to_string(),
                 rejected_reason: None,
+                contract: None,
                 created_at: 100,
                 delivered_at: Some(100),
                 completed_at: None,
@@ -53845,7 +54052,7 @@ attach: last_assistant
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
 
         let columns: Vec<String> = connection
             .prepare("PRAGMA table_info(goal_phases)")
@@ -53969,7 +54176,7 @@ attach: last_assistant
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
     }
 
     /// GL-02：读路径把 v13 的 6 列反序列化进 GoalPhaseDto，并能正确序列化给前端。
@@ -54637,6 +54844,159 @@ attach: last_assistant
         // 未知形态兜底也标注截断，不假装是完整 JSON。
         let unknown = super::goal_phase_evidence_digest(&serde_json::json!({ "weird": long }));
         assert!(unknown.contains("…[truncated]"));
+    }
+
+    /// GL-10：v14 迁移给 chat_handoffs 加 contract_json；结构化契约往返落库/读回，
+    /// 旧记录（contract=None）向后兼容。
+    #[test]
+    fn chat_handoff_contract_roundtrips_and_defaults_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("handoff.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        // 迁移后 user_version=14，contract_json 列存在。
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, 14);
+        let cols: Vec<String> = connection
+            .prepare("PRAGMA table_info(chat_handoffs)")
+            .expect("pragma")
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("q")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(cols.contains(&"contract_json".to_string()));
+        // chat_handoffs.chat_room_id 有外键 → 先建房间。
+        connection
+            .execute(
+                "INSERT INTO chat_rooms(id, name, created_at, updated_at) VALUES ('room','R',1,1)",
+                [],
+            )
+            .expect("seed room");
+        drop(connection);
+
+        let mk = |id: &str, contract: Option<serde_json::Value>| super::ChatHandoffRecord {
+            id: id.to_string(),
+            chat_room_id: "room".to_string(),
+            from_agent_id: "goal-commander".to_string(),
+            to_agent_id: "goal-implementer".to_string(),
+            intent: "重跑".to_string(),
+            intent_hash: "h".to_string(),
+            attach: "none".to_string(),
+            attach_message_ids: Vec::new(),
+            originating_user_msg_id: "u".to_string(),
+            depth: 0,
+            status: "delivered".to_string(),
+            rejected_reason: None,
+            contract,
+            created_at: 100,
+            delivered_at: Some(100),
+            completed_at: None,
+        };
+        // 带结构化契约的回退交接。
+        super::insert_chat_handoff_sqlite(
+            &db,
+            &mk(
+                "h-retry",
+                Some(serde_json::json!({
+                    "kind": "goal-phase-retry",
+                    "phase_id": "impl",
+                    "verdict": "fail",
+                    "reason": "缺 tests",
+                    "retry_count": 1,
+                    "max_retries": 2
+                })),
+            ),
+        )
+        .expect("insert retry");
+        // 普通交接（无契约）。
+        super::insert_chat_handoff_sqlite(&db, &mk("h-plain", None)).expect("insert plain");
+
+        let conn = super::open_session_connection(&db).expect("open");
+        let all = super::query_all_chat_handoffs_from_connection(&conn).expect("read");
+        let retry = all.iter().find(|h| h.id == "h-retry").expect("retry row");
+        assert_eq!(retry.contract.as_ref().unwrap()["verdict"], "fail");
+        assert_eq!(retry.contract.as_ref().unwrap()["retry_count"], 1);
+        let plain = all.iter().find(|h| h.id == "h-plain").expect("plain row");
+        assert!(plain.contract.is_none(), "普通交接 contract 应为 None");
+
+        // codex #2：库里若存了非法 JSON（外部篡改/历史脏数据），读回应原样保留成字符串，
+        // 不能静默丢成 None（否则 save() 全量重写会把它永久抹掉）。
+        let c = super::open_session_connection(&db).expect("open");
+        c.execute(
+            "UPDATE chat_handoffs SET contract_json = '{not valid json' WHERE id = 'h-plain'",
+            [],
+        )
+        .expect("corrupt");
+        let reread = super::query_all_chat_handoffs_from_connection(&c).expect("reread");
+        let corrupted = reread.iter().find(|h| h.id == "h-plain").expect("row");
+        assert_eq!(
+            corrupted.contract.as_ref().and_then(|v| v.as_str()),
+            Some("{not valid json"),
+            "非法 JSON 应原样保留成字符串，不丢失"
+        );
+    }
+
+    /// GL-12：从指定 phase 断点续跑——目标 phase 及其传递下游重置为 pending 且清空路由状态，
+    /// 上游已完成的 phase 原样保留，goal 置回 running。
+    #[test]
+    fn resume_from_phase_resets_target_and_downstream_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("resume-from.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        // 链：plan(completed) → impl(blocked,retry=3) → verify(pending, deps impl)。
+        // 另有一条独立分支 docs(completed, 不依赖 impl)，不应被重置。
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws','room','目标','paused',10,3,0,NULL,'{}',NULL,10,20,NULL); \
+                 INSERT INTO goal_phases \
+                   (id,goal_id,title,assigned_role,status,depends_on_json,skills_json,\
+                    output_artifacts_json,verification_json,created_at,updated_at,retry_count,max_retries,last_verdict) \
+                 VALUES \
+                   ('plan','g1','规划','planner','completed','[]','[]','[]',NULL,10,10,0,2,'pass'), \
+                   ('impl','g1','实现','implementer','blocked','[\"plan\"]','[]','[]',NULL,20,20,3,2,'fail'), \
+                   ('verify','g1','验证','verifier','pending','[\"impl\"]','[]','[]',NULL,30,30,1,2,'fail'), \
+                   ('docs','g1','文档','implementer','completed','[]','[]','[]',NULL,40,40,0,2,'pass');",
+            )
+            .expect("seed");
+        drop(connection);
+
+        let status = super::resume_goal_from_phase_sqlite(&db, "ws", "g1", "impl").expect("resume-from");
+        let phase = |id: &str| status.goal.phases.iter().find(|p| p.id == id).cloned().expect(id);
+
+        // 目标 impl + 下游 verify 重置为 pending、路由状态清空。
+        let im = phase("impl");
+        assert_eq!(im.status, "pending");
+        assert_eq!(im.retry_count, 0);
+        assert!(im.last_verdict.is_none());
+        let ve = phase("verify");
+        assert_eq!(ve.status, "pending", "下游 verify 应一并重置");
+        assert_eq!(ve.retry_count, 0);
+        assert!(ve.last_verdict.is_none());
+        // 上游 plan 与独立分支 docs 保持 completed。
+        assert_eq!(phase("plan").status, "completed", "上游不该被重置");
+        assert_eq!(phase("docs").status, "completed", "不依赖目标的分支不该被重置");
+        // goal 置回 running。
+        assert_eq!(status.goal.status, "running");
+        assert!(status
+            .goal
+            .recent_events
+            .iter()
+            .any(|e| e.event_type == "goal-resumed-from-phase"
+                && e.payload["from_phase_id"] == "impl"));
+
+        // codex #2：预算耗尽时 resume-from 与普通 resume 一致——拒绝，先抬高上限。
+        let c = super::open_session_connection(&db).expect("open");
+        c.execute("UPDATE goals SET current_iteration=10, max_iterations=10 WHERE id='g1'", [])
+            .expect("exhaust");
+        drop(c);
+        assert!(
+            super::resume_goal_from_phase_sqlite(&db, "ws", "g1", "impl").is_err(),
+            "预算耗尽时 resume-from 应被拒绝"
+        );
     }
 
     /// GL-09 辅助：搭一个带 commander + 指定角色会话的 store，供路由端到端测试复用。
