@@ -36060,6 +36060,71 @@ fn validate_goal_relative_path(path: &str, issues: &mut Vec<String>) {
     }
 }
 
+/// GL-03：一个 phase 的回退路由状态快照（v13 那 6 列）。
+///
+/// `set_goal_plan_sqlite` 走 DELETE + 全量 INSERT 重建 phases，而这些状态不在计划
+/// 请求里。若不显式保留，每次 re-plan（含 implementer→planner 回退触发的重规划）都会
+/// 把 retry_count/verdict 清零——正是 GL-03 要堵的坑。
+#[derive(Clone)]
+struct PhaseRoutingState {
+    retry_count: i64,
+    max_retries: i64,
+    last_verdict: Option<String>,
+    last_reason: Option<String>,
+    last_evidence_json: Option<String>,
+    route_hint: Option<String>,
+}
+
+impl Default for PhaseRoutingState {
+    fn default() -> Self {
+        // 新 phase 的默认值必须与 v13 建列默认一致：retry=0 / max=2 / 其余 NULL。
+        Self {
+            retry_count: 0,
+            max_retries: 2,
+            last_verdict: None,
+            last_reason: None,
+            last_evidence_json: None,
+            route_hint: None,
+        }
+    }
+}
+
+/// 重建计划前，按 phase id 抓出旧的回退路由状态，供 INSERT 时对号入座。
+/// 计划里新增的 phase id 查不到，调用方对其用 `PhaseRoutingState::default()`。
+fn query_goal_phase_routing_state(
+    connection: &Connection,
+    goal_id: &str,
+) -> rusqlite::Result<HashMap<String, PhaseRoutingState>> {
+    let mut stmt = connection.prepare(
+        r#"
+        SELECT id, retry_count, max_retries, last_verdict, last_reason,
+               last_evidence_json, route_hint
+        FROM goal_phases
+        WHERE goal_id = ?1
+        "#,
+    )?;
+    let rows = stmt.query_map(params![goal_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            PhaseRoutingState {
+                retry_count: row.get(1)?,
+                max_retries: row.get(2)?,
+                last_verdict: row.get(3)?,
+                last_reason: row.get(4)?,
+                last_evidence_json: row.get(5)?,
+                route_hint: row.get(6)?,
+            },
+        ))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (id, state) = row?;
+        // 键按 trim 归一，兼容历史里可能存进的带空白 id，与写路径的查找口径一致。
+        map.insert(id.trim().to_string(), state);
+    }
+    Ok(map)
+}
+
 fn set_goal_plan_sqlite(
     path: &Path,
     workspace_id: &str,
@@ -36079,7 +36144,16 @@ fn set_goal_plan_sqlite(
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error.to_string()))?;
     let mut connection = open_session_connection(path).map_err(sqlite_api_error)?;
     initialize_session_schema(&connection).map_err(sqlite_api_error)?;
-    let tx = connection.transaction().map_err(sqlite_api_error)?;
+    // GL-03：本事务第一条语句从 DELETE（写）变成了 SELECT（读旧路由状态）。deferred
+    // 事务下先读后写，WAL 里可能撞上 SQLITE_BUSY_SNAPSHOT（快照过期无法升级为写），
+    // busy_timeout 也救不了。用 Immediate 先拿写锁，再读再重建。
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sqlite_api_error)?;
+    // DELETE 之前先抓旧 phase 的回退路由状态，重建时对号保留，
+    // 否则每次 re-plan 都会把 retry_count/verdict 清零。
+    let preserved_routing =
+        query_goal_phase_routing_state(&tx, goal_id).map_err(sqlite_api_error)?;
     tx.execute(
         "DELETE FROM goal_phases WHERE goal_id = ?1",
         params![goal_id],
@@ -36091,16 +36165,27 @@ fn set_goal_plan_sqlite(
                 r#"
                 INSERT INTO goal_phases(
                     id, goal_id, title, assigned_role, status, depends_on_json,
-                    skills_json, output_artifacts_json, verification_json, created_at, updated_at
+                    skills_json, output_artifacts_json, verification_json, created_at, updated_at,
+                    retry_count, max_retries, last_verdict, last_reason,
+                    last_evidence_json, route_hint
                 )
-                VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?9)
+                VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?9,
+                        ?10, ?11, ?12, ?13, ?14, ?15)
                 "#,
             )
             .map_err(sqlite_api_error)?;
         for (index, phase) in payload.phases.iter().enumerate() {
             let phase_timestamp = now.saturating_add(index as u64);
+            // id 按 trim 归一：校验用的是 trim 后的 id，存储/查找也必须一致，否则
+            // " impl " 会被当成新 phase 把旧路由状态清零，还会把带空白的脏 id 存进库。
+            let phase_id = phase.id.trim();
+            // 旧 phase 保留其路由状态；计划新增的 phase 落默认值（retry=0/max=2）。
+            let routing = preserved_routing
+                .get(phase_id)
+                .cloned()
+                .unwrap_or_default();
             stmt.execute(params![
-                &phase.id,
+                phase_id,
                 goal_id,
                 phase.title.trim(),
                 phase.assigned_role.as_deref().unwrap_or("implementer"),
@@ -36117,6 +36202,12 @@ fn set_goal_plan_sqlite(
                     })
                     .and_then(|value| serde_json::to_string(&value).ok()),
                 u64_to_i64(phase_timestamp),
+                routing.retry_count,
+                routing.max_retries,
+                routing.last_verdict,
+                routing.last_reason,
+                routing.last_evidence_json,
+                routing.route_hint,
             ])
             .map_err(sqlite_api_error)?;
         }
@@ -53405,6 +53496,156 @@ attach: last_assistant
         let json1 = serde_json::to_value(p1).expect("serialize");
         assert!(json1["last_verdict"].is_null());
         assert!(json1["last_evidence"].is_null());
+    }
+
+    /// GL-03：re-plan（DELETE + 全量 INSERT）必须保留旧 phase 的回退路由状态，
+    /// 新增 phase 落默认值。
+    #[test]
+    fn set_goal_plan_preserves_routing_state_across_replan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("replan.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws-test','room','目标','running',5,1,0,NULL,'{}',NULL,10,20,NULL);",
+            )
+            .expect("seed goal");
+        drop(connection);
+
+        let plan = |ids: &[&str]| super::GoalPlanRequest {
+            phases: ids
+                .iter()
+                .map(|id| super::GoalPlanPhaseRequest {
+                    id: (*id).to_string(),
+                    title: format!("阶段 {id}"),
+                    assigned_role: Some("implementer".to_string()),
+                    depends_on: Vec::new(),
+                    skills_required: Vec::new(),
+                    output_artifacts: Vec::new(),
+                    verification: None,
+                })
+                .collect(),
+        };
+
+        // 首次落计划。
+        super::set_goal_plan_sqlite(&db, "ws-test", "g1", plan(&["impl", "verify"]))
+            .expect("initial plan");
+
+        // 模拟 GL-06 之后写入的回退状态。
+        let c = super::open_session_connection(&db).expect("open");
+        c.execute(
+            "UPDATE goal_phases SET retry_count=3, max_retries=5, last_verdict='fail', \
+             last_reason='缺测试', last_evidence_json='{\"missing\":[\"t.rs\"]}', \
+             route_hint='implementer' WHERE goal_id='g1' AND id='impl'",
+            [],
+        )
+        .expect("seed routing state");
+        drop(c);
+
+        // 再次落计划（re-plan），并新增一个 phase。旧的 DELETE+INSERT 会把状态清零。
+        super::set_goal_plan_sqlite(&db, "ws-test", "g1", plan(&["impl", "verify", "polish"]))
+            .expect("replan");
+
+        let c = super::open_session_connection(&db).expect("open");
+        // impl 的回退状态逐字段保留。
+        let (retry, max, verdict, reason, evidence, hint): (
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = c
+            .query_row(
+                "SELECT retry_count, max_retries, last_verdict, last_reason, \
+                 last_evidence_json, route_hint FROM goal_phases \
+                 WHERE goal_id='g1' AND id='impl'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .expect("impl row");
+        assert_eq!(retry, 3, "retry_count 不该被 re-plan 清零");
+        assert_eq!(max, 5);
+        assert_eq!(verdict.as_deref(), Some("fail"));
+        assert_eq!(reason.as_deref(), Some("缺测试"));
+        assert_eq!(evidence.as_deref(), Some("{\"missing\":[\"t.rs\"]}"));
+        assert_eq!(hint.as_deref(), Some("implementer"));
+
+        // 新增的 polish phase 落默认值。
+        let (nretry, nmax, nverdict): (i64, i64, Option<String>) = c
+            .query_row(
+                "SELECT retry_count, max_retries, last_verdict FROM goal_phases \
+                 WHERE goal_id='g1' AND id='polish'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("polish row");
+        assert_eq!(nretry, 0);
+        assert_eq!(nmax, 2);
+        assert!(nverdict.is_none());
+    }
+
+    /// GL-03（codex 审查补强）：re-plan 传入带首尾空白的 phase id 时，仍要按 trim 后的
+    /// id 命中旧路由状态、并把干净 id 存库，不能当成新 phase 清零。
+    #[test]
+    fn set_goal_plan_normalizes_whitespace_phase_id_and_keeps_routing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("ws-id.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws-test','room','目标','running',5,1,0,NULL,'{}',NULL,10,20,NULL);",
+            )
+            .expect("seed goal");
+        drop(connection);
+
+        let phase = |id: &str| super::GoalPlanRequest {
+            phases: vec![super::GoalPlanPhaseRequest {
+                id: id.to_string(),
+                title: "实现".to_string(),
+                assigned_role: Some("implementer".to_string()),
+                depends_on: Vec::new(),
+                skills_required: Vec::new(),
+                output_artifacts: Vec::new(),
+                verification: None,
+            }],
+        };
+
+        super::set_goal_plan_sqlite(&db, "ws-test", "g1", phase("impl")).expect("initial");
+        let c = super::open_session_connection(&db).expect("open");
+        c.execute(
+            "UPDATE goal_phases SET retry_count=2, last_verdict='fail' \
+             WHERE goal_id='g1' AND id='impl'",
+            [],
+        )
+        .expect("seed routing");
+        drop(c);
+
+        // 带空白的同一 id 重规划。
+        super::set_goal_plan_sqlite(&db, "ws-test", "g1", phase("  impl  ")).expect("replan");
+
+        let c = super::open_session_connection(&db).expect("open");
+        // 库里只应有一行、id 是干净的 "impl"。
+        let stored_id: String = c
+            .query_row("SELECT id FROM goal_phases WHERE goal_id='g1'", [], |r| {
+                r.get(0)
+            })
+            .expect("one row");
+        assert_eq!(stored_id, "impl", "脏 id 应被 trim 后存库");
+        // 路由状态没被当成新 phase 清零。
+        let (retry, verdict): (i64, Option<String>) = c
+            .query_row(
+                "SELECT retry_count, last_verdict FROM goal_phases WHERE goal_id='g1' AND id='impl'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(retry, 2, "带空白 id 的重规划不该清零 retry_count");
+        assert_eq!(verdict.as_deref(), Some("fail"));
     }
 
     #[test]
