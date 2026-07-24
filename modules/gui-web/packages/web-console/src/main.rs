@@ -7516,14 +7516,21 @@ struct GoalDeliveryOutcome {
 /// 判定 goal 是否已无可推进（完成）：状态为 completed，或无 runnable 阶段且无
 /// pending/running/paused（全部进入 completed/cancelled/skipped 终态）。
 fn goal_status_is_finished(status: &GoalStatusResponse) -> bool {
-    if status.goal.status == "completed" {
+    // 显式终态：completed / cancelled 才算跑完。
+    if matches!(status.goal.status.as_str(), "completed" | "cancelled") {
         return true;
+    }
+    // GL-05/06：paused / blocked 的 goal 明确「未完成」——它是卡住等人工，不是收尾。
+    // 定时任务据此不再把 blocked goal 误写成 completed。
+    if matches!(status.goal.status.as_str(), "paused" | "blocked") {
+        return false;
     }
     let counts = &status.phase_counts;
     next_runnable_goal_phase_id(&status.goal).is_none()
         && counts.pending == 0
         && counts.running == 0
         && counts.paused == 0
+        && counts.blocked == 0
         && !status.goal.phases.is_empty()
 }
 
@@ -15557,7 +15564,10 @@ async fn api_harness_metrics() -> ApiResult<Json<HarnessMetricsResponse>> {
         command_gate_failures: get("goal-phase-command-gate-failed"),
         verification_blocks: get("goal-phase-verification-blocked"),
         replan_requests: get("goal-phase-blocked-needs-replan"),
+        // GL-05/06：blocked（超重试上限）是新的升级信号；旧的两个 attention 事件已不再产生，
+        // 保留在和式里只为回看历史计数。
         escalations: get("goal-phase-replan-escalated")
+            + get("goal-phase-blocked")
             + get("goal-phase-verification-attention-required")
             + get("goal-phase-command-gate-attention-required"),
         l1_supervisor_triggers: HARNESS_L1_TRIGGERS.load(std::sync::atomic::Ordering::Relaxed),
@@ -31538,6 +31548,8 @@ impl SessionStore {
             .map_err(sqlite_api_error)?;
         update_goal_phase_status_connection(&tx, workspace_id, goal_id, phase_id, "completed")
             .map_err(sqlite_api_error)?;
+        // 事件在事务内只写库不广播，commit 成功后再统一广播（防回滚幽灵事件，codex #4）。
+        let mut pending_events = Vec::new();
         if let Some(verdict) = recorded_verdict {
             let verdict_evidence = (!evidence.is_empty()).then(|| json!({ "text": evidence }));
             record_phase_verdict_connection(
@@ -31549,35 +31561,42 @@ impl SessionStore {
                 verdict_evidence.as_ref(),
             )
             .map_err(sqlite_api_error)?;
-            insert_goal_event_connection(
+            pending_events.push(
+                insert_goal_event_connection_deferred(
+                    &tx,
+                    goal_id,
+                    "goal-phase-verdict",
+                    &format!("Phase {phase_id} verdict: {verdict}."),
+                    json!({
+                        "caller": "goal-loop",
+                        "phase_id": phase_id,
+                        "verdict": verdict,
+                        "assigned_role": phase.assigned_role.clone(),
+                    }),
+                )
+                .map_err(sqlite_api_error)?,
+            );
+        }
+        pending_events.push(
+            insert_goal_event_connection_deferred(
                 &tx,
                 goal_id,
-                "goal-phase-verdict",
-                &format!("Phase {phase_id} verdict: {verdict}."),
+                "phase-completed",
+                &format!("Phase {phase_id} completed with evidence."),
                 json!({
                     "caller": "goal-loop",
                     "phase_id": phase_id,
-                    "verdict": verdict,
                     "assigned_role": phase.assigned_role.clone(),
+                    "assigned_session_id": phase.assigned_session_id.clone(),
+                    "evidence": evidence,
                 }),
             )
-            .map_err(sqlite_api_error)?;
-        }
-        insert_goal_event_connection(
-            &tx,
-            goal_id,
-            "phase-completed",
-            &format!("Phase {phase_id} completed with evidence."),
-            json!({
-                "caller": "goal-loop",
-                "phase_id": phase_id,
-                "assigned_role": phase.assigned_role.clone(),
-                "assigned_session_id": phase.assigned_session_id.clone(),
-                "evidence": evidence,
-            }),
-        )
-        .map_err(sqlite_api_error)?;
+            .map_err(sqlite_api_error)?,
+        );
         tx.commit().map_err(sqlite_api_error)?;
+        for event in pending_events {
+            broadcast_goal_event(event);
+        }
         let status = goal_status_sqlite(&self.path, workspace_id, goal_id)?;
         if status.goal.status == "completed" {
             let removed = self.remove_goal_task_skill_overlays_from_state(goal_id);
@@ -31749,89 +31768,72 @@ impl SessionStore {
         // 复用现有 goal 暂停 + 事件机制，并用重试上限防止 planner↔implementer 死循环。
         if let Some(blocked_reason) = goal_phase_implementer_blocked_reason(&response.answer_text) {
             messages.append(&mut tool_messages);
-            let connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
+            let mut connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
             initialize_session_schema(&connection).map_err(sqlite_api_error)?;
-            let prior_replans =
-                goal_phase_replan_request_count(&connection, goal_id, phase_id).unwrap_or(0);
-            let replan_attempt = prior_replans + 1;
-            let note = format!(
-                "Goal phase blocked by implementer (attempt {replan_attempt}/{}): {blocked_reason}. Routing back to planner to revise the plan.",
-                GOAL_PHASE_REPLAN_MAX_RETRIES
-            );
-            messages.push(ChatMessageDto {
-                id: format!("msg-goal-{now}-{phase_id}-blocked-replan"),
-                author: "Goal feedback".to_string(),
-                role: "assistant".to_string(),
-                target: "Goal phase".to_string(),
-                content: note.clone(),
-                kind: "task-summary".to_string(),
-                attachments: Vec::new(),
-            });
-            insert_goal_event_connection(
-                &connection,
-                goal_id,
-                "goal-phase-blocked-needs-replan",
-                &note,
-                json!({
-                    "caller": "goal-loop",
-                    "phase_id": phase_id,
-                    "assigned_role": phase.assigned_role.clone(),
-                    "assigned_session_id": phase.assigned_session_id.clone(),
-                    "blocked_reason": blocked_reason,
-                    "replan_attempt": replan_attempt,
-                    "evidence": evidence,
-                }),
-            )
-            .map_err(sqlite_api_error)?;
-            // 阶段回到 pending（脱离 running），交回 planner/commander 重新规划与派发。
-            update_goal_phase_status_connection(
-                &connection,
-                workspace_id,
-                goal_id,
-                phase_id,
-                "pending",
-            )
-            .map_err(sqlite_api_error)?;
-            // 暂停 goal，等待 planner 重规划；达到重试上限则保持暂停并升级提示。
-            connection
-                .execute(
-                    r#"
-                    UPDATE goals
-                    SET status = 'paused', updated_at = ?1
-                    WHERE workspace_id = ?2
-                      AND id = ?3
-                      AND status NOT IN ('completed', 'cancelled', 'paused')
-                    "#,
-                    params![u64_to_i64(unix_timestamp_millis()), workspace_id, goal_id],
-                )
-                .map_err(sqlite_api_error)?;
-            if replan_attempt >= GOAL_PHASE_REPLAN_MAX_RETRIES {
-                let escalate = format!(
-                    "Goal escalation: phase {phase_id} still blocked after {replan_attempt} replan requests. Commander/human intervention required before further dispatch."
-                );
-                messages.push(ChatMessageDto {
-                    id: format!("msg-goal-{now}-{phase_id}-replan-escalate"),
-                    author: "Goal guardrail".to_string(),
-                    role: "assistant".to_string(),
-                    target: "Goal phase".to_string(),
-                    content: escalate.clone(),
-                    kind: "task-summary".to_string(),
-                    attachments: Vec::new(),
-                });
-                insert_goal_event_connection(
-                    &connection,
+            // GL-05/06（codex 二轮 #2）：implementer→planner 回退也统一到 retry_count，不再用事件
+            // 条数。未超上限 → phase 回 pending 交 planner 重规划、goal 暂停；超上限 → phase 置
+            // blocked、goal 暂停（此前只升级不 blocked，resume 后 pending 会被重新派发导致死循环）。
+            // codex 三轮 #低：note 保持事实陈述（implementer 报阻），不预判「回退 planner」——
+            // 最终是回退还是超限 blocked 由 outcome 决定，见下方 summary。
+            let note = format!("Goal phase reported blocked by implementer: {blocked_reason}.");
+            let outcome;
+            let replan_event;
+            {
+                let tx = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sqlite_api_error)?;
+                replan_event = insert_goal_event_connection_deferred(
+                    &tx,
                     goal_id,
-                    "goal-phase-replan-escalated",
-                    &escalate,
+                    "goal-phase-blocked-needs-replan",
+                    &note,
                     json!({
                         "caller": "goal-loop",
                         "phase_id": phase_id,
                         "assigned_role": phase.assigned_role.clone(),
-                        "replan_attempt": replan_attempt,
+                        "assigned_session_id": phase.assigned_session_id.clone(),
+                        "blocked_reason": blocked_reason,
+                        "evidence": evidence,
                     }),
                 )
                 .map_err(sqlite_api_error)?;
+                outcome = apply_phase_fail_retry_connection(
+                    &tx,
+                    workspace_id,
+                    goal_id,
+                    phase_id,
+                    &format!("implementer blocked: {blocked_reason}"),
+                    &json!({ "blocked_reason": blocked_reason, "text": evidence }),
+                    // 重规划回退：phase 回 pending 交 planner，goal 暂停等重规划。
+                    "pending",
+                    true,
+                )
+                .map_err(sqlite_api_error)?;
+                tx.commit().map_err(sqlite_api_error)?;
             }
+            broadcast_goal_event(replan_event);
+            broadcast_goal_event(outcome.event.clone());
+            // retry_count 是「校验门 + implementer 报阻」两条边共享的累计失败次数，文案据实措辞。
+            let summary = if outcome.blocked {
+                format!(
+                    "Goal escalation: phase {phase_id} blocked after {}/{} cumulative failures. Commander/human intervention required before further dispatch.",
+                    outcome.retry_count, outcome.max_retries
+                )
+            } else {
+                format!(
+                    "Goal phase reported blocked by implementer (cumulative failures {}/{}): {blocked_reason}. Routed back to planner to revise the plan; goal paused.",
+                    outcome.retry_count, outcome.max_retries
+                )
+            };
+            messages.push(ChatMessageDto {
+                id: format!("msg-goal-{now}-{phase_id}-replan"),
+                author: if outcome.blocked { "Goal guardrail" } else { "Goal feedback" }.to_string(),
+                role: "assistant".to_string(),
+                target: "Goal phase".to_string(),
+                content: summary,
+                kind: "task-summary".to_string(),
+                attachments: Vec::new(),
+            });
             self.append_chat_room_messages(&goal.chat_room_id, messages.clone())?;
             self.append_chat_messages(&agent.id, messages.clone())?;
             let status = goal_status_sqlite(&self.path, workspace_id, goal_id)?;
@@ -31848,34 +31850,26 @@ impl SessionStore {
         let missing_artifacts = goal_phase_missing_files(phase);
         if !missing_artifacts.is_empty() {
             messages.append(&mut tool_messages);
-            // verifier → implementer 回退：把校验未通过的具体证据（缺失/无效产物）回退给
-            // implementer 重新修改；阶段保持 running 以便同一 implementer 增量修复后再校验。
-            let note = format!(
-                "Goal verifier rejected the phase: required file artifact(s) missing or invalid: {}. Feedback routed back to implementer to revise; the phase stays running until valid exact file(s) exist.",
-                missing_artifacts.join(", ")
-            );
-            messages.push(ChatMessageDto {
-                id: format!("msg-goal-{now}-{phase_id}-verification-blocked"),
-                author: "Goal verification".to_string(),
-                role: "assistant".to_string(),
-                target: "Goal phase".to_string(),
-                content: note.clone(),
-                kind: "task-summary".to_string(),
-                attachments: Vec::new(),
-            });
             let mut connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
             initialize_session_schema(&connection).map_err(sqlite_api_error)?;
-            // GL-04：拒绝事件 + fail verdict 放进同一事务，避免「事件已计入 block 数但 verdict
-            // 列没写成」的撕裂态。缺失产物既进事件也进 evidence，供 GL-05/06 回退路由读取。
+            // GL-05/06：拒绝事件 + retry/verdict 统一处理放进同一事务。retry_count 超 max_retries
+            // 则 phase 置 blocked、goal 暂停（取代旧的「事件条数 >= 3」阈值）。事件延后到 commit
+            // 之后广播，避免回滚留下幽灵事件（codex #4）。
             let verdict_reason = format!(
                 "required file artifact(s) missing or invalid: {}",
                 missing_artifacts.join(", ")
             );
+            let note = format!(
+                "Goal verifier rejected the phase: required file artifact(s) missing or invalid: {}. Feedback routed back to implementer to revise.",
+                missing_artifacts.join(", ")
+            );
+            let outcome;
+            let blocked_event;
             {
                 let tx = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sqlite_api_error)?;
-                insert_goal_event_connection(
+                blocked_event = insert_goal_event_connection_deferred(
                     &tx,
                     goal_id,
                     "goal-phase-verification-blocked",
@@ -31890,67 +31884,47 @@ impl SessionStore {
                     }),
                 )
                 .map_err(sqlite_api_error)?;
-                record_phase_verdict_connection(
+                outcome = apply_phase_fail_retry_connection(
                     &tx,
+                    workspace_id,
                     goal_id,
                     phase_id,
-                    "fail",
-                    Some(&verdict_reason),
-                    Some(&json!({ "missing_artifacts": missing_artifacts, "text": evidence })),
+                    &verdict_reason,
+                    &json!({ "missing_artifacts": missing_artifacts, "text": evidence }),
+                    // 校验门重试：phase 留 running 原地重试，不暂停 goal。
+                    "running",
+                    false,
                 )
                 .map_err(sqlite_api_error)?;
                 tx.commit().map_err(sqlite_api_error)?;
             }
-            let blocked_count = goal_phase_verification_block_count(
-                &connection,
-                goal_id,
-                phase_id,
-                &missing_artifacts,
-            )
-            .map_err(sqlite_api_error)?;
-            if blocked_count >= GOAL_PHASE_VERIFICATION_ATTENTION_MIN_BLOCKS {
-                let attention_note = format!(
-                    "Goal phase needs attention: required file artifact(s) are still missing or invalid after {blocked_count} verification blocks: {}. The goal loop is paused; rerun after the assigned role creates valid exact file(s) or the plan is adjusted.",
+            broadcast_goal_event(blocked_event);
+            broadcast_goal_event(outcome.event.clone());
+            // codex #5：只发一条与最终状态一致的说明（重试中 / 已 blocked），不再自相矛盾。
+            let summary = if outcome.blocked {
+                format!(
+                    "Goal phase blocked: required file artifact(s) still missing or invalid after {}/{} attempts: {}. The goal loop is paused; rerun after the assigned role creates valid exact file(s) or the plan is adjusted.",
+                    outcome.retry_count,
+                    outcome.max_retries,
                     missing_artifacts.join(", ")
-                );
-                messages.push(ChatMessageDto {
-                    id: format!("msg-goal-{now}-{phase_id}-attention-required"),
-                    author: "Goal guardrail".to_string(),
-                    role: "assistant".to_string(),
-                    target: "Goal phase".to_string(),
-                    content: attention_note.clone(),
-                    kind: "task-summary".to_string(),
-                    attachments: Vec::new(),
-                });
-                connection
-                    .execute(
-                        r#"
-                        UPDATE goals
-                        SET status = 'paused', updated_at = ?1
-                        WHERE workspace_id = ?2
-                          AND id = ?3
-                          AND status NOT IN ('completed', 'cancelled', 'paused')
-                        "#,
-                        params![u64_to_i64(unix_timestamp_millis()), workspace_id, goal_id],
-                    )
-                    .map_err(sqlite_api_error)?;
-                insert_goal_event_connection(
-                    &connection,
-                    goal_id,
-                    "goal-phase-verification-attention-required",
-                    &attention_note,
-                    json!({
-                        "caller": "goal-loop",
-                        "phase_id": phase_id,
-                        "assigned_role": phase.assigned_role.clone(),
-                        "assigned_session_id": phase.assigned_session_id.clone(),
-                        "missing_artifacts": missing_artifacts,
-                        "blocked_count": blocked_count,
-                        "evidence": evidence,
-                    }),
                 )
-                .map_err(sqlite_api_error)?;
-            }
+            } else {
+                format!(
+                    "Goal verifier rejected the phase (retry {}/{}): required file artifact(s) missing or invalid: {}. The phase stays running for the implementer to revise.",
+                    outcome.retry_count,
+                    outcome.max_retries,
+                    missing_artifacts.join(", ")
+                )
+            };
+            messages.push(ChatMessageDto {
+                id: format!("msg-goal-{now}-{phase_id}-verification"),
+                author: if outcome.blocked { "Goal guardrail" } else { "Goal verification" }.to_string(),
+                role: "assistant".to_string(),
+                target: "Goal phase".to_string(),
+                content: summary,
+                kind: "task-summary".to_string(),
+                attachments: Vec::new(),
+            });
             self.append_chat_room_messages(&goal.chat_room_id, messages.clone())?;
             self.append_chat_messages(&agent.id, messages.clone())?;
             let status = goal_status_sqlite(&self.path, workspace_id, goal_id)?;
@@ -31970,26 +31944,20 @@ impl SessionStore {
         if !command_failures.is_empty() {
             messages.append(&mut tool_messages);
             let note = format!(
-                "Goal verifier rejected the phase: command gate failed:\n{}\nFeedback routed back to implementer to fix; the phase stays running until the commands pass.",
+                "Goal verifier rejected the phase: command gate failed:\n{}\nFeedback routed back to implementer to fix.",
                 command_failures.join("\n---\n")
             );
-            messages.push(ChatMessageDto {
-                id: format!("msg-goal-{now}-{phase_id}-command-gate"),
-                author: "Goal verification".to_string(),
-                role: "assistant".to_string(),
-                target: "Goal phase".to_string(),
-                content: note.clone(),
-                kind: "task-summary".to_string(),
-                attachments: Vec::new(),
-            });
             let mut connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
             initialize_session_schema(&connection).map_err(sqlite_api_error)?;
-            // GL-04：拒绝事件 + fail verdict 同一事务写入（与 FilesExist 分支对称）。
+            // GL-05/06：拒绝事件 + retry/verdict 统一处理（与 FilesExist 分支对称），
+            // 事件延后到 commit 之后广播。
+            let outcome;
+            let gate_event;
             {
                 let tx = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sqlite_api_error)?;
-                insert_goal_event_connection(
+                gate_event = insert_goal_event_connection_deferred(
                     &tx,
                     goal_id,
                     "goal-phase-command-gate-failed",
@@ -32004,59 +31972,42 @@ impl SessionStore {
                     }),
                 )
                 .map_err(sqlite_api_error)?;
-                // 命令门未过（cargo build/test 非零退出），记 fail verdict + 失败输出证据。
-                record_phase_verdict_connection(
+                outcome = apply_phase_fail_retry_connection(
                     &tx,
+                    workspace_id,
                     goal_id,
                     phase_id,
-                    "fail",
-                    Some("command gate failed"),
-                    Some(&json!({ "command_failures": command_failures, "text": evidence })),
+                    "command gate failed",
+                    &json!({ "command_failures": command_failures, "text": evidence }),
+                    // 命令门重试：phase 留 running 原地重试，不暂停 goal。
+                    "running",
+                    false,
                 )
                 .map_err(sqlite_api_error)?;
                 tx.commit().map_err(sqlite_api_error)?;
             }
-            let blocked_count = goal_phase_command_gate_block_count(&connection, goal_id, phase_id)
-                .map_err(sqlite_api_error)?;
-            if blocked_count >= GOAL_PHASE_VERIFICATION_ATTENTION_MIN_BLOCKS {
-                let attention_note = format!(
-                    "Goal phase needs attention: command gate still failing after {blocked_count} attempts. The goal loop is paused; rerun after the implementer fixes the build/test failures or the plan is adjusted."
-                );
-                messages.push(ChatMessageDto {
-                    id: format!("msg-goal-{now}-{phase_id}-command-attention"),
-                    author: "Goal guardrail".to_string(),
-                    role: "assistant".to_string(),
-                    target: "Goal phase".to_string(),
-                    content: attention_note.clone(),
-                    kind: "task-summary".to_string(),
-                    attachments: Vec::new(),
-                });
-                connection
-                    .execute(
-                        r#"
-                        UPDATE goals
-                        SET status = 'paused', updated_at = ?1
-                        WHERE workspace_id = ?2
-                          AND id = ?3
-                          AND status NOT IN ('completed', 'cancelled', 'paused')
-                        "#,
-                        params![u64_to_i64(unix_timestamp_millis()), workspace_id, goal_id],
-                    )
-                    .map_err(sqlite_api_error)?;
-                insert_goal_event_connection(
-                    &connection,
-                    goal_id,
-                    "goal-phase-command-gate-attention-required",
-                    &attention_note,
-                    json!({
-                        "caller": "goal-loop",
-                        "phase_id": phase_id,
-                        "assigned_role": phase.assigned_role.clone(),
-                        "blocked_count": blocked_count,
-                    }),
+            broadcast_goal_event(gate_event);
+            broadcast_goal_event(outcome.event.clone());
+            let summary = if outcome.blocked {
+                format!(
+                    "Goal phase blocked: command gate still failing after {}/{} attempts. The goal loop is paused; rerun after the implementer fixes the build/test failures or the plan is adjusted.",
+                    outcome.retry_count, outcome.max_retries
                 )
-                .map_err(sqlite_api_error)?;
-            }
+            } else {
+                format!(
+                    "Goal verifier rejected the phase (retry {}/{}): command gate failed. The phase stays running for the implementer to fix.",
+                    outcome.retry_count, outcome.max_retries
+                )
+            };
+            messages.push(ChatMessageDto {
+                id: format!("msg-goal-{now}-{phase_id}-command"),
+                author: if outcome.blocked { "Goal guardrail" } else { "Goal verification" }.to_string(),
+                role: "assistant".to_string(),
+                target: "Goal phase".to_string(),
+                content: summary,
+                kind: "task-summary".to_string(),
+                attachments: Vec::new(),
+            });
             self.append_chat_room_messages(&goal.chat_room_id, messages.clone())?;
             self.append_chat_messages(&agent.id, messages.clone())?;
             let status = goal_status_sqlite(&self.path, workspace_id, goal_id)?;
@@ -35054,6 +35005,7 @@ fn goal_phase_status_counts(phases: &[GoalPhaseDto]) -> GoalPhaseStatusCounts {
             "completed" => counts.completed += 1,
             "failed" => counts.failed += 1,
             "paused" => counts.paused += 1,
+            "blocked" => counts.blocked += 1,
             _ => counts.other += 1,
         }
     }
@@ -35274,13 +35226,17 @@ fn query_goal_events_connection(
     Ok(events)
 }
 
-fn insert_goal_event_connection(
+/// 只把事件写库、返回事件对象，**不广播**（GL-05/06 codex 审查修复 #4）。
+///
+/// 在事务里写事件时用它：SSE 广播必须等外层事务 commit 之后再发，否则事务回滚
+/// 会留下客户端已收到并去重的「幽灵事件」。调用方 commit 成功后再 broadcast_goal_event。
+fn insert_goal_event_connection_deferred(
     connection: &Connection,
     goal_id: &str,
     event_type: &str,
     message: &str,
     payload: JsonValue,
-) -> rusqlite::Result<usize> {
+) -> rusqlite::Result<GoalEventDto> {
     let now = unix_timestamp_millis();
     let event_id = format!(
         "goal-event-{now}-{:08x}",
@@ -35295,7 +35251,7 @@ fn insert_goal_event_connection(
         payload,
         created_at: now,
     };
-    let inserted = connection.execute(
+    connection.execute(
         r#"
         INSERT INTO goal_events(id, goal_id, event_type, message, payload_json, created_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -35308,11 +35264,22 @@ fn insert_goal_event_connection(
             payload_json,
             u64_to_i64(now)
         ],
-    );
-    if inserted.is_ok() {
-        broadcast_goal_event(event);
-    }
-    inserted
+    )?;
+    Ok(event)
+}
+
+/// 写事件并立即广播。非事务上下文用它；事务里请改用
+/// `insert_goal_event_connection_deferred` + commit 后 `broadcast_goal_event`。
+fn insert_goal_event_connection(
+    connection: &Connection,
+    goal_id: &str,
+    event_type: &str,
+    message: &str,
+    payload: JsonValue,
+) -> rusqlite::Result<usize> {
+    let event = insert_goal_event_connection_deferred(connection, goal_id, event_type, message, payload)?;
+    broadcast_goal_event(event);
+    Ok(1)
 }
 
 fn update_goal_phase_status_connection(
@@ -35375,6 +35342,109 @@ fn record_phase_verdict_connection(
         ],
     )?;
     Ok(())
+}
+
+/// GL-05/06：一次校验失败的路由结果。
+struct PhaseRetryOutcome {
+    retry_count: u32,
+    max_retries: u32,
+    /// 已超重试上限 → phase 置 blocked、goal 暂停。
+    blocked: bool,
+    /// goal-phase-retry / goal-phase-blocked 事件，等外层事务 commit 后再广播（防幽灵事件）。
+    event: GoalEventDto,
+}
+
+/// GL-05/06：所有失败回退边的统一处理（用户选定「统一到 retry_count」）。
+///
+/// 取代旧的「按事件条数 >= 固定阈值才暂停」逻辑——改由每个 phase 自己的
+/// retry_count/max_retries 决定，覆盖全部回退边：
+/// - 校验门失败（verifier→implementer 原地重试）：`retry_status="running"`，
+///   `pause_goal_on_retry=false`（phase 留 running，循环继续）；
+/// - implementer 报阻（implementer→planner 重规划）：`retry_status="pending"`，
+///   `pause_goal_on_retry=true`（phase 回 pending 交 planner，goal 暂停等重规划）。
+///
+/// 共同语义：retry_count+1，写 fail verdict/reason/evidence；未超上限 → status=retry_status
+/// （按需暂停 goal），记 `goal-phase-retry` 事件；超上限 → status=blocked、goal 暂停，
+/// 记 `goal-phase-blocked` 事件。retry_count 是权威计数（持久、经 GL-03 处理），不再依赖事件条数。
+fn apply_phase_fail_retry_connection(
+    connection: &Connection,
+    workspace_id: &str,
+    goal_id: &str,
+    phase_id: &str,
+    reason: &str,
+    evidence: &JsonValue,
+    retry_status: &str,
+    pause_goal_on_retry: bool,
+) -> rusqlite::Result<PhaseRetryOutcome> {
+    let (retry_count, max_retries): (i64, i64) = connection.query_row(
+        "SELECT retry_count, max_retries FROM goal_phases WHERE goal_id = ?1 AND id = ?2",
+        params![goal_id, phase_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let new_retry = retry_count + 1;
+    let blocked = new_retry > max_retries;
+    let now = unix_timestamp_millis();
+    // 超限 → blocked；否则落到 retry_status。status 与 retry_count/verdict 同一条 UPDATE，原子落库。
+    let next_status = if blocked { "blocked" } else { retry_status };
+    connection.execute(
+        "UPDATE goal_phases SET retry_count = ?1, last_verdict = 'fail', last_reason = ?2, \
+         last_evidence_json = ?3, status = ?4, updated_at = ?5 WHERE goal_id = ?6 AND id = ?7",
+        params![
+            new_retry,
+            reason,
+            evidence.to_string(),
+            next_status,
+            u64_to_i64(now),
+            goal_id,
+            phase_id,
+        ],
+    )?;
+    // blocked 或调用方要求时暂停 goal（等人工/等 planner）。
+    if blocked || pause_goal_on_retry {
+        connection.execute(
+            r#"
+            UPDATE goals SET status = 'paused', updated_at = ?1
+            WHERE workspace_id = ?2 AND id = ?3
+              AND status NOT IN ('completed', 'cancelled', 'paused')
+            "#,
+            params![u64_to_i64(now), workspace_id, goal_id],
+        )?;
+    }
+    let (event_type, message) = if blocked {
+        (
+            "goal-phase-blocked",
+            format!(
+                "Phase {phase_id} blocked after {new_retry} attempt(s) exceeded max_retries={max_retries}; goal paused for human intervention."
+            ),
+        )
+    } else {
+        (
+            "goal-phase-retry",
+            format!(
+                "Phase {phase_id} verdict fail; retry {new_retry}/{max_retries}, routed back to the assigned role to fix."
+            ),
+        )
+    };
+    // 事件在事务内只写库不广播；由调用方 commit 后广播。
+    let event = insert_goal_event_connection_deferred(
+        connection,
+        goal_id,
+        event_type,
+        &message,
+        json!({
+            "caller": "goal-loop",
+            "phase_id": phase_id,
+            "retry_count": new_retry,
+            "max_retries": max_retries,
+            "reason": reason,
+        }),
+    )?;
+    Ok(PhaseRetryOutcome {
+        retry_count: new_retry as u32,
+        max_retries: max_retries as u32,
+        blocked,
+        event,
+    })
 }
 
 fn goal_task_skill_memory_source(goal_id: &str) -> String {
@@ -35759,19 +35829,6 @@ async fn run_goal_gate_command(command: &str, cwd: &Path, timeout_ms: u64) -> Re
     Err(format!("`{command}` 失败（exit {code}）:\n{tail}"))
 }
 
-/// 统计某 phase 已触发的 Command 门控失败次数（达阈值后升级 attention 提示）。
-fn goal_phase_command_gate_block_count(
-    connection: &Connection,
-    goal_id: &str,
-    phase_id: &str,
-) -> rusqlite::Result<usize> {
-    Ok(query_goal_events_connection(connection, goal_id, 100)?
-        .into_iter()
-        .filter(|event| event.event_type == "goal-phase-command-gate-failed")
-        .filter(|event| event.payload.get("phase_id").and_then(JsonValue::as_str) == Some(phase_id))
-        .count())
-}
-
 /// 在不持 session_store 锁时执行 phase 的 Command 门控（异步），返回失败证据列表。
 /// 由 run_goal_phase_once 在 record 之前调用，结果作为参数传入 record 决定回退/完成。
 async fn run_goal_phase_command_gate(
@@ -35840,12 +35897,6 @@ fn goal_artifact_text_is_placeholder(lower_text: &str) -> bool {
     .any(|marker| lower_text.contains(marker))
 }
 
-const GOAL_PHASE_VERIFICATION_ATTENTION_MIN_BLOCKS: usize = 3;
-
-/// implementer 主动报告"无法完成此计划"时回退给上层 planner 重新规划的重试上限。
-/// 达到上限后 goal 暂停并上报，避免 planner↔implementer 死循环。
-const GOAL_PHASE_REPLAN_MAX_RETRIES: usize = 3;
-
 /// 检测 implementer 的回答是否表示"该计划无法完成、需要上层重新规划"。
 /// 命中任一明确信号即触发回退 planner 流程（见 record_goal_phase_model_result）。
 fn goal_phase_implementer_blocked_reason(answer_text: &str) -> Option<String> {
@@ -35881,38 +35932,6 @@ fn goal_phase_implementer_blocked_reason(answer_text: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-/// 统计某 phase 已触发的"回退 planner 重规划"次数，用于重试上限判断。
-fn goal_phase_replan_request_count(
-    connection: &Connection,
-    goal_id: &str,
-    phase_id: &str,
-) -> rusqlite::Result<usize> {
-    Ok(query_goal_events_connection(connection, goal_id, 100)?
-        .into_iter()
-        .filter(|event| event.event_type == "goal-phase-blocked-needs-replan")
-        .filter(|event| event.payload.get("phase_id").and_then(JsonValue::as_str) == Some(phase_id))
-        .count())
-}
-
-fn goal_phase_verification_block_count(
-    connection: &Connection,
-    goal_id: &str,
-    phase_id: &str,
-    missing_artifacts: &[String],
-) -> rusqlite::Result<usize> {
-    let missing: HashSet<&str> = missing_artifacts.iter().map(String::as_str).collect();
-    Ok(query_goal_events_connection(connection, goal_id, 100)?
-        .into_iter()
-        .filter(|event| event.event_type == "goal-phase-verification-blocked")
-        .filter(|event| event.payload.get("phase_id").and_then(JsonValue::as_str) == Some(phase_id))
-        .filter(|event| {
-            json_string_array(event.payload.get("missing_artifacts"))
-                .into_iter()
-                .any(|artifact| missing.contains(artifact.as_str()))
-        })
-        .count())
 }
 
 fn goal_task_memory_slug(value: &str) -> String {
@@ -36179,6 +36198,9 @@ struct PhaseRoutingState {
     last_reason: Option<String>,
     last_evidence_json: Option<String>,
     route_hint: Option<String>,
+    // GL-05/06（codex 二轮 #1）：旧 phase 的状态。若为 blocked，re-plan 视为显式解阻，
+    // 重置 retry_count 给一次干净的重试预算，而不是沿用已超限的计数（否则会绕过上限）。
+    status: String,
 }
 
 impl Default for PhaseRoutingState {
@@ -36191,6 +36213,7 @@ impl Default for PhaseRoutingState {
             last_reason: None,
             last_evidence_json: None,
             route_hint: None,
+            status: "pending".to_string(),
         }
     }
 }
@@ -36204,7 +36227,7 @@ fn query_goal_phase_routing_state(
     let mut stmt = connection.prepare(
         r#"
         SELECT id, retry_count, max_retries, last_verdict, last_reason,
-               last_evidence_json, route_hint
+               last_evidence_json, route_hint, status
         FROM goal_phases
         WHERE goal_id = ?1
         "#,
@@ -36219,6 +36242,7 @@ fn query_goal_phase_routing_state(
                 last_reason: row.get(4)?,
                 last_evidence_json: row.get(5)?,
                 route_hint: row.get(6)?,
+                status: row.get(7)?,
             },
         ))
     })?;
@@ -36260,6 +36284,8 @@ fn set_goal_plan_sqlite(
     // 否则每次 re-plan 都会把 retry_count/verdict 清零。
     let preserved_routing =
         query_goal_phase_routing_state(&tx, goal_id).map_err(sqlite_api_error)?;
+    // 事务内产生的事件延后到 commit 后广播（防回滚幽灵事件）。
+    let mut pending_plan_events: Vec<GoalEventDto> = Vec::new();
     tx.execute(
         "DELETE FROM goal_phases WHERE goal_id = ?1",
         params![goal_id],
@@ -36280,6 +36306,7 @@ fn set_goal_plan_sqlite(
                 "#,
             )
             .map_err(sqlite_api_error)?;
+        let mut unblocked_phase_ids = Vec::new();
         for (index, phase) in payload.phases.iter().enumerate() {
             let phase_timestamp = now.saturating_add(index as u64);
             // id 按 trim 归一：校验用的是 trim 后的 id，存储/查找也必须一致，否则
@@ -36290,6 +36317,14 @@ fn set_goal_plan_sqlite(
                 .get(phase_id)
                 .cloned()
                 .unwrap_or_default();
+            // GL-05/06（codex 二轮 #1）：re-plan 一个已 blocked 的 phase = 显式解阻，给它一次
+            // 干净的重试预算（retry_count 归 0），而不是沿用已超限的计数——否则 blocked→pending
+            // 后会额外获得一次执行绕过上限。非 blocked 的 phase 仍按 GL-03 保留 retry_count。
+            let was_blocked = routing.status == "blocked";
+            let effective_retry = if was_blocked { 0 } else { routing.retry_count };
+            if was_blocked {
+                unblocked_phase_ids.push(phase_id.to_string());
+            }
             stmt.execute(params![
                 phase_id,
                 goal_id,
@@ -36308,7 +36343,7 @@ fn set_goal_plan_sqlite(
                     })
                     .and_then(|value| serde_json::to_string(&value).ok()),
                 u64_to_i64(phase_timestamp),
-                routing.retry_count,
+                effective_retry,
                 routing.max_retries,
                 routing.last_verdict,
                 routing.last_reason,
@@ -36317,21 +36352,39 @@ fn set_goal_plan_sqlite(
             ])
             .map_err(sqlite_api_error)?;
         }
+        for unblocked in &unblocked_phase_ids {
+            pending_plan_events.push(
+                insert_goal_event_connection_deferred(
+                    &tx,
+                    goal_id,
+                    "goal-phase-unblocked",
+                    &format!("Phase {unblocked} unblocked by re-plan; retry budget reset."),
+                    json!({ "caller": "goal-loop", "phase_id": unblocked }),
+                )
+                .map_err(sqlite_api_error)?,
+            );
+        }
     }
     tx.execute(
         "UPDATE goals SET plan_json = ?1, updated_at = ?2 WHERE workspace_id = ?3 AND id = ?4",
         params![plan_json, u64_to_i64(now), workspace_id, goal_id],
     )
     .map_err(sqlite_api_error)?;
-    insert_goal_event_connection(
-        &tx,
-        goal_id,
-        "goal-plan-updated",
-        "Goal plan accepted and phases persisted.",
-        json!({ "phase_count": payload.phases.len() }),
-    )
-    .map_err(sqlite_api_error)?;
+    // codex 二轮 #3：goal-plan-updated 也延后到 commit 之后广播，避免回滚幽灵事件。
+    pending_plan_events.push(
+        insert_goal_event_connection_deferred(
+            &tx,
+            goal_id,
+            "goal-plan-updated",
+            "Goal plan accepted and phases persisted.",
+            json!({ "phase_count": payload.phases.len() }),
+        )
+        .map_err(sqlite_api_error)?,
+    );
     tx.commit().map_err(sqlite_api_error)?;
+    for event in pending_plan_events {
+        broadcast_goal_event(event);
+    }
     get_goal_sqlite(path, workspace_id, goal_id)
 }
 
@@ -36924,6 +36977,17 @@ fn review_goal_commander_sqlite(
                 "Phase has already been dispatched; monitor completion evidence before re-dispatch."
                     .to_string(),
                 false,
+            )
+        } else if phase.status == "blocked" {
+            // GL-05/06：超重试上限置 blocked 的 phase 绝不能再被派发（否则绕过重试上限）。
+            // 它是终态之外的「卡住」态，需人工显式解阻后才继续。
+            (
+                "blocked_retry_exhausted".to_string(),
+                format!(
+                    "Phase exhausted its retry budget (retry {}/{}) and is blocked; needs human resume before re-dispatch.",
+                    phase.retry_count, phase.max_retries
+                ),
+                true,
             )
         } else if !phase.assigned_session_available {
             let target = phase
@@ -39829,6 +39893,9 @@ struct GoalPhaseStatusCounts {
     completed: usize,
     failed: usize,
     paused: usize,
+    // GL-05/06：超重试上限的 phase 计入 blocked（此前落进 other，导致含 blocked 的 goal
+    // 被误判为已完成）。
+    blocked: usize,
     other: usize,
 }
 
@@ -51390,20 +51457,14 @@ attach: last_assistant
             "running",
         )
         .expect("mark running");
-        for index in 0..3 {
-            super::insert_goal_event_connection(
-                &connection,
-                &goal.id,
-                "goal-phase-verification-blocked",
-                &format!("Goal phase verification blocked by missing HTML artifact #{index}."),
-                serde_json::json!({
-                    "phase_id": "implement",
-                    "missing_artifacts": [missing_artifact.clone()],
-                    "attempt": index
-                }),
+        // GL-05/06：不再靠事件条数阈值。把 retry_count 顶到 max_retries(默认 2)，下一次
+        // FilesExist 失败即 retry_count=3 > 2 → phase 置 blocked、goal 暂停。
+        connection
+            .execute(
+                "UPDATE goal_phases SET retry_count = 2 WHERE goal_id = ?1 AND id = 'implement'",
+                super::params![&goal.id],
             )
-            .expect("seed blocked event");
-        }
+            .expect("seed retry_count at limit");
 
         let result = store
             .record_goal_phase_model_result(
@@ -51430,25 +51491,24 @@ attach: last_assistant
 
         let target = temp.path().join(&missing_artifact);
         assert_eq!(result.status.goal.status, "paused");
-        assert_eq!(result.status.goal.phases[0].status, "running");
+        // GL-05/06：超重试上限后 phase 本身置 blocked（旧行为是留 running 仅暂停 goal）。
+        assert_eq!(result.status.goal.phases[0].status, "blocked");
+        assert_eq!(result.status.goal.phases[0].retry_count, 3);
+        assert_eq!(result.status.goal.phases[0].last_verdict.as_deref(), Some("fail"));
         assert!(
             !target.exists(),
             "goal flow must not create artifacts on behalf of the model"
         );
         assert!(result.messages.iter().any(|message| {
-            message.kind == "task-summary" && message.content.contains("needs attention")
+            message.kind == "task-summary" && message.content.contains("blocked")
         }));
         let refreshed =
             super::get_goal_sqlite(&db_path, "workspace-html-recovery", &goal.id).expect("goal");
         assert_eq!(refreshed.status, "paused");
         assert!(refreshed.recent_events.iter().any(|event| event.event_type
-            == "goal-phase-verification-attention-required"
-            && event.payload["missing_artifacts"]
-                .as_array()
-                .is_some_and(|items| items.iter().any(|item| item == &missing_artifact))
-            && event.payload["blocked_count"]
-                .as_u64()
-                .is_some_and(|value| value >= 3)));
+            == "goal-phase-blocked"
+            && event.payload["phase_id"] == "implement"
+            && event.payload["retry_count"].as_u64() == Some(3)));
     }
 
     #[test]
@@ -53925,6 +53985,234 @@ attach: last_assistant
             .expect("row");
         assert_eq!(v2, "fail", "未知结论必须归一成 fail");
         assert_eq!(reason.as_deref(), Some("模型没给明确结论"));
+    }
+
+    /// GL-05/06：校验门失败统一走 retry_count——未超上限留 running 递增计数，
+    /// 超 max_retries 则 phase 置 blocked、goal 暂停，并各记 goal-phase-retry/blocked 事件。
+    #[test]
+    fn apply_phase_fail_retry_bumps_then_blocks_at_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("retry.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        // max_retries=2 → 第 1、2 次 fail 留 running，第 3 次超限 blocked。
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws','room','目标','running',5,1,0,NULL,'{}',NULL,10,20,NULL); \
+                 INSERT INTO goal_phases \
+                   (id,goal_id,title,assigned_role,status,depends_on_json,skills_json,\
+                    output_artifacts_json,verification_json,created_at,updated_at,\
+                    retry_count,max_retries) \
+                 VALUES ('impl','g1','实现','implementer','running','[]','[]','[]',NULL,10,10,0,2);",
+            )
+            .expect("seed");
+
+        let ev = serde_json::json!({ "text": "cargo test 失败" });
+        // 第 1 次：retry 1/2，未超限。
+        let o1 = super::apply_phase_fail_retry_connection(&connection, "ws", "g1", "impl", "门失败", &ev, "running", false)
+            .expect("retry1");
+        assert_eq!(o1.retry_count, 1);
+        assert!(!o1.blocked);
+        let (rc, st): (i64, String) = connection
+            .query_row(
+                "SELECT retry_count, status FROM goal_phases WHERE id='impl'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(rc, 1);
+        assert_eq!(st, "running", "未超限应保持 running 重试");
+
+        // 第 2 次：retry 2/2，仍未超限（2 <= 2）。
+        let o2 = super::apply_phase_fail_retry_connection(&connection, "ws", "g1", "impl", "门失败", &ev, "running", false)
+            .expect("retry2");
+        assert_eq!(o2.retry_count, 2);
+        assert!(!o2.blocked);
+
+        // 第 3 次：retry 3 > max 2 → blocked。
+        let o3 = super::apply_phase_fail_retry_connection(&connection, "ws", "g1", "impl", "门失败", &ev, "running", false)
+            .expect("retry3");
+        assert_eq!(o3.retry_count, 3);
+        assert!(o3.blocked, "超 max_retries 应 blocked");
+        let phase_status: String = connection
+            .query_row("SELECT status FROM goal_phases WHERE id='impl'", [], |r| r.get(0))
+            .expect("phase");
+        assert_eq!(phase_status, "blocked");
+        let goal_status: String = connection
+            .query_row("SELECT status FROM goals WHERE id='g1'", [], |r| r.get(0))
+            .expect("goal");
+        assert_eq!(goal_status, "paused", "超限应暂停 goal 等人工");
+
+        // 事件：两条 retry + 一条 blocked。
+        let events = super::query_goal_events_connection(&connection, "g1", 100).expect("events");
+        let retry_events = events
+            .iter()
+            .filter(|e| e.event_type == "goal-phase-retry")
+            .count();
+        let blocked_events = events
+            .iter()
+            .filter(|e| e.event_type == "goal-phase-blocked")
+            .count();
+        assert_eq!(retry_events, 2);
+        assert_eq!(blocked_events, 1);
+        // verdict/reason/evidence 也落库了。
+        let (verdict, reason): (String, String) = connection
+            .query_row(
+                "SELECT last_verdict, last_reason FROM goal_phases WHERE id='impl'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("verdict");
+        assert_eq!(verdict, "fail");
+        assert_eq!(reason, "门失败");
+    }
+
+    /// GL-05/06（codex 审查 #2）：含 blocked phase 的 goal 绝不能被判为已完成，
+    /// blocked 要单独计数（此前落进 other，导致定时任务把 blocked goal 误写成 completed）。
+    #[test]
+    fn blocked_phase_keeps_goal_unfinished() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("blocked.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        // goal 已 paused（apply 超限时会这么置），一个 completed + 一个 blocked phase。
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws','room','目标','paused',5,1,0,NULL,'{}',NULL,10,20,NULL); \
+                 INSERT INTO goal_phases \
+                   (id,goal_id,title,assigned_role,status,depends_on_json,skills_json,\
+                    output_artifacts_json,verification_json,created_at,updated_at,retry_count,max_retries) \
+                 VALUES \
+                   ('impl','g1','实现','implementer','completed','[]','[]','[]',NULL,10,10,0,2), \
+                   ('verify','g1','验证','verifier','blocked','[\"impl\"]','[]','[]',NULL,20,20,3,2);",
+            )
+            .expect("seed");
+        drop(connection);
+
+        let status = super::goal_status_sqlite(&db, "ws", "g1").expect("status");
+        assert_eq!(status.phase_counts.blocked, 1, "blocked 要单独计数");
+        assert_eq!(status.phase_counts.completed, 1);
+        assert!(
+            !super::goal_status_is_finished(&status),
+            "含 blocked phase 的 paused goal 不该被判为已完成"
+        );
+    }
+
+    /// GL-05/06（codex 审查 #1）：commander review 绝不能把 blocked phase 归类为
+    /// ready_to_dispatch——否则超重试上限后又被重新派发、绕过上限。
+    #[test]
+    fn commander_review_does_not_dispatch_blocked_phase() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("review.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws','room','目标','paused',5,1,0,NULL,'{}',NULL,10,20,NULL); \
+                 INSERT INTO goal_phases \
+                   (id,goal_id,title,assigned_role,status,depends_on_json,skills_json,\
+                    output_artifacts_json,verification_json,created_at,updated_at,retry_count,max_retries) \
+                 VALUES ('impl','g1','实现','implementer','blocked','[]','[]','[]',NULL,10,10,3,2);",
+            )
+            .expect("seed");
+        drop(connection);
+
+        // 空 sessions：blocked 分支排在 assigned_session_available 之前，仍应命中 blocked。
+        let review = super::review_goal_commander_sqlite(&db, "ws", "g1", &[]).expect("review");
+        let phase = review
+            .phase_reviews
+            .iter()
+            .find(|p| p.phase_id == "impl")
+            .expect("phase review");
+        assert_eq!(
+            phase.action, "blocked_retry_exhausted",
+            "blocked phase 必须分类为 blocked_retry_exhausted，不能 ready_to_dispatch"
+        );
+        assert_ne!(phase.action, "ready_to_dispatch");
+        assert!(review.pause_recommended, "有 blocked phase 应建议暂停");
+    }
+
+    /// GL-05/06（codex 二轮 #1）：re-plan 一个已 blocked 的 phase 视为显式解阻——
+    /// 重置 retry_count 给干净预算，而不是沿用超限计数（否则会绕过重试上限）。
+    /// 非 blocked 的 phase 仍按 GL-03 保留 retry_count。
+    #[test]
+    fn replan_unblocks_blocked_phase_and_resets_budget() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("unblock.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws','room','目标','paused',5,1,0,NULL,'{}',NULL,10,20,NULL);",
+            )
+            .expect("seed goal");
+        drop(connection);
+
+        let plan = || super::GoalPlanRequest {
+            phases: vec![
+                super::GoalPlanPhaseRequest {
+                    id: "impl".to_string(),
+                    title: "实现".to_string(),
+                    assigned_role: Some("implementer".to_string()),
+                    depends_on: Vec::new(),
+                    skills_required: Vec::new(),
+                    output_artifacts: Vec::new(),
+                    verification: None,
+                },
+                super::GoalPlanPhaseRequest {
+                    id: "verify".to_string(),
+                    title: "验证".to_string(),
+                    assigned_role: Some("verifier".to_string()),
+                    depends_on: vec!["impl".to_string()],
+                    skills_required: Vec::new(),
+                    output_artifacts: Vec::new(),
+                    verification: None,
+                },
+            ],
+        };
+        super::set_goal_plan_sqlite(&db, "ws", "g1", plan()).expect("initial plan");
+
+        // impl 超限 blocked（retry=3/max=2）；verify 正常重试中（retry=1/max=2，未 blocked）。
+        let c = super::open_session_connection(&db).expect("open");
+        c.execute(
+            "UPDATE goal_phases SET status='blocked', retry_count=3, max_retries=2, last_verdict='fail' WHERE id='impl'",
+            [],
+        )
+        .expect("block impl");
+        c.execute(
+            "UPDATE goal_phases SET retry_count=1, last_verdict='fail' WHERE id='verify'",
+            [],
+        )
+        .expect("retry verify");
+        drop(c);
+
+        // 重规划（同一份计划）。
+        super::set_goal_plan_sqlite(&db, "ws", "g1", plan()).expect("replan");
+
+        let c = super::open_session_connection(&db).expect("open");
+        let (impl_status, impl_retry): (String, i64) = c
+            .query_row(
+                "SELECT status, retry_count FROM goal_phases WHERE id='impl'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("impl");
+        // blocked phase：重置为 pending + retry_count=0（干净预算），不再绕过上限。
+        assert_eq!(impl_status, "pending", "解阻后应回 pending");
+        assert_eq!(impl_retry, 0, "blocked phase 重规划应重置 retry_count");
+        // 非 blocked 的 verify：retry_count 按 GL-03 保留。
+        let verify_retry: i64 = c
+            .query_row("SELECT retry_count FROM goal_phases WHERE id='verify'", [], |r| r.get(0))
+            .expect("verify");
+        assert_eq!(verify_retry, 1, "非 blocked phase 的 retry_count 仍保留");
+        // 记了解阻事件。
+        let events = super::query_goal_events_connection(&c, "g1", 100).expect("events");
+        assert!(events.iter().any(|e| e.event_type == "goal-phase-unblocked"
+            && e.payload["phase_id"] == "impl"));
     }
 
     #[test]
