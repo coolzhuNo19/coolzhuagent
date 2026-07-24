@@ -31504,7 +31504,7 @@ impl SessionStore {
         payload: GoalPhaseCompleteRequest,
     ) -> ApiResult<GoalStatusResponse> {
         self.save()?;
-        let connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
+        let mut connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
         initialize_session_schema(&connection).map_err(sqlite_api_error)?;
         let goal = get_goal_sqlite(&self.path, workspace_id, goal_id)?;
         let phase = goal
@@ -31525,16 +31525,46 @@ impl SessionStore {
             .chars()
             .take(2_000)
             .collect::<String>();
-        update_goal_phase_status_connection(
-            &connection,
-            workspace_id,
-            goal_id,
-            phase_id,
-            "completed",
-        )
-        .map_err(sqlite_api_error)?;
+        // GL-04：verdict 只由调用方显式给出——自动运行路径确认校验通过后传 Some("pass")；
+        // 通用/手工完成传 None，不推断结论、绝不伪造 pass。归一在 record 里做。
+        let recorded_verdict = payload
+            .verdict
+            .as_deref()
+            .map(|value| if value.trim().eq_ignore_ascii_case("pass") { "pass" } else { "fail" });
+        // GL-04（codex 审查）：status + verdict + 事件放进同一事务，避免出现「status=completed
+        // 但 last_verdict 仍是旧值/NULL」的撕裂中间态。用 Immediate 先拿写锁。
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_api_error)?;
+        update_goal_phase_status_connection(&tx, workspace_id, goal_id, phase_id, "completed")
+            .map_err(sqlite_api_error)?;
+        if let Some(verdict) = recorded_verdict {
+            let verdict_evidence = (!evidence.is_empty()).then(|| json!({ "text": evidence }));
+            record_phase_verdict_connection(
+                &tx,
+                goal_id,
+                phase_id,
+                verdict,
+                None,
+                verdict_evidence.as_ref(),
+            )
+            .map_err(sqlite_api_error)?;
+            insert_goal_event_connection(
+                &tx,
+                goal_id,
+                "goal-phase-verdict",
+                &format!("Phase {phase_id} verdict: {verdict}."),
+                json!({
+                    "caller": "goal-loop",
+                    "phase_id": phase_id,
+                    "verdict": verdict,
+                    "assigned_role": phase.assigned_role.clone(),
+                }),
+            )
+            .map_err(sqlite_api_error)?;
+        }
         insert_goal_event_connection(
-            &connection,
+            &tx,
             goal_id,
             "phase-completed",
             &format!("Phase {phase_id} completed with evidence."),
@@ -31547,6 +31577,7 @@ impl SessionStore {
             }),
         )
         .map_err(sqlite_api_error)?;
+        tx.commit().map_err(sqlite_api_error)?;
         let status = goal_status_sqlite(&self.path, workspace_id, goal_id)?;
         if status.goal.status == "completed" {
             let removed = self.remove_goal_task_skill_overlays_from_state(goal_id);
@@ -31832,23 +31863,44 @@ impl SessionStore {
                 kind: "task-summary".to_string(),
                 attachments: Vec::new(),
             });
-            let connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
+            let mut connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
             initialize_session_schema(&connection).map_err(sqlite_api_error)?;
-            insert_goal_event_connection(
-                &connection,
-                goal_id,
-                "goal-phase-verification-blocked",
-                &note,
-                json!({
-                    "caller": "goal-loop",
-                    "phase_id": phase_id,
-                    "assigned_role": phase.assigned_role.clone(),
-                    "assigned_session_id": phase.assigned_session_id.clone(),
-                    "missing_artifacts": missing_artifacts,
-                    "evidence": evidence,
-                }),
-            )
-            .map_err(sqlite_api_error)?;
+            // GL-04：拒绝事件 + fail verdict 放进同一事务，避免「事件已计入 block 数但 verdict
+            // 列没写成」的撕裂态。缺失产物既进事件也进 evidence，供 GL-05/06 回退路由读取。
+            let verdict_reason = format!(
+                "required file artifact(s) missing or invalid: {}",
+                missing_artifacts.join(", ")
+            );
+            {
+                let tx = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sqlite_api_error)?;
+                insert_goal_event_connection(
+                    &tx,
+                    goal_id,
+                    "goal-phase-verification-blocked",
+                    &note,
+                    json!({
+                        "caller": "goal-loop",
+                        "phase_id": phase_id,
+                        "assigned_role": phase.assigned_role.clone(),
+                        "assigned_session_id": phase.assigned_session_id.clone(),
+                        "missing_artifacts": missing_artifacts,
+                        "evidence": evidence,
+                    }),
+                )
+                .map_err(sqlite_api_error)?;
+                record_phase_verdict_connection(
+                    &tx,
+                    goal_id,
+                    phase_id,
+                    "fail",
+                    Some(&verdict_reason),
+                    Some(&json!({ "missing_artifacts": missing_artifacts, "text": evidence })),
+                )
+                .map_err(sqlite_api_error)?;
+                tx.commit().map_err(sqlite_api_error)?;
+            }
             let blocked_count = goal_phase_verification_block_count(
                 &connection,
                 goal_id,
@@ -31930,23 +31982,40 @@ impl SessionStore {
                 kind: "task-summary".to_string(),
                 attachments: Vec::new(),
             });
-            let connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
+            let mut connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
             initialize_session_schema(&connection).map_err(sqlite_api_error)?;
-            insert_goal_event_connection(
-                &connection,
-                goal_id,
-                "goal-phase-command-gate-failed",
-                &note,
-                json!({
-                    "caller": "goal-loop",
-                    "phase_id": phase_id,
-                    "assigned_role": phase.assigned_role.clone(),
-                    "assigned_session_id": phase.assigned_session_id.clone(),
-                    "failures": command_failures.clone(),
-                    "evidence": evidence.clone(),
-                }),
-            )
-            .map_err(sqlite_api_error)?;
+            // GL-04：拒绝事件 + fail verdict 同一事务写入（与 FilesExist 分支对称）。
+            {
+                let tx = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sqlite_api_error)?;
+                insert_goal_event_connection(
+                    &tx,
+                    goal_id,
+                    "goal-phase-command-gate-failed",
+                    &note,
+                    json!({
+                        "caller": "goal-loop",
+                        "phase_id": phase_id,
+                        "assigned_role": phase.assigned_role.clone(),
+                        "assigned_session_id": phase.assigned_session_id.clone(),
+                        "failures": command_failures.clone(),
+                        "evidence": evidence.clone(),
+                    }),
+                )
+                .map_err(sqlite_api_error)?;
+                // 命令门未过（cargo build/test 非零退出），记 fail verdict + 失败输出证据。
+                record_phase_verdict_connection(
+                    &tx,
+                    goal_id,
+                    phase_id,
+                    "fail",
+                    Some("command gate failed"),
+                    Some(&json!({ "command_failures": command_failures, "text": evidence })),
+                )
+                .map_err(sqlite_api_error)?;
+                tx.commit().map_err(sqlite_api_error)?;
+            }
             let blocked_count = goal_phase_command_gate_block_count(&connection, goal_id, phase_id)
                 .map_err(sqlite_api_error)?;
             if blocked_count >= GOAL_PHASE_VERIFICATION_ATTENTION_MIN_BLOCKS {
@@ -32004,12 +32073,15 @@ impl SessionStore {
         messages.append(&mut tool_messages);
         self.append_chat_room_messages(&goal.chat_room_id, messages.clone())?;
         self.append_chat_messages(&agent.id, messages.clone())?;
+        // GL-04：能走到这里说明本 phase 适用的确定性校验门（FilesExist / 命令门）都未拒绝——
+        // 上面两个 fail 分支会提前 return。只有此路径有资格断言 pass。
         let status = self.complete_goal_phase(
             workspace_id,
             goal_id,
             phase_id,
             GoalPhaseCompleteRequest {
                 evidence: Some(evidence),
+                verdict: Some("pass".to_string()),
             },
         )?;
         Ok(GoalPhaseRunResponse {
@@ -35268,6 +35340,40 @@ fn update_goal_phase_status_connection(
         params![u64_to_i64(now), workspace_id, goal_id],
     )?;
     cleanup_goal_task_skill_memory_if_finished_connection(connection, workspace_id, goal_id, now)?;
+    Ok(())
+}
+
+/// GL-04：把校验结论写回 phase 的回退路由列。与 `update_goal_phase_status_connection`
+/// 并列——那个管 status，这个管 verdict/reason/evidence，供 GL-05/06 的结果驱动路由读取。
+///
+/// verdict 只认 `pass`/`fail`，其它一律归一成 `fail`（AC：无结论/解析失败绝不静默 pass）。
+/// evidence 以 JSON 落到 `last_evidence_json`，前端读回时解析成对象（见 GL-02 读路径）。
+fn record_phase_verdict_connection(
+    connection: &Connection,
+    goal_id: &str,
+    phase_id: &str,
+    verdict: &str,
+    reason: Option<&str>,
+    evidence: Option<&JsonValue>,
+) -> rusqlite::Result<()> {
+    let normalized = if verdict.trim().eq_ignore_ascii_case("pass") {
+        "pass"
+    } else {
+        "fail"
+    };
+    let evidence_json = evidence.map(|value| value.to_string());
+    connection.execute(
+        "UPDATE goal_phases SET last_verdict = ?1, last_reason = ?2, \
+         last_evidence_json = ?3, updated_at = ?4 WHERE goal_id = ?5 AND id = ?6",
+        params![
+            normalized,
+            reason,
+            evidence_json,
+            u64_to_i64(unix_timestamp_millis()),
+            goal_id,
+            phase_id,
+        ],
+    )?;
     Ok(())
 }
 
@@ -39944,6 +40050,10 @@ struct GoalRoleConfigStored {
 #[derive(Debug, Deserialize)]
 struct GoalPhaseCompleteRequest {
     evidence: Option<String>,
+    // GL-04：只有明确知道校验通过的调用方（自动运行路径）才传 Some("pass")。
+    // 通用/手工完成（前端 Complete 按钮）默认 None——不凭空写 verdict，绝不伪造 pass。
+    #[serde(default)]
+    verdict: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -51493,6 +51603,8 @@ attach: last_assistant
                 "plan",
                 super::GoalPhaseCompleteRequest {
                     evidence: Some("Planner produced the accepted phase report.".to_string()),
+                    // 模拟自动运行路径：校验通过后显式断言 pass。
+                    verdict: Some("pass".to_string()),
                 },
             )
             .expect("phase completion");
@@ -51515,6 +51627,110 @@ attach: last_assistant
             .memory_beads
             .iter()
             .all(|bead| bead.kind != "goal-task-skill"));
+
+        // GL-04：完成走的是「校验通过」路径 → phase 记 pass verdict + goal-phase-verdict 事件。
+        assert!(status
+            .goal
+            .recent_events
+            .iter()
+            .any(|event| event.event_type == "goal-phase-verdict"
+                && event.payload["verdict"] == serde_json::json!("pass")));
+        let phase = status
+            .goal
+            .phases
+            .iter()
+            .find(|phase| phase.id == "plan")
+            .expect("plan phase");
+        assert_eq!(phase.last_verdict.as_deref(), Some("pass"));
+        assert_eq!(
+            phase.last_evidence,
+            Some(serde_json::json!({ "text": "Planner produced the accepted phase report." }))
+        );
+    }
+
+    /// GL-04（codex 审查修复）：手工完成（不带 verdict）绝不能伪造 pass——
+    /// complete_goal_phase 是通用/前端可调的入口，不重跑校验门，不得凭空写结论。
+    #[test]
+    fn manual_complete_without_verdict_does_not_fabricate_pass() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("manual.sqlite3");
+        let mut store = super::SessionStore {
+            path: db.clone(),
+            legacy_json_path: tmp.path().join("sessions.json"),
+            capacity: super::SessionStoreCapacity::default(),
+            state: super::PersistedSessionState {
+                sessions: Vec::new(),
+                active_session_id: None,
+                active_vision_session_id: None,
+                chat_rooms: vec![super::PersistedChatRoom {
+                    id: "room-manual".to_string(),
+                    name: "Room".to_string(),
+                    created_at: 1,
+                    updated_at: 1,
+                    messages: Vec::new(),
+                }],
+                active_chat_room_id: Some("room-manual".to_string()),
+            },
+        };
+        let goal = super::create_goal_sqlite(
+            &db,
+            "ws-manual",
+            "room-manual",
+            super::CreateGoalRequest {
+                title: "手工完成".to_string(),
+                chat_room_id: Some("room-manual".to_string()),
+                max_iterations: Some(2),
+                background: Some(false),
+                originating_user_msg_id: None,
+                completion_condition: Some(serde_json::json!({ "type": "UserConfirm" })),
+            },
+        )
+        .expect("goal");
+        super::set_goal_plan_sqlite(
+            &db,
+            "ws-manual",
+            &goal.id,
+            super::GoalPlanRequest {
+                phases: vec![super::GoalPlanPhaseRequest {
+                    id: "impl".to_string(),
+                    title: "实现".to_string(),
+                    assigned_role: Some("implementer".to_string()),
+                    depends_on: Vec::new(),
+                    skills_required: Vec::new(),
+                    output_artifacts: Vec::new(),
+                    verification: None,
+                }],
+            },
+        )
+        .expect("plan");
+
+        let status = store
+            .complete_goal_phase(
+                "ws-manual",
+                &goal.id,
+                "impl",
+                super::GoalPhaseCompleteRequest {
+                    evidence: Some("手工点了完成".to_string()),
+                    verdict: None,
+                },
+            )
+            .expect("complete");
+
+        let phase = status
+            .goal
+            .phases
+            .iter()
+            .find(|p| p.id == "impl")
+            .expect("phase");
+        // 状态确实完成了……
+        assert_eq!(phase.status, "completed");
+        // ……但没有凭空写 verdict（保持 NULL），也没有 goal-phase-verdict 事件。
+        assert!(phase.last_verdict.is_none(), "手工完成不该伪造 pass verdict");
+        assert!(!status
+            .goal
+            .recent_events
+            .iter()
+            .any(|event| event.event_type == "goal-phase-verdict"));
     }
 
     #[test]
@@ -53646,6 +53862,69 @@ attach: last_assistant
             .expect("row");
         assert_eq!(retry, 2, "带空白 id 的重规划不该清零 retry_count");
         assert_eq!(verdict.as_deref(), Some("fail"));
+    }
+
+    /// GL-04：record_phase_verdict_connection 写回 verdict/reason/evidence；
+    /// 非 pass/fail 的输入一律归一成 fail（绝不静默 pass），evidence 以 JSON 落库。
+    #[test]
+    fn record_phase_verdict_normalizes_and_persists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("verdict.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws','room','目标','running',5,1,0,NULL,'{}',NULL,10,20,NULL); \
+                 INSERT INTO goal_phases \
+                   (id,goal_id,title,assigned_role,status,depends_on_json,skills_json,\
+                    output_artifacts_json,verification_json,created_at,updated_at) \
+                 VALUES ('impl','g1','实现','implementer','running','[]','[]','[]',NULL,10,10);",
+            )
+            .expect("seed");
+
+        // pass（大小写不敏感）+ 证据对象。
+        super::record_phase_verdict_connection(
+            &connection,
+            "g1",
+            "impl",
+            "PASS",
+            None,
+            Some(&serde_json::json!({ "text": "ok" })),
+        )
+        .expect("record pass");
+        let (v, ev): (String, String) = connection
+            .query_row(
+                "SELECT last_verdict, last_evidence_json FROM goal_phases WHERE id='impl'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(v, "pass");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ev).unwrap(),
+            serde_json::json!({ "text": "ok" })
+        );
+
+        // 无法解析的结论（"maybe"）必须落 fail，绝不静默 pass。
+        super::record_phase_verdict_connection(
+            &connection,
+            "g1",
+            "impl",
+            "maybe",
+            Some("模型没给明确结论"),
+            None,
+        )
+        .expect("record fallback");
+        let (v2, reason): (String, Option<String>) = connection
+            .query_row(
+                "SELECT last_verdict, last_reason FROM goal_phases WHERE id='impl'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(v2, "fail", "未知结论必须归一成 fail");
+        assert_eq!(reason.as_deref(), Some("模型没给明确结论"));
     }
 
     #[test]
