@@ -852,6 +852,7 @@ fn app() -> Router {
         )
         .route("/api/goals/{goal_id}/pause", post(api_pause_goal))
         .route("/api/goals/{goal_id}/resume", post(api_resume_goal))
+        .route("/api/goals/{goal_id}/budget", post(api_update_goal_budget))
         .route("/api/goals/{goal_id}/cancel", post(api_cancel_goal))
         .route(
             "/api/sessions/{session_id}/messages/{message_id}",
@@ -13301,6 +13302,21 @@ async fn api_resume_goal(
     let workspace_id = workspace_identity(&workspace);
     let db_path = default_session_sqlite_path();
     let status = resume_goal_sqlite(&db_path, &workspace_id, &goal_id)?;
+    Ok(Json(status))
+}
+
+/// GL-08（codex 二轮 #4）：抬高迭代预算。
+///
+/// 预算耗尽后 resume 会被拒绝，但此前**没有任何接口能改 max_iterations**（只有创建时能设），
+/// 于是耗尽的 goal 只能取消——错误信息给的恢复办法根本执行不了。这里补上唯一的解法入口。
+async fn api_update_goal_budget(
+    AxumPath(goal_id): AxumPath<String>,
+    Json(payload): Json<GoalBudgetUpdateRequest>,
+) -> ApiResult<Json<GoalStatusResponse>> {
+    let workspace = active_workspace_path();
+    let workspace_id = workspace_identity(&workspace);
+    let db_path = default_session_sqlite_path();
+    let status = update_goal_budget_sqlite(&db_path, &workspace_id, &goal_id, payload)?;
     Ok(Json(status))
 }
 
@@ -31288,15 +31304,17 @@ impl SessionStore {
                 .as_ref()
                 .map(JsonValue::to_string)
                 .unwrap_or_else(|| "none".to_string());
+            let retry_context = goal_phase_retry_intent_context(phase);
             let intent = format!(
-                "Goal: {}\nPhase: {} ({})\nAssigned role: {}\nRequired skills: {}\nOutput artifacts: {}\nVerification: {}\nTask-scoped skill overlay: install/use the required skills for this phase only; remove task-scoped role skills and temporary task memory after reporting completion.\nCommander request: execute this phase and report completion evidence for review.",
+                "Goal: {}\nPhase: {} ({})\nAssigned role: {}\nRequired skills: {}\nOutput artifacts: {}\nVerification: {}{}\nTask-scoped skill overlay: install/use the required skills for this phase only; remove task-scoped role skills and temporary task memory after reporting completion.\nCommander request: execute this phase and report completion evidence for review.",
                 goal.title,
                 phase.title,
                 phase.id,
                 phase.assigned_role,
                 required_skills,
                 output_artifacts,
-                verification
+                verification,
+                retry_context
             );
             if target_session_id == commander_session_id {
                 self.install_goal_task_skill_overlay(
@@ -31338,6 +31356,26 @@ impl SessionStore {
                     }),
                 )
                 .map_err(sqlite_api_error)?;
+                // GL-07（codex #5 + 二轮 #3）：self-dispatch 不走 handoff，intent 原本被直接丢弃——
+                // 被打回的 self-role 阶段拿不到失败原因/证据。必须写进**聊天室**：自动执行的
+                // context_history 取自聊天室消息，写 session messages 不会进下一次模型请求。
+                if !retry_context.is_empty() {
+                    let retry_message = ChatMessageDto {
+                        id: format!(
+                            "msg-goal-{}-{}-self-retry",
+                            unix_timestamp_millis(),
+                            phase.id
+                        ),
+                        author: "Goal commander".to_string(),
+                        role: "assistant".to_string(),
+                        target: "Goal phase".to_string(),
+                        content: intent.clone(),
+                        kind: "task-summary".to_string(),
+                        attachments: Vec::new(),
+                    };
+                    self.append_chat_room_messages(&room_id, vec![retry_message.clone()])?;
+                    self.append_chat_messages(&target_session_id, vec![retry_message])?;
+                }
                 dispatched.push(GoalPhaseDispatchDto {
                     phase_id: phase_review.phase_id.clone(),
                     title: phase_review.title.clone(),
@@ -31631,6 +31669,26 @@ impl SessionStore {
                 "Only running goal phases can be executed.",
             ));
         }
+        // GL-08（codex 二轮 #1）：在模型调用前**原子占用**一次迭代额度。
+        // 全局刹车必须挡在真正的执行入口上——commander review 只能拦派发，run-next 会绕过
+        // review 直接跑 running 阶段。且必须是条件 UPDATE 占用而不是先读后判，否则并发下
+        // 两个请求会同时通过检查、双双执行把计数顶到 max+1。
+        {
+            let connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
+            initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+            if reserve_goal_iteration_connection(&connection, workspace_id, goal_id)
+                .map_err(sqlite_api_error)?
+                .is_none()
+            {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "Goal iteration budget exhausted ({}/{}); raise max_iterations via /api/goals/{{goal_id}}/budget or close the goal.",
+                        goal.current_iteration, goal.max_iterations
+                    ),
+                ));
+            }
+        }
         let assigned_session_id = phase.assigned_session_id.as_deref().ok_or_else(|| {
             api_error(
                 StatusCode::BAD_REQUEST,
@@ -31692,6 +31750,21 @@ impl SessionStore {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
                 "Goal phase result came from a different session.",
+            ));
+        }
+        // GL-08（codex #2）：拒收陈旧/失效结果。phase 不再 running，或 goal 已被取消/收尾，
+        // 都说明这次执行的结果已经过期（并发 run-next、重复点击、执行途中被取消）。
+        // 迭代额度已在 prepare_goal_phase_run_context 里原子占用，这里不再重复计数。
+        if phase.status != "running" {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "Goal phase is no longer running; this result is stale and was not recorded.",
+            ));
+        }
+        if matches!(goal.status.as_str(), "cancelled" | "completed") {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "Goal is already cancelled or completed; this in-flight result was not recorded.",
             ));
         }
         let mut messages = Vec::new();
@@ -34734,6 +34807,62 @@ fn pause_goal_sqlite(
     goal_status_sqlite(path, workspace_id, goal_id)
 }
 
+/// GL-08：抬高迭代预算，让「预算耗尽」有一条真实的恢复路径（配合 resume 的预算校验）。
+///
+/// 只允许调高：新上限必须 > 已用量，否则这次调整无法让 goal 继续跑，等于无效操作。
+fn update_goal_budget_sqlite(
+    path: &Path,
+    workspace_id: &str,
+    goal_id: &str,
+    payload: GoalBudgetUpdateRequest,
+) -> ApiResult<GoalStatusResponse> {
+    let existing = get_goal_sqlite(path, workspace_id, goal_id)?;
+    if matches!(existing.status.as_str(), "completed" | "cancelled") {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Cannot change the iteration budget of a completed or cancelled goal.",
+        ));
+    }
+    let new_max = payload.max_iterations.clamp(1, 1_000);
+    if new_max <= existing.current_iteration {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "max_iterations must exceed the already-used {} iterations.",
+                existing.current_iteration
+            ),
+        ));
+    }
+    let connection = open_session_connection(path).map_err(sqlite_api_error)?;
+    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+    connection
+        .execute(
+            "UPDATE goals SET max_iterations = ?1, updated_at = ?2 WHERE workspace_id = ?3 AND id = ?4",
+            params![
+                i64::from(new_max),
+                u64_to_i64(unix_timestamp_millis()),
+                workspace_id,
+                goal_id
+            ],
+        )
+        .map_err(sqlite_api_error)?;
+    let _ = insert_goal_event_connection(
+        &connection,
+        goal_id,
+        "goal-budget-raised",
+        &format!(
+            "Goal iteration budget raised to {new_max} (used {}).",
+            existing.current_iteration
+        ),
+        json!({
+            "caller": "goal-loop",
+            "max_iterations": new_max,
+            "current_iteration": existing.current_iteration,
+        }),
+    );
+    goal_status_sqlite(path, workspace_id, goal_id)
+}
+
 fn resume_goal_sqlite(
     path: &Path,
     workspace_id: &str,
@@ -34742,6 +34871,17 @@ fn resume_goal_sqlite(
     let existing = get_goal_sqlite(path, workspace_id, goal_id)?;
     if existing.status != "paused" {
         return Ok(goal_status_response_from_goal(existing));
+    }
+    // GL-08（codex #1）：预算耗尽导致的暂停，不抬高 max_iterations 就不许 resume——
+    // 否则 resume 就成了绕过全局天花板的后门。
+    if existing.current_iteration >= existing.max_iterations {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "Goal iteration budget exhausted ({}/{}); raise max_iterations before resuming.",
+                existing.current_iteration, existing.max_iterations
+            ),
+        ));
     }
     let now = unix_timestamp_millis();
     let resumed_status = resumed_goal_status(&existing);
@@ -35445,6 +35585,117 @@ fn apply_phase_fail_retry_connection(
         blocked,
         event,
     })
+}
+
+/// GL-07：把 `last_evidence` 摘成人读的短文本，而不是截断 JSON。
+///
+/// 证据的形态是已知的几种（`missing_artifacts` / `command_failures` / `blocked_reason` / `text`），
+/// 按字段分别取要点并各自限长，截断处标注 `…[truncated]`，避免产出半个 JSON 误导 agent。
+fn goal_phase_evidence_digest(evidence: &JsonValue) -> String {
+    fn clip(value: &str, limit: usize) -> String {
+        let trimmed = value.trim();
+        if trimmed.chars().count() <= limit {
+            return trimmed.to_string();
+        }
+        let head: String = trimmed.chars().take(limit).collect();
+        format!("{head}…[truncated]")
+    }
+    let mut parts = Vec::new();
+    if let Some(items) = evidence.get("missing_artifacts").and_then(JsonValue::as_array) {
+        let list = items
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .take(10)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !list.is_empty() {
+            parts.push(format!("missing artifacts: {}", clip(&list, 300)));
+        }
+    }
+    if let Some(items) = evidence.get("command_failures").and_then(JsonValue::as_array) {
+        // 命令失败输出通常很长，只取前 2 条、每条限长。
+        let list = items
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .take(2)
+            .map(|item| clip(item, 300))
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+        if !list.is_empty() {
+            parts.push(format!("command failures:\n{list}"));
+        }
+    }
+    if let Some(reason) = evidence.get("blocked_reason").and_then(JsonValue::as_str) {
+        parts.push(format!("blocked reason: {}", clip(reason, 300)));
+    }
+    if let Some(text) = evidence.get("text").and_then(JsonValue::as_str) {
+        let text = clip(text, 300);
+        if !text.is_empty() {
+            parts.push(format!("report: {text}"));
+        }
+    }
+    if parts.is_empty() {
+        // 未知形态：整体摘要，明确标注是摘要而非完整 JSON。
+        clip(&evidence.to_string(), 300)
+    } else {
+        parts.join("\n")
+    }
+}
+
+/// GL-07：被打回重跑的阶段派发时，追加「上次为什么失败 + 证据 + 第几次重试」。
+///
+/// 不注入的话，被回退的 agent 拿到的 intent 与首次派发一模一样，只会原样重做一遍——
+/// 回退边就白建了。retry_count==0（首次派发）返回空串，不给 intent 添噪音。
+fn goal_phase_retry_intent_context(phase: &GoalPhaseDto) -> String {
+    if phase.retry_count == 0 {
+        return String::new();
+    }
+    let reason = phase.last_reason.as_deref().unwrap_or("unspecified");
+    // codex #6：不要把整个 JSON to_string 后硬截断——那会切出半个对象、看起来像被错误补闭合的
+    // 伪 JSON。按已知字段分别摘要，截断处明确标注。
+    let evidence = phase
+        .last_evidence
+        .as_ref()
+        .map(goal_phase_evidence_digest)
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "\nPrevious attempt failed (retry {}/{}, last verdict: {}).\nFailure reason: {}\nFailure evidence: {}\nFix the specific problem above before reporting completion again; do not repeat the same attempt.",
+        phase.retry_count,
+        phase.max_retries,
+        phase.last_verdict.as_deref().unwrap_or("fail"),
+        reason,
+        evidence
+    )
+}
+
+/// GL-08 全局刹车：**原子占用**一次迭代额度。占到返回 `Some((当前, 上限))`，额度耗尽返回 `None`。
+///
+/// `max_iterations` 字段一直存在但 `current_iteration` 从没被递增过（恒为 0），刹车形同虚设。
+/// 这里让它变成真实计数：phase 级 retry_count 管单个阶段，goal 级 current_iteration 管整体，
+/// 构成设计里的「双层刹车」。
+///
+/// 关键（codex 二轮 #1）：递增必须带 `current_iteration < max_iterations` 条件，且在**模型调用前**
+/// 占用。先读后判再跑是 check-then-act，并发下两个请求会同时通过检查、双双执行，把计数顶到 max+1。
+/// 条件 UPDATE 的 rows_affected==0 即代表额度已被别人占满，直接拒绝。
+fn reserve_goal_iteration_connection(
+    connection: &Connection,
+    workspace_id: &str,
+    goal_id: &str,
+) -> rusqlite::Result<Option<(u32, u32)>> {
+    let changed = connection.execute(
+        "UPDATE goals SET current_iteration = current_iteration + 1, updated_at = ?1 \
+         WHERE workspace_id = ?2 AND id = ?3 AND current_iteration < max_iterations",
+        params![u64_to_i64(unix_timestamp_millis()), workspace_id, goal_id],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    let (current, max): (i64, i64) = connection.query_row(
+        "SELECT current_iteration, max_iterations FROM goals WHERE workspace_id = ?1 AND id = ?2",
+        params![workspace_id, goal_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(Some((current.max(0) as u32, max.max(1) as u32)))
 }
 
 fn goal_task_skill_memory_source(goal_id: &str) -> String {
@@ -36949,6 +37200,16 @@ fn review_goal_commander_sqlite(
     let mut blocking_reasons = Vec::new();
     if role_response.commander_session_id.is_none() {
         blocking_reasons.push("No commander session configured.".to_string());
+    }
+    // GL-08 全局刹车：迭代预算耗尽后一律不再派发（phase 级 retry 之上的第二层天花板）。
+    // codex #4：已收尾的 goal（completed/cancelled）不该再因预算给出阻断理由。
+    if !matches!(goal.status.as_str(), "completed" | "cancelled")
+        && goal.current_iteration >= goal.max_iterations
+    {
+        blocking_reasons.push(format!(
+            "Goal iteration budget exhausted ({}/{}); raise max_iterations or close the goal before further dispatch.",
+            goal.current_iteration, goal.max_iterations
+        ));
     }
 
     let mut phase_reviews = Vec::new();
@@ -39783,6 +40044,12 @@ struct CreateGoalRequest {
 #[derive(Debug, Deserialize)]
 struct GoalConditionValidateRequest {
     condition: JsonValue,
+}
+
+/// GL-08：抬高 goal 的迭代预算（只允许调高，不允许调低到已用量以下）。
+#[derive(Debug, Deserialize)]
+struct GoalBudgetUpdateRequest {
+    max_iterations: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -54213,6 +54480,163 @@ attach: last_assistant
         let events = super::query_goal_events_connection(&c, "g1", 100).expect("events");
         assert!(events.iter().any(|e| e.event_type == "goal-phase-unblocked"
             && e.payload["phase_id"] == "impl"));
+    }
+
+    /// GL-08 全局刹车：current_iteration 真实递增，达到 max_iterations 后 commander review
+    /// 给出阻断理由、建议暂停，不再派发（此前该字段恒为 0，刹车形同虚设）。
+    #[test]
+    fn goal_iteration_budget_blocks_further_dispatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("brake.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        // max_iterations=2，current 从 0 开始。
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws','room','目标','running',2,0,0,NULL,'{}',NULL,10,20,NULL); \
+                 INSERT INTO goal_phases \
+                   (id,goal_id,title,assigned_role,status,depends_on_json,skills_json,\
+                    output_artifacts_json,verification_json,created_at,updated_at,retry_count,max_retries) \
+                 VALUES ('impl','g1','实现','implementer','pending','[]','[]','[]',NULL,10,10,0,2);",
+            )
+            .expect("seed");
+
+        // 预算未耗尽时不因刹车阻断。
+        let review = super::review_goal_commander_sqlite(&db, "ws", "g1", &[]).expect("review");
+        assert!(
+            !review.blocking_reasons.iter().any(|r| r.contains("iteration budget")),
+            "预算未耗尽不该出现刹车阻断"
+        );
+
+        // 占用两次到达上限。
+        let (c1, m1) = super::reserve_goal_iteration_connection(&connection, "ws", "g1")
+            .expect("reserve1")
+            .expect("额度充足时应占用成功");
+        assert_eq!((c1, m1), (1, 2));
+        let (c2, _) = super::reserve_goal_iteration_connection(&connection, "ws", "g1")
+            .expect("reserve2")
+            .expect("额度充足时应占用成功");
+        assert_eq!(c2, 2, "current_iteration 必须真实递增");
+        // 第三次必须占不到——条件 UPDATE 原子拒绝，杜绝 check-then-act 并发超额。
+        assert!(
+            super::reserve_goal_iteration_connection(&connection, "ws", "g1")
+                .expect("reserve3")
+                .is_none(),
+            "额度耗尽后必须占用失败，不能顶到 max+1"
+        );
+        // 且不会把计数顶过上限。
+        let after: i64 = connection
+            .query_row("SELECT current_iteration FROM goals WHERE id='g1'", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(after, 2, "占用失败不该递增");
+        drop(connection);
+
+        // 达到 max_iterations → commander review 阻断并建议暂停。
+        let review = super::review_goal_commander_sqlite(&db, "ws", "g1", &[]).expect("review");
+        assert!(
+            review.blocking_reasons.iter().any(|r| r.contains("iteration budget exhausted")),
+            "预算耗尽应给出刹车阻断理由"
+        );
+        assert!(review.pause_recommended);
+    }
+
+    /// GL-07：被打回重跑的 phase，派发 intent 必须带上「上次为什么失败 + 证据 + 第几次重试」，
+    /// 否则 agent 拿到的 intent 与首次一模一样，只会原样重做。
+    #[test]
+    fn dispatch_intent_carries_retry_reason_and_evidence() {
+        // 直接复用 dispatch 构造 intent 的同款逻辑做断言：retry_count>0 才注入。
+        let base = super::GoalPhaseDto {
+            id: "impl".to_string(),
+            goal_id: "g1".to_string(),
+            title: "实现".to_string(),
+            assigned_role: "implementer".to_string(),
+            assigned_session_id: Some("goal-implementer".to_string()),
+            assigned_session_display_name: None,
+            assigned_session_available: true,
+            status: "running".to_string(),
+            depends_on: Vec::new(),
+            skills_required: Vec::new(),
+            output_artifacts: Vec::new(),
+            verification: None,
+            retry_count: 0,
+            max_retries: 2,
+            last_verdict: None,
+            last_reason: None,
+            last_evidence: None,
+            route_hint: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        // 首次派发：不注入重试上下文。
+        assert_eq!(super::goal_phase_retry_intent_context(&base), "");
+
+        // 被打回：注入原因/证据/重试计数。
+        let bounced = super::GoalPhaseDto {
+            retry_count: 1,
+            last_verdict: Some("fail".to_string()),
+            last_reason: Some("缺少 tests/foo.rs".to_string()),
+            last_evidence: Some(serde_json::json!({ "missing_artifacts": ["tests/foo.rs"] })),
+            ..base
+        };
+        let ctx = super::goal_phase_retry_intent_context(&bounced);
+        assert!(ctx.contains("retry 1/2"), "应含重试计数: {ctx}");
+        assert!(ctx.contains("缺少 tests/foo.rs"), "应含失败原因: {ctx}");
+        assert!(ctx.contains("tests/foo.rs"), "应含证据: {ctx}");
+        assert!(ctx.contains("fail"), "应含上次结论: {ctx}");
+    }
+
+    /// GL-08（codex #1）：预算耗尽导致的暂停不许直接 resume——否则 resume 就是绕过
+    /// 全局天花板的后门（耗尽→暂停→resume→再跑→…无限）。
+    #[test]
+    fn resume_refuses_when_iteration_budget_exhausted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("resume.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        // 预算耗尽(2/2)且已暂停。
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws','room','目标','paused',2,2,0,NULL,'{}',NULL,10,20,NULL);",
+            )
+            .expect("seed exhausted");
+        drop(connection);
+        let err = super::resume_goal_sqlite(&db, "ws", "g1");
+        assert!(err.is_err(), "预算耗尽时 resume 必须被拒绝");
+
+        // 抬高 max_iterations 后可以恢复。
+        let c = super::open_session_connection(&db).expect("open");
+        c.execute("UPDATE goals SET max_iterations = 5 WHERE id='g1'", [])
+            .expect("raise budget");
+        drop(c);
+        let ok = super::resume_goal_sqlite(&db, "ws", "g1").expect("抬高上限后应可 resume");
+        assert_ne!(ok.goal.status, "paused");
+    }
+
+    /// GL-07（codex #6）：证据摘要按字段裁剪，不产出被硬截断的伪 JSON。
+    #[test]
+    fn evidence_digest_summarizes_without_broken_json() {
+        let missing = super::goal_phase_evidence_digest(&serde_json::json!({
+            "missing_artifacts": ["a.rs", "b.rs"],
+            "text": "verifier 拒绝"
+        }));
+        assert!(missing.contains("missing artifacts: a.rs, b.rs"), "{missing}");
+        assert!(missing.contains("report: verifier 拒绝"), "{missing}");
+        // 不应是原始 JSON 串
+        assert!(!missing.starts_with('{'), "不该直接吐 JSON: {missing}");
+
+        // 超长命令输出：截断处有明确标记，且不残留半个 JSON。
+        let long = "x".repeat(1000);
+        let cmd = super::goal_phase_evidence_digest(&serde_json::json!({
+            "command_failures": [long]
+        }));
+        assert!(cmd.contains("…[truncated]"), "截断需标注: {}", &cmd[..80.min(cmd.len())]);
+        assert!(cmd.starts_with("command failures:"), "{}", &cmd[..40.min(cmd.len())]);
+
+        // 未知形态兜底也标注截断，不假装是完整 JSON。
+        let unknown = super::goal_phase_evidence_digest(&serde_json::json!({ "weird": long }));
+        assert!(unknown.contains("…[truncated]"));
     }
 
     #[test]
