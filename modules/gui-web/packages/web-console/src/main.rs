@@ -850,6 +850,10 @@ fn app() -> Router {
             "/api/goals/{goal_id}/phases/{phase_id}/run",
             post(api_run_goal_phase),
         )
+        .route(
+            "/api/goals/{goal_id}/phases/{phase_id}/resume-from",
+            post(api_resume_goal_from_phase),
+        )
         .route("/api/goals/{goal_id}/pause", post(api_pause_goal))
         .route("/api/goals/{goal_id}/resume", post(api_resume_goal))
         .route("/api/goals/{goal_id}/budget", post(api_update_goal_budget))
@@ -13302,6 +13306,17 @@ async fn api_resume_goal(
     let workspace_id = workspace_identity(&workspace);
     let db_path = default_session_sqlite_path();
     let status = resume_goal_sqlite(&db_path, &workspace_id, &goal_id)?;
+    Ok(Json(status))
+}
+
+/// GL-12：从指定 phase 断点续跑——重置该 phase 及其（传递）下游为 pending，goal 置 ready。
+async fn api_resume_goal_from_phase(
+    AxumPath((goal_id, phase_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<GoalStatusResponse>> {
+    let workspace = active_workspace_path();
+    let workspace_id = workspace_identity(&workspace);
+    let db_path = default_session_sqlite_path();
+    let status = resume_goal_from_phase_sqlite(&db_path, &workspace_id, &goal_id, &phase_id)?;
     Ok(Json(status))
 }
 
@@ -34863,6 +34878,138 @@ fn update_goal_budget_sqlite(
     goal_status_sqlite(path, workspace_id, goal_id)
 }
 
+/// GL-12：从指定 phase 断点续跑。
+///
+/// 把目标 phase 及其**传递下游**（直接/间接依赖它的所有 phase）重置为 pending、清空各自的
+/// 回退路由状态（retry/verdict/reason/evidence），goal 置回可运行态；上游已完成的 phase 保持不动。
+/// 用途：崩溃重启或人工修正后，只从某个检查点重跑该及后续阶段，不必从头再来。
+fn resume_goal_from_phase_sqlite(
+    path: &Path,
+    workspace_id: &str,
+    goal_id: &str,
+    phase_id: &str,
+) -> ApiResult<GoalStatusResponse> {
+    let now = unix_timestamp_millis();
+    let mut connection = open_session_connection(path).map_err(sqlite_api_error)?;
+    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+    let event;
+    {
+        // codex 审查 #1：读 goal/phases + 算闭包 + 写入全部放进同一 Immediate 事务，
+        // 避免与并发 cancel / set_goal_plan 竞态（否则可能基于旧 DAG 算闭包、或对已取消的
+        // goal 写 resumed 事件）。
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_api_error)?;
+        let (status, current_iteration, max_iterations): (String, i64, i64) = tx
+            .query_row(
+                "SELECT status, current_iteration, max_iterations FROM goals \
+                 WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, goal_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(sqlite_api_error)?
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Goal does not exist."))?;
+        if status == "cancelled" {
+            return Err(api_error(StatusCode::BAD_REQUEST, "Cannot resume a cancelled goal."));
+        }
+        // codex 审查 #2：与普通 resume 一致——预算耗尽先抬高 max_iterations，否则续跑出来的
+        // running goal 实际跑不动（commander 拦派发、原子占用也会拒）。不清零 current_iteration，
+        // 免得绕过全局刹车。
+        if current_iteration >= max_iterations {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Goal iteration budget exhausted ({current_iteration}/{max_iterations}); raise max_iterations via /api/goals/{{goal_id}}/budget before resuming."
+                ),
+            ));
+        }
+        // 事务内读 phase 依赖图。
+        let phases: Vec<(String, Vec<String>)> = {
+            let mut stmt = tx
+                .prepare("SELECT id, depends_on_json FROM goal_phases WHERE goal_id = ?1")
+                .map_err(sqlite_api_error)?;
+            let rows = stmt
+                .query_map(params![goal_id], |row| {
+                    let id: String = row.get(0)?;
+                    let deps_json: String = row.get(1)?;
+                    Ok((id, deps_json))
+                })
+                .map_err(sqlite_api_error)?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, deps_json) = row.map_err(sqlite_api_error)?;
+                let deps: Vec<String> = serde_json::from_str(&deps_json).unwrap_or_default();
+                out.push((id, deps));
+            }
+            out
+        };
+        if !phases.iter().any(|(id, _)| id == phase_id) {
+            return Err(api_error(StatusCode::NOT_FOUND, "Goal phase does not exist."));
+        }
+        // 传递闭包：从 phase_id 出发，凡 depends_on 命中已入集合的 phase 也纳入。
+        // 反复扫描直到不再新增（phase 有限 + HashSet 单调增长 → 必终止，环也不会死循环）。
+        let mut to_reset: HashSet<String> = HashSet::new();
+        to_reset.insert(phase_id.to_string());
+        loop {
+            let mut added = false;
+            for (id, deps) in &phases {
+                if to_reset.contains(id) {
+                    continue;
+                }
+                if deps.iter().any(|dep| to_reset.contains(dep)) {
+                    to_reset.insert(id.clone());
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        {
+            let mut stmt = tx
+                .prepare(
+                    "UPDATE goal_phases SET status = 'pending', retry_count = 0, \
+                     last_verdict = NULL, last_reason = NULL, last_evidence_json = NULL, \
+                     route_hint = NULL, updated_at = ?1 WHERE goal_id = ?2 AND id = ?3",
+                )
+                .map_err(sqlite_api_error)?;
+            for id in &to_reset {
+                stmt.execute(params![u64_to_i64(now), goal_id, id])
+                    .map_err(sqlite_api_error)?;
+            }
+        }
+        // goal 置回 running，让 dispatch/commander 重新接管。
+        tx.execute(
+            "UPDATE goals SET status = 'running', updated_at = ?1 \
+             WHERE workspace_id = ?2 AND id = ?3 AND status != 'cancelled'",
+            params![u64_to_i64(now), workspace_id, goal_id],
+        )
+        .map_err(sqlite_api_error)?;
+        // 事件 payload 里 phase id 排序，日志/测试稳定（HashSet 顺序不定）。
+        let mut reset_sorted: Vec<String> = to_reset.iter().cloned().collect();
+        reset_sorted.sort();
+        event = insert_goal_event_connection_deferred(
+            &tx,
+            goal_id,
+            "goal-resumed-from-phase",
+            &format!(
+                "Resumed from phase {phase_id}; {} phase(s) reset to pending.",
+                reset_sorted.len()
+            ),
+            json!({
+                "caller": "goal-loop",
+                "from_phase_id": phase_id,
+                "reset_phase_ids": reset_sorted,
+            }),
+        )
+        .map_err(sqlite_api_error)?;
+        tx.commit().map_err(sqlite_api_error)?;
+    }
+    broadcast_goal_event(event);
+    goal_status_sqlite(path, workspace_id, goal_id)
+}
+
 fn resume_goal_sqlite(
     path: &Path,
     workspace_id: &str,
@@ -54637,6 +54784,67 @@ attach: last_assistant
         // 未知形态兜底也标注截断，不假装是完整 JSON。
         let unknown = super::goal_phase_evidence_digest(&serde_json::json!({ "weird": long }));
         assert!(unknown.contains("…[truncated]"));
+    }
+
+    /// GL-12：从指定 phase 断点续跑——目标 phase 及其传递下游重置为 pending 且清空路由状态，
+    /// 上游已完成的 phase 原样保留，goal 置回 running。
+    #[test]
+    fn resume_from_phase_resets_target_and_downstream_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("resume-from.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        // 链：plan(completed) → impl(blocked,retry=3) → verify(pending, deps impl)。
+        // 另有一条独立分支 docs(completed, 不依赖 impl)，不应被重置。
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws','room','目标','paused',10,3,0,NULL,'{}',NULL,10,20,NULL); \
+                 INSERT INTO goal_phases \
+                   (id,goal_id,title,assigned_role,status,depends_on_json,skills_json,\
+                    output_artifacts_json,verification_json,created_at,updated_at,retry_count,max_retries,last_verdict) \
+                 VALUES \
+                   ('plan','g1','规划','planner','completed','[]','[]','[]',NULL,10,10,0,2,'pass'), \
+                   ('impl','g1','实现','implementer','blocked','[\"plan\"]','[]','[]',NULL,20,20,3,2,'fail'), \
+                   ('verify','g1','验证','verifier','pending','[\"impl\"]','[]','[]',NULL,30,30,1,2,'fail'), \
+                   ('docs','g1','文档','implementer','completed','[]','[]','[]',NULL,40,40,0,2,'pass');",
+            )
+            .expect("seed");
+        drop(connection);
+
+        let status = super::resume_goal_from_phase_sqlite(&db, "ws", "g1", "impl").expect("resume-from");
+        let phase = |id: &str| status.goal.phases.iter().find(|p| p.id == id).cloned().expect(id);
+
+        // 目标 impl + 下游 verify 重置为 pending、路由状态清空。
+        let im = phase("impl");
+        assert_eq!(im.status, "pending");
+        assert_eq!(im.retry_count, 0);
+        assert!(im.last_verdict.is_none());
+        let ve = phase("verify");
+        assert_eq!(ve.status, "pending", "下游 verify 应一并重置");
+        assert_eq!(ve.retry_count, 0);
+        assert!(ve.last_verdict.is_none());
+        // 上游 plan 与独立分支 docs 保持 completed。
+        assert_eq!(phase("plan").status, "completed", "上游不该被重置");
+        assert_eq!(phase("docs").status, "completed", "不依赖目标的分支不该被重置");
+        // goal 置回 running。
+        assert_eq!(status.goal.status, "running");
+        assert!(status
+            .goal
+            .recent_events
+            .iter()
+            .any(|e| e.event_type == "goal-resumed-from-phase"
+                && e.payload["from_phase_id"] == "impl"));
+
+        // codex #2：预算耗尽时 resume-from 与普通 resume 一致——拒绝，先抬高上限。
+        let c = super::open_session_connection(&db).expect("open");
+        c.execute("UPDATE goals SET current_iteration=10, max_iterations=10 WHERE id='g1'", [])
+            .expect("exhaust");
+        drop(c);
+        assert!(
+            super::resume_goal_from_phase_sqlite(&db, "ws", "g1", "impl").is_err(),
+            "预算耗尽时 resume-from 应被拒绝"
+        );
     }
 
     /// GL-09 辅助：搭一个带 commander + 指定角色会话的 store，供路由端到端测试复用。

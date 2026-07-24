@@ -4753,6 +4753,36 @@ function goalPhaseRoleTargetText(phase) {
   return `${role} -> ${target} (${state})`;
 }
 
+// GL-11：把 GL-04/05/06 落库的 verdict / retry / 回退原因渲染成任务卡上的徽标。
+// 无结论（首次未跑）不渲染；blocked 优先展示；fail 带重试计数与回退原因。
+function goalPhaseVerdictBadge(phase) {
+  if (!phase) return "";
+  const retry = Number(phase.retry_count) || 0;
+  const max = Number(phase.max_retries) || 0;
+  const verdict = String(phase.last_verdict || "").toLowerCase();
+  const reason = phase.last_reason ? String(phase.last_reason) : "";
+  let kind = "";
+  let label = "";
+  if (phase.status === "blocked") {
+    kind = "blocked";
+    label = `受阻 · 超重试上限 ${retry}/${max}`;
+  } else if (verdict === "fail") {
+    kind = "fail";
+    label = retry > 0 ? `未过 · 重试 ${retry}/${max}` : "未过";
+  } else if (verdict === "pass") {
+    kind = "pass";
+    label = "通过";
+  } else {
+    return "";
+  }
+  const title = reason ? ` title="${escapeHtml(reason)}"` : "";
+  const reasonShort = reason.length > 60 ? `${reason.slice(0, 60)}…` : reason;
+  const reasonText = reason
+    ? `<em class="task-goal-phase-verdict-reason">${escapeHtml(reasonShort)}</em>`
+    : "";
+  return `<span class="task-goal-phase-verdict verdict-${kind}"${title}>${escapeHtml(label)}</span>${reasonText}`;
+}
+
 function taskRenderGoals(goals = [], error = null) {
   const host = document.querySelector('[data-role="goal-consult-list"]');
   setBindText("tasks.goalCount", String(goals.length));
@@ -4792,6 +4822,7 @@ function taskRenderGoals(goals = [], error = null) {
           <li class="task-goal-phase-target ${targetClass}">
             <span>${escapeHtml(phase.status || "-")}</span>
             <strong>${escapeHtml(phase.title || phase.id || "Phase")}</strong>
+            ${goalPhaseVerdictBadge(phase)}
             <small>${escapeHtml(goalPhaseRoleTargetText(phase))}</small>
             <div class="task-goal-phase-buttons">
               <button type="button" data-goal-action="phase-run" data-phase-id="${escapeHtml(phase.id || "")}" ${phase.status === "running" ? "" : "disabled"}>Run phase</button>
