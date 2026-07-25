@@ -3914,6 +3914,15 @@ const GOAL_EVENT_NAMES = [
   "goal-phase-retry",
   "goal-phase-blocked",
   "goal-phase-unblocked",
+  // GL-14：补齐 GL-08 刹车 / GL-12 续跑 / GL-13 人工确认的事件，
+  // 让每次前进·回退·阻塞·刹车·人工介入都能在事件流里回看。
+  "goal-phase-command-gate-failed",
+  "goal-iteration-budget-exhausted",
+  "goal-budget-raised",
+  "goal-resumed-from-phase",
+  "goal-phase-awaiting-ack",
+  "goal-phase-ack-approved",
+  "goal-phase-ack-rejected",
   "goal-context-compacted",
   "phase-started",
   "phase-completed",
@@ -4687,6 +4696,34 @@ async function taskHandleGoalListClick(event) {
       setBusy(button, false);
     }
   }
+
+  // GL-13：高风险阶段的人工放行入口。没有它这个断点只能靠 curl 解，
+  // 等于把 goal 卡死在界面上（codex 场景实测指出的缺口）。
+  if (action === "phase-approve" || action === "phase-reject") {
+    const phaseId = event.target.closest("[data-phase-id]")?.dataset.phaseId;
+    if (!phaseId) return;
+    const approved = action === "phase-approve";
+    let reason = null;
+    if (!approved) {
+      reason = window.prompt("拒绝理由（可留空）：", "");
+      if (reason === null) return; // 用户取消
+    }
+    setBusy(button, true, approved ? "Approving" : "Rejecting");
+    try {
+      await requestJson(`/api/goals/${encodeURIComponent(item.dataset.goalId)}/phases/${encodeURIComponent(phaseId)}/ack`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ approved, reason }),
+      });
+      await refreshGoals();
+      refreshOpenGoalTaskChain(item.dataset.goalId);
+    } catch (error) {
+      console.warn("Goal phase ack failed:", error);
+      window.alert(`人工确认失败：${error.message}`);
+    } finally {
+      setBusy(button, false);
+    }
+  }
 }
 
 function goalSeedPlanPayload(goal) {
@@ -4763,6 +4800,11 @@ function goalPhaseVerdictBadge(phase) {
   const reason = phase.last_reason ? String(phase.last_reason) : "";
   let kind = "";
   let label = "";
+  // GL-13：等待人工确认优先展示——这是需要用户立刻行动的状态。
+  if (phase.human_ack === "awaiting") {
+    const title = ' title="该阶段标记为高风险，派发前需人工批准"';
+    return `<span class="task-goal-phase-verdict verdict-await"${title}>待人工确认</span>`;
+  }
   if (phase.status === "blocked") {
     kind = "blocked";
     label = `受阻 · 超重试上限 ${retry}/${max}`;
@@ -4825,6 +4867,10 @@ function taskRenderGoals(goals = [], error = null) {
             ${goalPhaseVerdictBadge(phase)}
             <small>${escapeHtml(goalPhaseRoleTargetText(phase))}</small>
             <div class="task-goal-phase-buttons">
+              ${phase.human_ack === "awaiting" ? `
+              <button type="button" class="phase-ack-approve" data-goal-action="phase-approve" data-phase-id="${escapeHtml(phase.id || "")}">批准</button>
+              <button type="button" class="phase-ack-reject" data-goal-action="phase-reject" data-phase-id="${escapeHtml(phase.id || "")}">拒绝</button>
+              ` : ""}
               <button type="button" data-goal-action="phase-run" data-phase-id="${escapeHtml(phase.id || "")}" ${phase.status === "running" ? "" : "disabled"}>Run phase</button>
               <button type="button" data-goal-action="phase-complete" data-phase-id="${escapeHtml(phase.id || "")}" ${phase.status === "running" ? "" : "disabled"}>Complete</button>
             </div>
@@ -5238,6 +5284,13 @@ function taskChainEventLabel(eventType) {
     "goal-phase-retry": "重试·回退修复",
     "goal-phase-blocked": "超重试上限·受阻暂停",
     "goal-phase-unblocked": "重规划解阻·预算重置",
+    "goal-phase-command-gate-failed": "命令门未过",
+    "goal-iteration-budget-exhausted": "迭代预算耗尽·刹车",
+    "goal-budget-raised": "预算已抬高",
+    "goal-resumed-from-phase": "断点续跑",
+    "goal-phase-awaiting-ack": "等待人工确认",
+    "goal-phase-ack-approved": "人工已批准",
+    "goal-phase-ack-rejected": "人工已拒绝",
     "goal-paused": "已暂停",
     "goal-resumed": "已恢复",
     "goal-cancelled": "已取消",
@@ -5252,6 +5305,22 @@ function goalTaskChainEventDetail(event = {}) {
   if (payload.assigned_role) parts.push(`role=${payload.assigned_role}`);
   if (payload.assigned_session_id) parts.push(`session=${agentLabel(payload.assigned_session_id) || payload.assigned_session_id}`);
   if (payload.handoff_id) parts.push(`handoff=${payload.handoff_id}`);
+  // GL-14：把路由/重试/刹车的因果信息显示出来，事件流才真的能回看
+  // "为什么现在轮到它、第几次重试、卡在哪"。
+  if (payload.route_reason) parts.push(`route=${payload.route_reason}`);
+  if (payload.retry_count !== undefined && payload.max_retries !== undefined) {
+    parts.push(`retry=${payload.retry_count}/${payload.max_retries}`);
+  } else if (payload.retry_count) {
+    parts.push(`retry=${payload.retry_count}`);
+  }
+  if (payload.verdict) parts.push(`verdict=${payload.verdict}`);
+  if (payload.reason) parts.push(`reason=${String(payload.reason).slice(0, 60)}`);
+  if (payload.current_iteration !== undefined && payload.max_iterations !== undefined) {
+    parts.push(`iteration=${payload.current_iteration}/${payload.max_iterations}`);
+  }
+  if (Array.isArray(payload.depends_on) && payload.depends_on.length) {
+    parts.push(`deps=${payload.depends_on.join(",")}`);
+  }
   if (payload.goal_status) parts.push(`status=${payload.goal_status}`);
   if (payload.completed_steps !== undefined || payload.max_steps !== undefined) {
     parts.push(`progress=${payload.completed_steps ?? 0}/${payload.max_steps ?? "-"}`);

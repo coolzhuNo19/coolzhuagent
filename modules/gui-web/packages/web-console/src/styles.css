@@ -5325,6 +5325,24 @@ body.ui-3d .avatar-picker.is-portal {
   background: rgba(192, 57, 43, 0.92);
   border-color: #7b241c;
 }
+/* GL-13：等待人工确认——用醒目的蓝紫与其它状态区分，提示需要用户行动。 */
+.task-goal-phase-target > span.task-goal-phase-verdict.verdict-await {
+  color: #fff;
+  background: rgba(108, 92, 231, 0.92);
+  border-color: #4834b0;
+}
+.task-goal-phase-buttons .phase-ack-approve {
+  color: #063d1e;
+  background: rgba(46, 204, 113, 0.9);
+  border: 1px solid #1e8449;
+  font-weight: 800;
+}
+.task-goal-phase-buttons .phase-ack-reject {
+  color: #fff;
+  background: rgba(192, 57, 43, 0.9);
+  border: 1px solid #7b241c;
+  font-weight: 800;
+}
 .task-goal-phase-target .task-goal-phase-verdict-reason {
   grid-column: 2 / -1;
   color: rgba(255, 210, 140, 0.72);
