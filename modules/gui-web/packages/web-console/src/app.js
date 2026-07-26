@@ -4977,9 +4977,47 @@ function openGoalTaskChain(goalId) {
   modal.addEventListener("click", (event) => {
     if (event.target === modal || event.target.closest("[data-task-chain-close]")) {
       modal.remove();
+      return;
+    }
+    // GL-13：人工确认入口。弹窗是动态创建的，用它自己的委托监听
+    //（页面初始化时那套监听绑不到动态节点）。
+    const ackBtn = event.target.closest("[data-goal-ack]");
+    if (ackBtn) {
+      handleGoalPhaseAck(ackBtn);
     }
   });
   document.body.append(modal);
+}
+
+/// GL-13：批准/拒绝一个等待人工确认的阶段，完成后刷新任务链与 Goal 数据。
+async function handleGoalPhaseAck(button) {
+  const approved = button.dataset.goalAck === "approve";
+  const goalId = button.dataset.goalId;
+  const phaseId = button.dataset.phaseId;
+  if (!goalId || !phaseId) return;
+  let reason = null;
+  if (!approved) {
+    reason = window.prompt("拒绝理由（可留空）：", "");
+    if (reason === null) return; // 用户取消
+  }
+  setBusy(button, true, approved ? "批准中" : "拒绝中");
+  try {
+    await requestJson(
+      `/api/goals/${encodeURIComponent(goalId)}/phases/${encodeURIComponent(phaseId)}/ack`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ approved, reason }),
+      },
+    );
+    await refreshGoals();
+    refreshOpenGoalTaskChain(goalId);
+  } catch (error) {
+    console.warn("Goal phase ack failed:", error);
+    window.alert(`人工确认失败：${error.message}`);
+  } finally {
+    setBusy(button, false);
+  }
 }
 
 function refreshOpenGoalTaskChain(goalId = null) {
@@ -5081,12 +5119,22 @@ function goalTaskChainRows(goal) {
   `);
   (goal.phases || []).forEach((phase, index) => {
     const meta = taskChainPhaseStatusMeta(phase.status);
+    // GL-11/13：verdict 徽标与人工确认入口挂在任务链弹窗（用户实际可达的地方）。
+    // 早先挂在 goal-consult-list 容器上，而那个容器已在界面精简中删除，等于人看不到也点不到。
+    const awaitingAck = phase.human_ack === "awaiting";
+    const ackControls = awaitingAck
+      ? `<div class="task-chain-ack">
+           <button type="button" class="phase-ack-approve" data-goal-ack="approve" data-goal-id="${escapeHtml(goal.id || "")}" data-phase-id="${escapeHtml(phase.id || "")}">批准</button>
+           <button type="button" class="phase-ack-reject" data-goal-ack="reject" data-goal-id="${escapeHtml(goal.id || "")}" data-phase-id="${escapeHtml(phase.id || "")}">拒绝</button>
+         </div>`
+      : "";
     rows.push(`
       <li class="task-chain-node">
         <span class="task-chain-dot ${meta.cls}"></span>
         <strong>${index + 1}. ${escapeHtml(goalRoleDisplay(phase.assigned_role || "role"))}</strong>
-        <p>${escapeHtml(phase.title || phase.id || "Phase")} <em class="task-chain-status-tag ${meta.cls}">${escapeHtml(meta.label)}</em></p>
+        <p>${escapeHtml(phase.title || phase.id || "Phase")} <em class="task-chain-status-tag ${meta.cls}">${escapeHtml(meta.label)}</em>${goalPhaseVerdictBadge(phase)}</p>
         <small>${escapeHtml(goalPhaseRoleTargetText(phase))}</small>
+        ${ackControls}
       </li>
     `);
   });
@@ -5504,7 +5552,14 @@ function goalUpdatedAt(goal = {}) {
   return Number(goal.updated_at || goal.updatedAt || goal.created_at || goal.createdAt || 0);
 }
 
-const TASK_CARD_OPEN_GOAL_STATUSES = new Set(["created", "planning", "planned", "pending", "running", "in_progress", "blocked"]);
+// GL-13：`paused` 必须在内——为等人工确认而暂停的 goal，恰恰是用户最需要看见并处理的那个。
+// 此前它不在集合里，导致「一进入等待确认就从任务卡消失」，人再也点不到批准/拒绝。
+const TASK_CARD_OPEN_GOAL_STATUSES = new Set(["created", "planning", "planned", "pending", "running", "in_progress", "blocked", "paused"]);
+
+/// GL-13：该 goal 是否有阶段正卡在人工确认上（有的话必须优先露出，别被 runtime 任务遮蔽）。
+function goalHasAwaitingHumanAck(goal = {}) {
+  return (goal.phases || []).some((phase) => phase?.human_ack === "awaiting");
+}
 // 任务卡片只反映最近活跃的 goal：超过此时长未更新的视为遗留 / 中断任务，不再占用任务卡片。
 const TASK_CARD_GOAL_MAX_AGE_MS = 30 * 60 * 1000;
 
@@ -5522,14 +5577,20 @@ function goalIsCurrentTaskCardCandidate(goal = {}) {
 }
 
 function taskCardVisibleGoals(goals = [], runtimeTasks = taskRuntimeItems) {
-  if (Array.isArray(runtimeTasks) && runtimeTasks.length) {
-    return [];
-  }
   const ordered = (Array.isArray(goals) ? goals : [])
     .filter((goal) => Boolean(goal?.id))
     .filter(goalIsCurrentTaskCardCandidate)
     .slice()
     .sort((left, right) => goalUpdatedAt(right) - goalUpdatedAt(left));
+  // GL-13：卡在人工确认上的 goal 在等用户操作，优先级高于 runtime 任务——
+  // 否则只要有 runtime 任务在跑，用户就永远看不到需要自己批准的阶段。
+  const awaiting = ordered.filter(goalHasAwaitingHumanAck);
+  if (awaiting.length) {
+    return [awaiting[0]];
+  }
+  if (Array.isArray(runtimeTasks) && runtimeTasks.length) {
+    return [];
+  }
   if (ordered.length) {
     return [ordered[0]];
   }

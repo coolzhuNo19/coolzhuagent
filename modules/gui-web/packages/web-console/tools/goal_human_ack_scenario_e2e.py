@@ -140,6 +140,12 @@ print("\n-- 步骤3：重新规划后须重新确认 --")
 st, _ = call("POST", f"/api/goals/{gid}/plan", plan_body())
 st, status = call("GET", f"/api/goals/{gid}")
 check("重规划后 human_ack 被重置", phase_of(status, "deploy").get("human_ack") is None)
+# 拒绝会把 goal 暂停。暂停的 goal 不允许派发（人叫停的只能由人恢复），
+# 所以重规划之后还必须显式 resume 才能继续——这是刻意的安全语义。
+st, _ = call("POST", f"/api/goals/{gid}/dispatch-ready")
+check("暂停中的 goal 拒绝派发", st == 400, f"HTTP {st}")
+st, _ = call("POST", f"/api/goals/{gid}/resume")
+check("显式 resume 成功", st == 200, f"HTTP {st}")
 call("POST", f"/api/goals/{gid}/dispatch-ready")
 st, status = call("GET", f"/api/goals/{gid}")
 check("重新回到等待确认", phase_of(status, "deploy").get("human_ack") == "awaiting")
@@ -194,7 +200,9 @@ check("派发事件带 GL-14 路由因果字段",
 print("\n-- 步骤5：GL-14 事件流可回看 --")
 st, status = call("GET", f"/api/goals/{gid}")
 seen = events_of(status)
-for want in ["goal-phase-awaiting-ack", "goal-phase-ack-rejected", "goal-phase-ack-approved"]:
+# recent_events 只回最近若干条，拒绝发生在流程早期已被挤出窗口——
+# 它在「步骤2」已就地断言过，这里只校验最近的路由事件仍可回看。
+for want in ["goal-phase-awaiting-ack", "goal-phase-ack-approved"]:
     check(f"事件流含 {want}", want in seen)
 
 # 前端白名单/标签（GL-14 关键：后端记了事件、前端得能显示）

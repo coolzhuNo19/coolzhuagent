@@ -31327,6 +31327,21 @@ impl SessionStore {
         goal_id: &str,
     ) -> ApiResult<GoalDispatchReadyResponse> {
         self.save()?;
+        // codex 自检 P0：此前没有 goal 级状态门——被拒绝/超限而暂停的 goal，只要重规划把 phase
+        // 变回 pending，dispatch 就照样派发，产生「goal 暂停但 phase 正在跑」的矛盾态。
+        // 暂停/取消/已完成的 goal 一律不派发；要继续必须显式 resume（那里有预算等前置校验）。
+        let goal_status_now = get_goal_sqlite(&self.path, workspace_id, goal_id)?.status;
+        if matches!(
+            goal_status_now.as_str(),
+            "paused" | "cancelled" | "completed"
+        ) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Goal is {goal_status_now}; resume it before dispatching phases."
+                ),
+            ));
+        }
         let review =
             review_goal_commander_sqlite(&self.path, workspace_id, goal_id, &self.state.sessions)?;
         let generated_at = unix_timestamp_millis();
@@ -31730,6 +31745,28 @@ impl SessionStore {
                 "cancelled or skipped goal phases cannot be completed",
             ));
         }
+        // codex 自检 P0：blocked 是「超重试上限 / 被人工拒绝」的受阻终态，通用 complete 接口
+        // 此前只挡 cancelled|skipped，于是可以直接把被拒绝的高风险阶段强行完成，
+        // 把重试上限和人工否决一起绕过。必须先解阻（重规划 / resume-from）才能再完成。
+        if phase.status == "blocked" {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "blocked goal phases cannot be completed; re-plan or resume from this phase first",
+            ));
+        }
+        if phase.human_ack.as_deref() == Some("rejected") {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "phase was rejected by a human; re-plan the goal before completing it",
+            ));
+        }
+        // 标了需人工确认、但还没批准的阶段，也不能靠通用 complete 绕过闸门。
+        if phase.requires_human_ack && phase.human_ack.as_deref() != Some("approved") {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "phase requires human acknowledgement before it can be completed",
+            ));
+        }
         let evidence = payload
             .evidence
             .unwrap_or_default()
@@ -31743,6 +31780,14 @@ impl SessionStore {
             .verdict
             .as_deref()
             .map(|value| if value.trim().eq_ignore_ascii_case("pass") { "pass" } else { "fail" });
+        // codex 自检 P0：verdict=fail 却把阶段置 completed 是自相矛盾的。
+        // 「失败」要走回退路由（apply_phase_fail_retry），不能从完成入口进来。
+        if recorded_verdict == Some("fail") {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "cannot complete a phase with verdict=fail; a failing verdict must go through the retry/blocked路由",
+            ));
+        }
         // GL-04（codex 审查）：status + verdict + 事件放进同一事务，避免出现「status=completed
         // 但 last_verdict 仍是旧值/NULL」的撕裂中间态。用 Immediate 先拿写锁。
         let tx = connection
@@ -31844,13 +31889,39 @@ impl SessionStore {
                 .map_err(sqlite_api_error)?
                 .is_none()
             {
-                return Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    &format!(
-                        "Goal iteration budget exhausted ({}/{}); raise max_iterations via /api/goals/{{goal_id}}/budget or close the goal.",
-                        goal.current_iteration, goal.max_iterations
-                    ),
-                ));
+                // codex 自检发现的回归：把占用前移到这里时，原来那段「暂停 goal + 发事件」
+                // 被一并删掉了，结果超限只报 400，goal 仍是 running、事件永不发出
+                // （前端白名单里的 goal-iteration-budget-exhausted 成了死事件）。
+                // 这里补回来：耗尽即暂停并记事件，且只在真正发生状态变化时发一次。
+                let note = format!(
+                    "Goal iteration budget exhausted: {}/{}. The goal is paused; raise max_iterations or close it out.",
+                    goal.current_iteration, goal.max_iterations
+                );
+                let paused = connection
+                    .execute(
+                        r#"
+                        UPDATE goals SET status = 'paused', updated_at = ?1
+                        WHERE workspace_id = ?2 AND id = ?3
+                          AND status NOT IN ('completed', 'cancelled', 'paused')
+                        "#,
+                        params![u64_to_i64(unix_timestamp_millis()), workspace_id, goal_id],
+                    )
+                    .map_err(sqlite_api_error)?;
+                if paused > 0 {
+                    let _ = insert_goal_event_connection(
+                        &connection,
+                        goal_id,
+                        "goal-iteration-budget-exhausted",
+                        &note,
+                        json!({
+                            "caller": "goal-loop",
+                            "phase_id": phase_id,
+                            "current_iteration": goal.current_iteration,
+                            "max_iterations": goal.max_iterations,
+                        }),
+                    );
+                }
+                return Err(api_error(StatusCode::BAD_REQUEST, &note));
             }
         }
         let assigned_session_id = phase.assigned_session_id.as_deref().ok_or_else(|| {
@@ -55370,6 +55441,130 @@ attach: last_assistant
         .is_err());
     }
 
+    /// codex computer-use 自检 P0 回归锁：通用 `/complete` 不得绕过受阻态、人工否决与
+    /// `verdict=fail`。这三条此前都能把「已被拒绝/已超限」的阶段直接强行完成。
+    #[test]
+    fn complete_rejects_blocked_unacked_and_failing_verdict() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("complete-guard.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws','room','目标','running',10,1,0,NULL,'{}',NULL,10,20,NULL); \
+                 INSERT INTO goal_phases \
+                   (id,goal_id,title,assigned_role,status,depends_on_json,skills_json,\
+                    output_artifacts_json,verification_json,created_at,updated_at,\
+                    retry_count,max_retries,requires_human_ack,human_ack) \
+                 VALUES \
+                   ('blocked','g1','超限','implementer','blocked','[]','[]','[]',NULL,10,10,3,2,0,NULL), \
+                   ('rejected','g1','被拒','implementer','pending','[]','[]','[]',NULL,20,20,0,2,1,'rejected'), \
+                   ('unacked','g1','待确认','implementer','pending','[]','[]','[]',NULL,30,30,0,2,1,'awaiting'), \
+                   ('ok','g1','普通','implementer','running','[]','[]','[]',NULL,40,40,0,2,0,NULL);",
+            )
+            .expect("seed");
+        drop(connection);
+        let mut store = super::SessionStore {
+            path: db.clone(),
+            legacy_json_path: tmp.path().join("sessions.json"),
+            capacity: super::SessionStoreCapacity::default(),
+            state: super::PersistedSessionState {
+                sessions: Vec::new(),
+                active_session_id: None,
+                active_vision_session_id: None,
+                chat_rooms: vec![super::PersistedChatRoom {
+                    id: "room".to_string(),
+                    name: "R".to_string(),
+                    created_at: 1,
+                    updated_at: 1,
+                    messages: Vec::new(),
+                }],
+                active_chat_room_id: Some("room".to_string()),
+            },
+        };
+        let mut complete = |phase: &str, verdict: Option<&str>| {
+            store.complete_goal_phase(
+                "ws",
+                "g1",
+                phase,
+                super::GoalPhaseCompleteRequest {
+                    evidence: Some("done".to_string()),
+                    verdict: verdict.map(str::to_string),
+                },
+            )
+        };
+
+        assert!(complete("blocked", None).is_err(), "blocked 阶段不该能被完成");
+        assert!(
+            complete("rejected", None).is_err(),
+            "被人工拒绝的阶段不该能被完成"
+        );
+        assert!(
+            complete("unacked", None).is_err(),
+            "需人工确认但未批准的阶段不该能被完成"
+        );
+        assert!(
+            complete("ok", Some("fail")).is_err(),
+            "verdict=fail 不该走完成入口（应走回退路由）"
+        );
+        // 正常阶段 + pass 仍可完成，别把正路堵死。
+        assert!(complete("ok", Some("pass")).is_ok());
+    }
+
+    /// codex computer-use 自检 P0 回归锁：暂停/取消/已完成的 goal 不得派发。
+    /// 此前拒绝→暂停后，只要重规划把 phase 变回 pending，dispatch 就照样把它跑起来。
+    #[test]
+    fn dispatch_refuses_paused_goal() {
+        let _guard = config_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, db_path) = gl09_store_with_roles(&temp, &["implementer"]);
+        let goal = super::create_goal_sqlite(
+            &db_path,
+            "ws",
+            "room-1",
+            super::CreateGoalRequest {
+                title: "暂停不派发".to_string(),
+                chat_room_id: Some("room-1".to_string()),
+                max_iterations: Some(10),
+                background: Some(false),
+                originating_user_msg_id: None,
+                completion_condition: Some(serde_json::json!({ "type": "Manual" })),
+            },
+        )
+        .expect("goal");
+        super::set_goal_plan_sqlite(
+            &db_path,
+            "ws",
+            &goal.id,
+            super::GoalPlanRequest {
+                phases: vec![super::GoalPlanPhaseRequest {
+                    id: "impl".to_string(),
+                    title: "实现".to_string(),
+                    assigned_role: Some("implementer".to_string()),
+                    depends_on: Vec::new(),
+                    skills_required: Vec::new(),
+                    output_artifacts: Vec::new(),
+                    verification: None,
+                    requires_human_ack: false,
+                }],
+            },
+        )
+        .expect("plan");
+        // goal 暂停后，即使 phase 是 pending 也不该派发。
+        let c = super::open_session_connection(&db_path).expect("open");
+        c.execute(
+            "UPDATE goals SET status='paused' WHERE id=?1",
+            super::params![&goal.id],
+        )
+        .expect("pause");
+        drop(c);
+        assert!(
+            store.dispatch_ready_goal_phases("ws", &goal.id).is_err(),
+            "暂停的 goal 不该能派发"
+        );
+    }
+
     /// GL-13（codex 场景实测 #1/#2 回归锁）：确认只允许 `awaiting` → approved/rejected 的
     /// **单次**转移。未进入等待的阶段不能被凭空批准；批准/拒绝都是终态，不能互相覆盖
     /// （并发下条件 UPDATE 只让一个命中）；批准也不该解除因别的原因造成的暂停。
@@ -60683,8 +60878,10 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("function goalUpdatedAt"));
         assert!(WEB_APP_JS.contains("function selectTaskCardGoal"));
         assert!(WEB_APP_JS.contains("function taskCardVisibleGoals"));
+        // GL-13：集合里必须含 "paused"——为等人工确认而暂停的 goal 正是用户要处理的那个，
+        // 它此前不在集合里，导致一进入等待就从任务卡消失、批准按钮再也点不到。
         assert!(WEB_APP_JS.contains(
-            "new Set([\"created\", \"planning\", \"planned\", \"pending\", \"running\", \"in_progress\", \"blocked\"])"
+            "new Set([\"created\", \"planning\", \"planned\", \"pending\", \"running\", \"in_progress\", \"blocked\", \"paused\"])"
         ));
         assert!(WEB_APP_JS.contains("const ordered = Array.isArray(goals)"));
         assert!(WEB_APP_JS.contains("return ordered[0] || null;"));

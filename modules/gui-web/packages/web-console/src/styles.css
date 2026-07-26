@@ -5310,26 +5310,67 @@ body.ui-3d .avatar-picker.is-portal {
   text-transform: none;
   white-space: nowrap;
 }
-.task-goal-phase-target > span.task-goal-phase-verdict.verdict-pass {
+/* 颜色规则同时作用于两处宿主：Goal 列表行与任务链弹窗节点。
+   带 .task-goal-phase-target 前缀是为了压过该容器里 `.missing > span` 的着色；
+   .task-chain-node 里没有竞争规则，但必须显式列出，否则弹窗里的徽标没有底色。 */
+.task-goal-phase-target > span.task-goal-phase-verdict.verdict-pass,
+.task-chain-node .task-goal-phase-verdict.verdict-pass {
   color: #063d1e;
   background: rgba(46, 204, 113, 0.85);
   border-color: #1e8449;
 }
-.task-goal-phase-target > span.task-goal-phase-verdict.verdict-fail {
+.task-goal-phase-target > span.task-goal-phase-verdict.verdict-fail,
+.task-chain-node .task-goal-phase-verdict.verdict-fail {
   color: #3d1500;
   background: rgba(255, 168, 38, 0.9);
   border-color: #a85b00;
 }
-.task-goal-phase-target > span.task-goal-phase-verdict.verdict-blocked {
+.task-goal-phase-target > span.task-goal-phase-verdict.verdict-blocked,
+.task-chain-node .task-goal-phase-verdict.verdict-blocked {
   color: #fff;
   background: rgba(192, 57, 43, 0.92);
   border-color: #7b241c;
 }
 /* GL-13：等待人工确认——用醒目的蓝紫与其它状态区分，提示需要用户行动。 */
-.task-goal-phase-target > span.task-goal-phase-verdict.verdict-await {
+.task-goal-phase-target > span.task-goal-phase-verdict.verdict-await,
+.task-chain-node .task-goal-phase-verdict.verdict-await {
   color: #fff;
   background: rgba(108, 92, 231, 0.92);
   border-color: #4834b0;
+}
+/* 任务链弹窗里的徽标与确认按钮 */
+.task-chain-node .task-goal-phase-verdict {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 800;
+  font-style: normal;
+  border-radius: 2px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.task-chain-ack {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+.task-chain-ack button {
+  padding: 3px 14px;
+  font-size: 11px;
+  font-weight: 800;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.task-chain-ack .phase-ack-approve {
+  color: #063d1e;
+  background: rgba(46, 204, 113, 0.9);
+  border: 1px solid #1e8449;
+}
+.task-chain-ack .phase-ack-reject {
+  color: #fff;
+  background: rgba(192, 57, 43, 0.9);
+  border: 1px solid #7b241c;
 }
 .task-goal-phase-buttons .phase-ack-approve {
   color: #063d1e;
