@@ -854,6 +854,10 @@ fn app() -> Router {
             "/api/goals/{goal_id}/phases/{phase_id}/resume-from",
             post(api_resume_goal_from_phase),
         )
+        .route(
+            "/api/goals/{goal_id}/phases/{phase_id}/ack",
+            post(api_ack_goal_phase),
+        )
         .route("/api/goals/{goal_id}/pause", post(api_pause_goal))
         .route("/api/goals/{goal_id}/resume", post(api_resume_goal))
         .route("/api/goals/{goal_id}/budget", post(api_update_goal_budget))
@@ -13306,6 +13310,18 @@ async fn api_resume_goal(
     let workspace_id = workspace_identity(&workspace);
     let db_path = default_session_sqlite_path();
     let status = resume_goal_sqlite(&db_path, &workspace_id, &goal_id)?;
+    Ok(Json(status))
+}
+
+/// GL-13：人工确认/拒绝一个 `requires_human_ack` 阶段。
+async fn api_ack_goal_phase(
+    AxumPath((goal_id, phase_id)): AxumPath<(String, String)>,
+    Json(payload): Json<GoalPhaseAckRequest>,
+) -> ApiResult<Json<GoalStatusResponse>> {
+    let workspace = active_workspace_path();
+    let workspace_id = workspace_identity(&workspace);
+    let db_path = default_session_sqlite_path();
+    let status = ack_goal_phase_sqlite(&db_path, &workspace_id, &goal_id, &phase_id, payload)?;
     Ok(Json(status))
 }
 
@@ -28172,6 +28188,7 @@ fn default_goal_trigger_plan(title: &str) -> GoalPlanRequest {
                 skills_required: vec!["plan".to_string(), "decompose".to_string()],
                 output_artifacts: Vec::new(),
                 verification: Some(json!({ "type": "UserConfirm" })),
+                requires_human_ack: false,
             },
             GoalPlanPhaseRequest {
                 id: "implement".to_string(),
@@ -28181,6 +28198,7 @@ fn default_goal_trigger_plan(title: &str) -> GoalPlanRequest {
                 skills_required: vec!["implement".to_string(), "test".to_string()],
                 output_artifacts: output_artifacts.clone(),
                 verification: Some(verification.clone()),
+                requires_human_ack: false,
             },
             GoalPlanPhaseRequest {
                 id: "verify".to_string(),
@@ -28190,6 +28208,7 @@ fn default_goal_trigger_plan(title: &str) -> GoalPlanRequest {
                 skills_required: vec!["verify".to_string()],
                 output_artifacts,
                 verification: Some(verification),
+                requires_human_ack: false,
             },
         ],
     }
@@ -31217,12 +31236,112 @@ impl SessionStore {
         }))
     }
 
+    /// GL-13：把 review 判为 `awaiting_human_ack` 且尚未标记过的阶段置成 `awaiting`，
+    /// 发等待确认事件并暂停 goal。
+    ///
+    /// 只在 `human_ack IS NULL` 时写入（条件 UPDATE + rows_affected 判定），所以反复调用
+    /// dispatch 不会重复刷事件——幂等靠数据库而不是内存标志。
+    fn mark_goal_phases_awaiting_ack(
+        &self,
+        workspace_id: &str,
+        goal_id: &str,
+        review: &GoalCommanderReviewResponse,
+    ) -> ApiResult<()> {
+        let awaiting: Vec<&GoalCommanderPhaseReview> = review
+            .phase_reviews
+            .iter()
+            .filter(|phase| phase.action == "awaiting_human_ack")
+            .collect();
+        if awaiting.is_empty() {
+            return Ok(());
+        }
+        let mut connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
+        initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+        let mut pending_events = Vec::new();
+        {
+            let tx = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sqlite_api_error)?;
+            for phase in &awaiting {
+                // codex 场景实测 #3：review 是在事务外算的，中间可能有并发 replan 把同 ID 的
+                // phase 改成不需要确认/已在跑。所以事务内用条件 UPDATE 重新校验前提，
+                // 而不只看 human_ack IS NULL——否则会给一个新 phase 错误地挂上等待并暂停 goal。
+                let changed = tx
+                    .execute(
+                        "UPDATE goal_phases SET human_ack = 'awaiting', updated_at = ?1 \
+                         WHERE goal_id = ?2 AND id = ?3 AND human_ack IS NULL \
+                           AND requires_human_ack = 1 AND status = 'pending'",
+                        params![
+                            u64_to_i64(unix_timestamp_millis()),
+                            goal_id,
+                            &phase.phase_id
+                        ],
+                    )
+                    .map_err(sqlite_api_error)?;
+                if changed == 0 {
+                    // 已经是 awaiting/approved/rejected，或前提已变 —— 不重复发事件。
+                    continue;
+                }
+                pending_events.push(
+                    insert_goal_event_connection_deferred(
+                        &tx,
+                        goal_id,
+                        "goal-phase-awaiting-ack",
+                        &format!(
+                            "Phase {} requires human acknowledgement before dispatch.",
+                            phase.phase_id
+                        ),
+                        json!({
+                            "caller": "goal-loop",
+                            "phase_id": phase.phase_id,
+                            "title": phase.title,
+                            "assigned_role": phase.assigned_role,
+                        }),
+                    )
+                    .map_err(sqlite_api_error)?,
+                );
+            }
+            if !pending_events.is_empty() {
+                // 有新进入等待的阶段才暂停 goal，等人工处理。
+                tx.execute(
+                    r#"
+                    UPDATE goals SET status = 'paused', updated_at = ?1
+                    WHERE workspace_id = ?2 AND id = ?3
+                      AND status NOT IN ('completed', 'cancelled', 'paused')
+                    "#,
+                    params![u64_to_i64(unix_timestamp_millis()), workspace_id, goal_id],
+                )
+                .map_err(sqlite_api_error)?;
+            }
+            tx.commit().map_err(sqlite_api_error)?;
+        }
+        for event in pending_events {
+            broadcast_goal_event(event);
+        }
+        Ok(())
+    }
+
     fn dispatch_ready_goal_phases(
         &mut self,
         workspace_id: &str,
         goal_id: &str,
     ) -> ApiResult<GoalDispatchReadyResponse> {
         self.save()?;
+        // codex 自检 P0：此前没有 goal 级状态门——被拒绝/超限而暂停的 goal，只要重规划把 phase
+        // 变回 pending，dispatch 就照样派发，产生「goal 暂停但 phase 正在跑」的矛盾态。
+        // 暂停/取消/已完成的 goal 一律不派发；要继续必须显式 resume（那里有预算等前置校验）。
+        let goal_status_now = get_goal_sqlite(&self.path, workspace_id, goal_id)?.status;
+        if matches!(
+            goal_status_now.as_str(),
+            "paused" | "cancelled" | "completed"
+        ) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Goal is {goal_status_now}; resume it before dispatching phases."
+                ),
+            ));
+        }
         let review =
             review_goal_commander_sqlite(&self.path, workspace_id, goal_id, &self.state.sessions)?;
         let generated_at = unix_timestamp_millis();
@@ -31230,6 +31349,10 @@ impl SessionStore {
         let mut skipped = Vec::new();
 
         if review.pause_recommended {
+            // GL-13：命中 human-in-the-loop 断点——首次遇到 awaiting_human_ack 阶段时，
+            // 记 human_ack='awaiting'（幂等标志）、发 goal-phase-awaiting-ack 事件、暂停 goal，
+            // 等人工经 /ack 接口批准或拒绝。仅在 human_ack IS NULL 时触发，避免重复刷事件。
+            self.mark_goal_phases_awaiting_ack(workspace_id, goal_id, &review)?;
             skipped.extend(
                 review
                     .phase_reviews
@@ -31375,6 +31498,11 @@ impl SessionStore {
                         "chat_room_id": room_id.clone(),
                         "originating_user_msg_id": originating_user_msg_id.clone(),
                         "commander_session_id": commander_session_id.clone(),
+                        // GL-14（codex #4）：self-dispatch 分支同样要带前进决策的因果链，
+                        // 否则这条路径派发出去的阶段在事件流里查不到「为什么现在轮到它」。
+                        "route_reason": if phase.retry_count > 0 { "retry" } else { "advance" },
+                        "retry_count": phase.retry_count,
+                        "depends_on": phase.depends_on.clone(),
                     }),
                 )
                 .map_err(sqlite_api_error)?;
@@ -31482,6 +31610,11 @@ impl SessionStore {
                         "chat_room_id": room_id.clone(),
                         "originating_user_msg_id": originating_user_msg_id.clone(),
                         "commander_session_id": commander_session_id.clone(),
+                        // GL-14：前进决策的因果链——是首次派发还是被打回后重跑、
+                        // 依赖了谁。让事件流能回看"为什么现在轮到这个阶段"。
+                        "route_reason": if phase.retry_count > 0 { "retry" } else { "advance" },
+                        "retry_count": phase.retry_count,
+                        "depends_on": phase.depends_on.clone(),
                     }),
                 )
                 .map_err(sqlite_api_error)?;
@@ -31612,6 +31745,28 @@ impl SessionStore {
                 "cancelled or skipped goal phases cannot be completed",
             ));
         }
+        // codex 自检 P0：blocked 是「超重试上限 / 被人工拒绝」的受阻终态，通用 complete 接口
+        // 此前只挡 cancelled|skipped，于是可以直接把被拒绝的高风险阶段强行完成，
+        // 把重试上限和人工否决一起绕过。必须先解阻（重规划 / resume-from）才能再完成。
+        if phase.status == "blocked" {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "blocked goal phases cannot be completed; re-plan or resume from this phase first",
+            ));
+        }
+        if phase.human_ack.as_deref() == Some("rejected") {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "phase was rejected by a human; re-plan the goal before completing it",
+            ));
+        }
+        // 标了需人工确认、但还没批准的阶段，也不能靠通用 complete 绕过闸门。
+        if phase.requires_human_ack && phase.human_ack.as_deref() != Some("approved") {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "phase requires human acknowledgement before it can be completed",
+            ));
+        }
         let evidence = payload
             .evidence
             .unwrap_or_default()
@@ -31625,6 +31780,14 @@ impl SessionStore {
             .verdict
             .as_deref()
             .map(|value| if value.trim().eq_ignore_ascii_case("pass") { "pass" } else { "fail" });
+        // codex 自检 P0：verdict=fail 却把阶段置 completed 是自相矛盾的。
+        // 「失败」要走回退路由（apply_phase_fail_retry），不能从完成入口进来。
+        if recorded_verdict == Some("fail") {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "cannot complete a phase with verdict=fail; a failing verdict must go through the retry/blocked路由",
+            ));
+        }
         // GL-04（codex 审查）：status + verdict + 事件放进同一事务，避免出现「status=completed
         // 但 last_verdict 仍是旧值/NULL」的撕裂中间态。用 Immediate 先拿写锁。
         let tx = connection
@@ -31726,13 +31889,39 @@ impl SessionStore {
                 .map_err(sqlite_api_error)?
                 .is_none()
             {
-                return Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    &format!(
-                        "Goal iteration budget exhausted ({}/{}); raise max_iterations via /api/goals/{{goal_id}}/budget or close the goal.",
-                        goal.current_iteration, goal.max_iterations
-                    ),
-                ));
+                // codex 自检发现的回归：把占用前移到这里时，原来那段「暂停 goal + 发事件」
+                // 被一并删掉了，结果超限只报 400，goal 仍是 running、事件永不发出
+                // （前端白名单里的 goal-iteration-budget-exhausted 成了死事件）。
+                // 这里补回来：耗尽即暂停并记事件，且只在真正发生状态变化时发一次。
+                let note = format!(
+                    "Goal iteration budget exhausted: {}/{}. The goal is paused; raise max_iterations or close it out.",
+                    goal.current_iteration, goal.max_iterations
+                );
+                let paused = connection
+                    .execute(
+                        r#"
+                        UPDATE goals SET status = 'paused', updated_at = ?1
+                        WHERE workspace_id = ?2 AND id = ?3
+                          AND status NOT IN ('completed', 'cancelled', 'paused')
+                        "#,
+                        params![u64_to_i64(unix_timestamp_millis()), workspace_id, goal_id],
+                    )
+                    .map_err(sqlite_api_error)?;
+                if paused > 0 {
+                    let _ = insert_goal_event_connection(
+                        &connection,
+                        goal_id,
+                        "goal-iteration-budget-exhausted",
+                        &note,
+                        json!({
+                            "caller": "goal-loop",
+                            "phase_id": phase_id,
+                            "current_iteration": goal.current_iteration,
+                            "max_iterations": goal.max_iterations,
+                        }),
+                    );
+                }
+                return Err(api_error(StatusCode::BAD_REQUEST, &note));
             }
         }
         let assigned_session_id = phase.assigned_session_id.as_deref().ok_or_else(|| {
@@ -33671,6 +33860,7 @@ fn initialize_session_schema(connection: &Connection) -> rusqlite::Result<()> {
     apply_session_migration_v12(connection)?;
     apply_session_migration_v13(connection)?;
     apply_session_migration_v14(connection)?;
+    apply_session_migration_v15(connection)?;
     Ok(())
 }
 
@@ -33737,6 +33927,24 @@ fn apply_session_migration_v14(connection: &Connection) -> rusqlite::Result<()> 
     ensure_table_column(connection, "chat_handoffs", "contract_json", "TEXT")?;
     if current < 14 {
         connection.execute_batch("PRAGMA user_version = 14;")?;
+    }
+    Ok(())
+}
+
+/// Schema v15（GL-13 · human-in-the-loop 断点）：goal_phases 增两列。
+/// `requires_human_ack`（默认 0）标记「派发前必须人工确认」的高风险阶段；
+/// `human_ack`（NULL/"approved"/"rejected"）记录确认结论，兼作「已发过等待事件」的幂等标志。
+fn apply_session_migration_v15(connection: &Connection) -> rusqlite::Result<()> {
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    ensure_table_column(
+        connection,
+        "goal_phases",
+        "requires_human_ack",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_table_column(connection, "goal_phases", "human_ack", "TEXT")?;
+    if current < 15 {
+        connection.execute_batch("PRAGMA user_version = 15;")?;
     }
     Ok(())
 }
@@ -34930,6 +35138,168 @@ fn update_goal_budget_sqlite(
     goal_status_sqlite(path, workspace_id, goal_id)
 }
 
+/// GL-13：人工确认（approve）或拒绝（reject）一个 `requires_human_ack` 阶段。
+///
+/// - approve → `human_ack='approved'`，goal 从 paused 恢复，下次 dispatch 该阶段即可派发；
+/// - reject  → `human_ack='rejected'` 且 phase 置 `blocked`，goal 保持暂停；
+///   拒绝是终态，须重新规划（re-plan 会重置 human_ack）才能再跑。
+///
+/// 只接受确实标了 `requires_human_ack` 的阶段，避免给普通阶段乱写确认态。
+fn ack_goal_phase_sqlite(
+    path: &Path,
+    workspace_id: &str,
+    goal_id: &str,
+    phase_id: &str,
+    payload: GoalPhaseAckRequest,
+) -> ApiResult<GoalStatusResponse> {
+    let now = unix_timestamp_millis();
+    let mut connection = open_session_connection(path).map_err(sqlite_api_error)?;
+    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+    let event;
+    {
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_api_error)?;
+        let goal_status: String = tx
+            .query_row(
+                "SELECT status FROM goals WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, goal_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_api_error)?
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Goal does not exist."))?;
+        if matches!(goal_status.as_str(), "cancelled" | "completed") {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "Cannot acknowledge a phase of a cancelled or completed goal.",
+            ));
+        }
+        let (requires_ack, existing_ack, phase_status): (i64, Option<String>, String) = tx
+            .query_row(
+                "SELECT requires_human_ack, human_ack, status FROM goal_phases \
+                 WHERE goal_id = ?1 AND id = ?2",
+                params![goal_id, phase_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(sqlite_api_error)?
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Goal phase does not exist."))?;
+        if requires_ack == 0 {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "Phase does not require human acknowledgement.",
+            ));
+        }
+        let reason = payload
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let decision = if payload.approved { "approved" } else { "rejected" };
+        // codex 场景实测 #1/#2：确认必须是 `awaiting` → `approved`/`rejected` 的**单次**转移。
+        // 用条件 UPDATE 把状态机写进 WHERE：只有 status='pending' 且 human_ack='awaiting' 的行
+        // 才会被改。这同时解决两个问题——
+        //   · 未进入等待（human_ack IS NULL）或已在 running 的阶段不能被凭空确认；
+        //   · 并发 approve/reject 只有一个能命中（先提交者把 awaiting 改掉，后者 rows=0），
+        //     批准和拒绝都成为终态，不会互相覆盖。
+        let changed = if payload.approved {
+            tx.execute(
+                "UPDATE goal_phases SET human_ack = 'approved', updated_at = ?1 \
+                 WHERE goal_id = ?2 AND id = ?3 AND requires_human_ack = 1 \
+                   AND status = 'pending' AND human_ack = 'awaiting'",
+                params![u64_to_i64(now), goal_id, phase_id],
+            )
+        } else {
+            // 拒绝：阶段置 blocked（commander 的 blocked 分支会拦住不再派发）。
+            tx.execute(
+                "UPDATE goal_phases SET human_ack = 'rejected', status = 'blocked', \
+                 last_reason = ?1, updated_at = ?2 \
+                 WHERE goal_id = ?3 AND id = ?4 AND requires_human_ack = 1 \
+                   AND status = 'pending' AND human_ack = 'awaiting'",
+                params![reason, u64_to_i64(now), goal_id, phase_id],
+            )
+        }
+        .map_err(sqlite_api_error)?;
+        if changed == 0 {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                &format!(
+                    "Phase is not awaiting acknowledgement (status={phase_status}, human_ack={}); \
+                     only a phase waiting for confirmation can be {decision}. Re-plan to retry.",
+                    existing_ack.as_deref().unwrap_or("none")
+                ),
+            ));
+        }
+        if payload.approved {
+            // codex #1：只有当 goal 确实**只**卡在这次确认上时才自动恢复。
+            // 还有别的 phase 在等确认/被 blocked，或迭代预算已耗尽（含用户手工暂停后仍有
+            // 其它阻塞的情形）就保持暂停，交给用户显式 resume，避免一次批准解除所有刹车。
+            let blockers: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM goal_phases WHERE goal_id = ?1 \
+                     AND (status = 'blocked' OR human_ack = 'awaiting')",
+                    params![goal_id],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_api_error)?;
+            let budget_left: i64 = tx
+                .query_row(
+                    "SELECT CASE WHEN current_iteration < max_iterations THEN 1 ELSE 0 END \
+                     FROM goals WHERE workspace_id = ?1 AND id = ?2",
+                    params![workspace_id, goal_id],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_api_error)?;
+            if blockers == 0 && budget_left == 1 {
+                tx.execute(
+                    "UPDATE goals SET status = 'running', updated_at = ?1 \
+                     WHERE workspace_id = ?2 AND id = ?3 AND status = 'paused'",
+                    params![u64_to_i64(now), workspace_id, goal_id],
+                )
+                .map_err(sqlite_api_error)?;
+            }
+        } else {
+            tx.execute(
+                r#"
+                UPDATE goals SET status = 'paused', updated_at = ?1
+                WHERE workspace_id = ?2 AND id = ?3
+                  AND status NOT IN ('completed', 'cancelled', 'paused')
+                "#,
+                params![u64_to_i64(now), workspace_id, goal_id],
+            )
+            .map_err(sqlite_api_error)?;
+        }
+        event = insert_goal_event_connection_deferred(
+            &tx,
+            goal_id,
+            if payload.approved {
+                "goal-phase-ack-approved"
+            } else {
+                "goal-phase-ack-rejected"
+            },
+            &if payload.approved {
+                format!("Phase {phase_id} approved by human; dispatch may proceed.")
+            } else {
+                format!(
+                    "Phase {phase_id} rejected by human{}.",
+                    reason.map(|r| format!(": {r}")).unwrap_or_default()
+                )
+            },
+            json!({
+                "caller": "goal-loop",
+                "phase_id": phase_id,
+                "approved": payload.approved,
+                "reason": reason,
+            }),
+        )
+        .map_err(sqlite_api_error)?;
+        tx.commit().map_err(sqlite_api_error)?;
+    }
+    broadcast_goal_event(event);
+    goal_status_sqlite(path, workspace_id, goal_id)
+}
+
 /// GL-12：从指定 phase 断点续跑。
 ///
 /// 把目标 phase 及其**传递下游**（直接/间接依赖它的所有 phase）重置为 pending、清空各自的
@@ -35481,7 +35851,8 @@ fn query_goal_phases_connection(
         r#"
         SELECT id, goal_id, title, assigned_role, status, depends_on_json,
                skills_json, output_artifacts_json, verification_json, created_at, updated_at,
-               retry_count, max_retries, last_verdict, last_reason, last_evidence_json, route_hint
+               retry_count, max_retries, last_verdict, last_reason, last_evidence_json, route_hint,
+               requires_human_ack, human_ack
         FROM goal_phases
         WHERE goal_id = ?1
         ORDER BY created_at, id
@@ -35522,6 +35893,8 @@ fn query_goal_phases_connection(
             last_evidence: last_evidence_json
                 .and_then(|value| serde_json::from_str(&value).ok()),
             route_hint: row.get(16)?,
+            requires_human_ack: row.get::<_, i64>(17)? != 0,
+            human_ack: row.get(18)?,
             created_at: i64_to_u64(row.get::<_, i64>(9)?),
             updated_at: i64_to_u64(row.get::<_, i64>(10)?),
         })
@@ -36749,10 +37122,10 @@ fn set_goal_plan_sqlite(
                     id, goal_id, title, assigned_role, status, depends_on_json,
                     skills_json, output_artifacts_json, verification_json, created_at, updated_at,
                     retry_count, max_retries, last_verdict, last_reason,
-                    last_evidence_json, route_hint
+                    last_evidence_json, route_hint, requires_human_ack, human_ack
                 )
                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?9,
-                        ?10, ?11, ?12, ?13, ?14, ?15)
+                        ?10, ?11, ?12, ?13, ?14, ?15, ?16, NULL)
                 "#,
             )
             .map_err(sqlite_api_error)?;
@@ -36799,6 +37172,9 @@ fn set_goal_plan_sqlite(
                 routing.last_reason,
                 routing.last_evidence_json,
                 routing.route_hint,
+                // GL-13：requires_human_ack 由计划给定；human_ack 重置为 NULL——
+                // 每次重规划高风险阶段都要重新确认，不沿用旧的 approved。
+                i64::from(phase.requires_human_ack),
             ])
             .map_err(sqlite_api_error)?;
         }
@@ -37477,6 +37853,20 @@ fn review_goal_commander_sqlite(
                 "wait_dependency".to_string(),
                 "Phase dependencies are not completed yet.".to_string(),
                 false,
+            )
+        } else if phase.requires_human_ack
+            && phase.human_ack.as_deref() != Some("approved")
+        {
+            // GL-13：依赖已满足、会话就绪，但标了 requires_human_ack 且尚未批准 →
+            // 派发前暂停等人工确认（rejected 也走这里，永远不派发，直到重新规划）。
+            (
+                "awaiting_human_ack".to_string(),
+                if phase.human_ack.as_deref() == Some("rejected") {
+                    "Phase was rejected by a human; re-plan to retry.".to_string()
+                } else {
+                    "Phase requires human acknowledgement before dispatch.".to_string()
+                },
+                true,
             )
         } else {
             (
@@ -40251,6 +40641,14 @@ struct GoalBudgetUpdateRequest {
     max_iterations: u32,
 }
 
+/// GL-13：人工确认请求。`approved=false` 表示拒绝，可带原因。
+#[derive(Debug, Deserialize)]
+struct GoalPhaseAckRequest {
+    approved: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct GoalConditionValidationResponse {
     valid: bool,
@@ -40277,6 +40675,9 @@ struct GoalPlanPhaseRequest {
     #[serde(default)]
     output_artifacts: Vec<String>,
     verification: Option<JsonValue>,
+    // GL-13：标记该阶段派发前须人工确认（高风险步骤，如上线/删除）。
+    #[serde(default)]
+    requires_human_ack: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -40302,6 +40703,10 @@ struct GoalPhaseDto {
     last_reason: Option<String>,
     last_evidence: Option<JsonValue>,
     route_hint: Option<String>,
+    // GL-13：human-in-the-loop 断点。requires_human_ack 标记高风险阶段派发前须人工确认；
+    // human_ack 为 None（未确认/未到）/"awaiting"（已发等待事件）/"approved"/"rejected"。
+    requires_human_ack: bool,
+    human_ack: Option<String>,
     created_at: u64,
     updated_at: u64,
 }
@@ -47942,6 +48347,8 @@ mod tests {
                 route_hint: None,
                 created_at: 1,
                 updated_at: 1,
+                requires_human_ack: false,
+                human_ack: None,
             },
         );
 
@@ -49616,6 +50023,7 @@ attach: last_assistant
                         skills_required: vec!["plan".to_string()],
                         output_artifacts: Vec::new(),
                         verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                        requires_human_ack: false,
                     },
                     super::GoalPlanPhaseRequest {
                         id: "verify".to_string(),
@@ -49625,6 +50033,7 @@ attach: last_assistant
                         skills_required: vec!["verify".to_string()],
                         output_artifacts: Vec::new(),
                         verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                        requires_human_ack: false,
                     },
                 ],
             },
@@ -49800,6 +50209,7 @@ attach: last_assistant
                         skills_required: vec!["plan".to_string()],
                         output_artifacts: Vec::new(),
                         verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                        requires_human_ack: false,
                     },
                     super::GoalPlanPhaseRequest {
                         id: "verify".to_string(),
@@ -49809,6 +50219,7 @@ attach: last_assistant
                         skills_required: vec!["verify".to_string()],
                         output_artifacts: vec!["docs/work-logs/goal.md".to_string()],
                         verification: Some(serde_json::json!({ "type": "FilesExist", "paths": ["docs/work-logs/goal.md"] })),
+                        requires_human_ack: false,
                     },
                 ],
             },
@@ -49831,6 +50242,7 @@ attach: last_assistant
                     skills_required: Vec::new(),
                     output_artifacts: Vec::new(),
                     verification: None,
+                    requires_human_ack: false,
                 },
                 super::GoalPlanPhaseRequest {
                     id: "b".to_string(),
@@ -49840,6 +50252,7 @@ attach: last_assistant
                     skills_required: Vec::new(),
                     output_artifacts: Vec::new(),
                     verification: None,
+                    requires_human_ack: false,
                 },
             ],
         });
@@ -49894,6 +50307,7 @@ attach: last_assistant
                         skills_required: vec!["plan".to_string()],
                         output_artifacts: Vec::new(),
                         verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                        requires_human_ack: false,
                     }],
                 },
             )
@@ -50743,6 +51157,7 @@ attach: last_assistant
                         skills_required: vec!["plan".to_string()],
                         output_artifacts: Vec::new(),
                         verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                        requires_human_ack: false,
                     },
                     super::GoalPlanPhaseRequest {
                         id: "verify".to_string(),
@@ -50752,6 +51167,7 @@ attach: last_assistant
                         skills_required: vec!["verify".to_string()],
                         output_artifacts: Vec::new(),
                         verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                        requires_human_ack: false,
                     },
                 ],
             },
@@ -50883,6 +51299,7 @@ attach: last_assistant
                     skills_required: vec!["superpowers:writing-plans".to_string()],
                     output_artifacts: Vec::new(),
                     verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                    requires_human_ack: false,
                 }],
             },
         )
@@ -51013,6 +51430,7 @@ attach: last_assistant
                         skills_required: vec!["plan".to_string()],
                         output_artifacts: Vec::new(),
                         verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                        requires_human_ack: false,
                     },
                     super::GoalPlanPhaseRequest {
                         id: "implement".to_string(),
@@ -51022,6 +51440,7 @@ attach: last_assistant
                         skills_required: vec!["implement".to_string()],
                         output_artifacts: Vec::new(),
                         verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                        requires_human_ack: false,
                     },
                 ],
             },
@@ -51149,6 +51568,7 @@ attach: last_assistant
                     skills_required: vec!["plan".to_string()],
                     output_artifacts: Vec::new(),
                     verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                    requires_human_ack: false,
                 }],
             },
         )
@@ -51326,6 +51746,7 @@ attach: last_assistant
                         "type": "FilesExist",
                         "paths": ["goal-artifacts/output.html"]
                     })),
+                    requires_human_ack: false,
                 }],
             },
         )
@@ -51389,6 +51810,7 @@ attach: last_assistant
                         skills_required: Vec::new(),
                         output_artifacts: Vec::new(),
                         verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                        requires_human_ack: false,
                     },
                     super::GoalPlanPhaseRequest {
                         id: "implement".to_string(),
@@ -51398,6 +51820,7 @@ attach: last_assistant
                         skills_required: Vec::new(),
                         output_artifacts: Vec::new(),
                         verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                        requires_human_ack: false,
                     },
                     super::GoalPlanPhaseRequest {
                         id: "verify".to_string(),
@@ -51407,6 +51830,7 @@ attach: last_assistant
                         skills_required: Vec::new(),
                         output_artifacts: Vec::new(),
                         verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                        requires_human_ack: false,
                     },
                 ],
             },
@@ -51571,6 +51995,7 @@ attach: last_assistant
                     skills_required: vec!["plan".to_string()],
                     output_artifacts: vec!["artifact.html".to_string()],
                     verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                    requires_human_ack: false,
                 }],
             },
         )
@@ -51729,6 +52154,7 @@ attach: last_assistant
                         "type": "FilesExist",
                         "paths": [missing_artifact.clone()]
                     })),
+                    requires_human_ack: false,
                 }],
             },
         )
@@ -51815,6 +52241,8 @@ attach: last_assistant
             route_hint: None,
             created_at: 1,
             updated_at: 1,
+            requires_human_ack: false,
+            human_ack: None,
         };
 
         let missing_or_invalid = super::goal_phase_missing_files(&phase);
@@ -51917,6 +52345,7 @@ attach: last_assistant
                         "type": "FilesExist",
                         "paths": [missing_artifact.clone()]
                     })),
+                    requires_human_ack: false,
                 }],
             },
         )
@@ -52112,6 +52541,7 @@ attach: last_assistant
                     skills_required: vec!["plan".to_string()],
                     output_artifacts: Vec::new(),
                     verification: Some(serde_json::json!({ "type": "UserConfirm" })),
+                    requires_human_ack: false,
                 }],
             },
         )
@@ -52232,6 +52662,7 @@ attach: last_assistant
                     skills_required: Vec::new(),
                     output_artifacts: Vec::new(),
                     verification: None,
+                    requires_human_ack: false,
                 }],
             },
         )
@@ -54052,7 +54483,7 @@ attach: last_assistant
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         let columns: Vec<String> = connection
             .prepare("PRAGMA table_info(goal_phases)")
@@ -54176,7 +54607,7 @@ attach: last_assistant
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
     }
 
     /// GL-02：读路径把 v13 的 6 列反序列化进 GoalPhaseDto，并能正确序列化给前端。
@@ -54275,6 +54706,7 @@ attach: last_assistant
                     skills_required: Vec::new(),
                     output_artifacts: Vec::new(),
                     verification: None,
+                    requires_human_ack: false,
                 })
                 .collect(),
         };
@@ -54362,6 +54794,7 @@ attach: last_assistant
                 skills_required: Vec::new(),
                 output_artifacts: Vec::new(),
                 verification: None,
+                requires_human_ack: false,
             }],
         };
 
@@ -54636,6 +55069,7 @@ attach: last_assistant
                     skills_required: Vec::new(),
                     output_artifacts: Vec::new(),
                     verification: None,
+                    requires_human_ack: false,
                 },
                 super::GoalPlanPhaseRequest {
                     id: "verify".to_string(),
@@ -54645,6 +55079,7 @@ attach: last_assistant
                     skills_required: Vec::new(),
                     output_artifacts: Vec::new(),
                     verification: None,
+                    requires_human_ack: false,
                 },
             ],
         };
@@ -54774,6 +55209,8 @@ attach: last_assistant
             route_hint: None,
             created_at: 1,
             updated_at: 1,
+            requires_human_ack: false,
+            human_ack: None,
         };
         // 首次派发：不注入重试上下文。
         assert_eq!(super::goal_phase_retry_intent_context(&base), "");
@@ -54846,6 +55283,351 @@ attach: last_assistant
         assert!(unknown.contains("…[truncated]"));
     }
 
+    /// GL-13 场景：高风险阶段（如"上线到生产"）标 requires_human_ack。
+    /// 依赖满足、会话就绪后 commander review 不放行，而是 awaiting_human_ack；
+    /// 人工批准后可派发；人工拒绝则阶段 blocked、goal 暂停。
+    #[test]
+    fn human_ack_gate_blocks_dispatch_until_approved() {
+        let _guard = config_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (store, db_path) = gl09_store_with_roles(&temp, &["implementer"]);
+        let goal = super::create_goal_sqlite(
+            &db_path,
+            "ws",
+            "room-1",
+            super::CreateGoalRequest {
+                title: "上线发布".to_string(),
+                chat_room_id: Some("room-1".to_string()),
+                max_iterations: Some(10),
+                background: Some(false),
+                originating_user_msg_id: None,
+                completion_condition: Some(serde_json::json!({ "type": "Manual" })),
+            },
+        )
+        .expect("goal");
+        // deploy 阶段标为需人工确认。
+        super::set_goal_plan_sqlite(
+            &db_path,
+            "ws",
+            &goal.id,
+            super::GoalPlanRequest {
+                phases: vec![super::GoalPlanPhaseRequest {
+                    id: "deploy".to_string(),
+                    title: "部署到生产".to_string(),
+                    assigned_role: Some("implementer".to_string()),
+                    depends_on: Vec::new(),
+                    skills_required: Vec::new(),
+                    output_artifacts: Vec::new(),
+                    verification: None,
+                    requires_human_ack: true,
+                }],
+            },
+        )
+        .expect("plan");
+
+        let action_of = || -> String {
+            super::refresh_goal_runtime_role_heartbeats(&db_path, "ws");
+            super::review_goal_commander_sqlite(&db_path, "ws", &goal.id, &store.state.sessions)
+                .expect("review")
+                .phase_reviews
+                .into_iter()
+                .find(|p| p.phase_id == "deploy")
+                .expect("phase")
+                .action
+        };
+
+        // 未确认 → 不放行。
+        assert_eq!(action_of(), "awaiting_human_ack", "高风险阶段派发前须人工确认");
+
+        // 真实流程里是 dispatch 把阶段置成 awaiting 的（mark_goal_phases_awaiting_ack）。
+        // ack 严格要求从 awaiting 转移，所以这里必须先走这一步。
+        let enter_awaiting = || {
+            let review = super::review_goal_commander_sqlite(
+                &db_path,
+                "ws",
+                &goal.id,
+                &store.state.sessions,
+            )
+            .expect("review");
+            store
+                .mark_goal_phases_awaiting_ack("ws", &goal.id, &review)
+                .expect("mark awaiting");
+        };
+        enter_awaiting();
+
+        // 拒绝 → 阶段 blocked、goal 暂停、记事件。
+        let rejected = super::ack_goal_phase_sqlite(
+            &db_path,
+            "ws",
+            &goal.id,
+            "deploy",
+            super::GoalPhaseAckRequest {
+                approved: false,
+                reason: Some("发布窗口未到".to_string()),
+            },
+        )
+        .expect("reject");
+        let phase = rejected
+            .goal
+            .phases
+            .iter()
+            .find(|p| p.id == "deploy")
+            .expect("deploy");
+        assert_eq!(phase.status, "blocked", "拒绝后阶段应 blocked");
+        assert_eq!(phase.human_ack.as_deref(), Some("rejected"));
+        assert_eq!(rejected.goal.status, "paused");
+        assert!(rejected
+            .goal
+            .recent_events
+            .iter()
+            .any(|e| e.event_type == "goal-phase-ack-rejected"));
+        // 已拒绝不可再确认（须重新规划）。
+        assert!(super::ack_goal_phase_sqlite(
+            &db_path,
+            "ws",
+            &goal.id,
+            "deploy",
+            super::GoalPhaseAckRequest { approved: true, reason: None },
+        )
+        .is_err());
+
+        // 重新规划 → human_ack 重置，重新回到等待确认。
+        super::set_goal_plan_sqlite(
+            &db_path,
+            "ws",
+            &goal.id,
+            super::GoalPlanRequest {
+                phases: vec![super::GoalPlanPhaseRequest {
+                    id: "deploy".to_string(),
+                    title: "部署到生产".to_string(),
+                    assigned_role: Some("implementer".to_string()),
+                    depends_on: Vec::new(),
+                    skills_required: Vec::new(),
+                    output_artifacts: Vec::new(),
+                    verification: None,
+                    requires_human_ack: true,
+                }],
+            },
+        )
+        .expect("replan");
+        assert_eq!(action_of(), "awaiting_human_ack", "重规划后须重新确认");
+        enter_awaiting();
+
+        // 批准 → 放行可派发，goal 恢复。
+        let approved = super::ack_goal_phase_sqlite(
+            &db_path,
+            "ws",
+            &goal.id,
+            "deploy",
+            super::GoalPhaseAckRequest { approved: true, reason: None },
+        )
+        .expect("approve");
+        assert_ne!(approved.goal.status, "paused", "批准后 goal 应恢复");
+        assert!(approved
+            .goal
+            .recent_events
+            .iter()
+            .any(|e| e.event_type == "goal-phase-ack-approved"));
+        assert_eq!(action_of(), "ready_to_dispatch", "批准后应可派发");
+
+        // 普通阶段（未标 requires_human_ack）不接受 ack。
+        assert!(super::ack_goal_phase_sqlite(
+            &db_path,
+            "ws",
+            &goal.id,
+            "nonexistent",
+            super::GoalPhaseAckRequest { approved: true, reason: None },
+        )
+        .is_err());
+    }
+
+    /// codex computer-use 自检 P0 回归锁：通用 `/complete` 不得绕过受阻态、人工否决与
+    /// `verdict=fail`。这三条此前都能把「已被拒绝/已超限」的阶段直接强行完成。
+    #[test]
+    fn complete_rejects_blocked_unacked_and_failing_verdict() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("complete-guard.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws','room','目标','running',10,1,0,NULL,'{}',NULL,10,20,NULL); \
+                 INSERT INTO goal_phases \
+                   (id,goal_id,title,assigned_role,status,depends_on_json,skills_json,\
+                    output_artifacts_json,verification_json,created_at,updated_at,\
+                    retry_count,max_retries,requires_human_ack,human_ack) \
+                 VALUES \
+                   ('blocked','g1','超限','implementer','blocked','[]','[]','[]',NULL,10,10,3,2,0,NULL), \
+                   ('rejected','g1','被拒','implementer','pending','[]','[]','[]',NULL,20,20,0,2,1,'rejected'), \
+                   ('unacked','g1','待确认','implementer','pending','[]','[]','[]',NULL,30,30,0,2,1,'awaiting'), \
+                   ('ok','g1','普通','implementer','running','[]','[]','[]',NULL,40,40,0,2,0,NULL);",
+            )
+            .expect("seed");
+        drop(connection);
+        let mut store = super::SessionStore {
+            path: db.clone(),
+            legacy_json_path: tmp.path().join("sessions.json"),
+            capacity: super::SessionStoreCapacity::default(),
+            state: super::PersistedSessionState {
+                sessions: Vec::new(),
+                active_session_id: None,
+                active_vision_session_id: None,
+                chat_rooms: vec![super::PersistedChatRoom {
+                    id: "room".to_string(),
+                    name: "R".to_string(),
+                    created_at: 1,
+                    updated_at: 1,
+                    messages: Vec::new(),
+                }],
+                active_chat_room_id: Some("room".to_string()),
+            },
+        };
+        let mut complete = |phase: &str, verdict: Option<&str>| {
+            store.complete_goal_phase(
+                "ws",
+                "g1",
+                phase,
+                super::GoalPhaseCompleteRequest {
+                    evidence: Some("done".to_string()),
+                    verdict: verdict.map(str::to_string),
+                },
+            )
+        };
+
+        assert!(complete("blocked", None).is_err(), "blocked 阶段不该能被完成");
+        assert!(
+            complete("rejected", None).is_err(),
+            "被人工拒绝的阶段不该能被完成"
+        );
+        assert!(
+            complete("unacked", None).is_err(),
+            "需人工确认但未批准的阶段不该能被完成"
+        );
+        assert!(
+            complete("ok", Some("fail")).is_err(),
+            "verdict=fail 不该走完成入口（应走回退路由）"
+        );
+        // 正常阶段 + pass 仍可完成，别把正路堵死。
+        assert!(complete("ok", Some("pass")).is_ok());
+    }
+
+    /// codex computer-use 自检 P0 回归锁：暂停/取消/已完成的 goal 不得派发。
+    /// 此前拒绝→暂停后，只要重规划把 phase 变回 pending，dispatch 就照样把它跑起来。
+    #[test]
+    fn dispatch_refuses_paused_goal() {
+        let _guard = config_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, db_path) = gl09_store_with_roles(&temp, &["implementer"]);
+        let goal = super::create_goal_sqlite(
+            &db_path,
+            "ws",
+            "room-1",
+            super::CreateGoalRequest {
+                title: "暂停不派发".to_string(),
+                chat_room_id: Some("room-1".to_string()),
+                max_iterations: Some(10),
+                background: Some(false),
+                originating_user_msg_id: None,
+                completion_condition: Some(serde_json::json!({ "type": "Manual" })),
+            },
+        )
+        .expect("goal");
+        super::set_goal_plan_sqlite(
+            &db_path,
+            "ws",
+            &goal.id,
+            super::GoalPlanRequest {
+                phases: vec![super::GoalPlanPhaseRequest {
+                    id: "impl".to_string(),
+                    title: "实现".to_string(),
+                    assigned_role: Some("implementer".to_string()),
+                    depends_on: Vec::new(),
+                    skills_required: Vec::new(),
+                    output_artifacts: Vec::new(),
+                    verification: None,
+                    requires_human_ack: false,
+                }],
+            },
+        )
+        .expect("plan");
+        // goal 暂停后，即使 phase 是 pending 也不该派发。
+        let c = super::open_session_connection(&db_path).expect("open");
+        c.execute(
+            "UPDATE goals SET status='paused' WHERE id=?1",
+            super::params![&goal.id],
+        )
+        .expect("pause");
+        drop(c);
+        assert!(
+            store.dispatch_ready_goal_phases("ws", &goal.id).is_err(),
+            "暂停的 goal 不该能派发"
+        );
+    }
+
+    /// GL-13（codex 场景实测 #1/#2 回归锁）：确认只允许 `awaiting` → approved/rejected 的
+    /// **单次**转移。未进入等待的阶段不能被凭空批准；批准/拒绝都是终态，不能互相覆盖
+    /// （并发下条件 UPDATE 只让一个命中）；批准也不该解除因别的原因造成的暂停。
+    #[test]
+    fn ack_requires_awaiting_state_and_is_single_shot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("ack-fsm.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        connection
+            .execute_batch(
+                "INSERT INTO goals VALUES \
+                 ('g1','ws','room','目标','paused',10,1,0,NULL,'{}',NULL,10,20,NULL); \
+                 INSERT INTO goal_phases \
+                   (id,goal_id,title,assigned_role,status,depends_on_json,skills_json,\
+                    output_artifacts_json,verification_json,created_at,updated_at,\
+                    retry_count,max_retries,requires_human_ack,human_ack) \
+                 VALUES \
+                   ('deploy','g1','上线','implementer','pending','[]','[]','[]',NULL,10,10,0,2,1,NULL), \
+                   ('other','g1','另一个','implementer','blocked','[]','[]','[]',NULL,20,20,3,2,0,NULL);",
+            )
+            .expect("seed");
+        drop(connection);
+
+        let ack = |approved: bool| {
+            super::ack_goal_phase_sqlite(
+                &db,
+                "ws",
+                "g1",
+                "deploy",
+                super::GoalPhaseAckRequest { approved, reason: None },
+            )
+        };
+
+        // human_ack 还是 NULL（没进入等待）→ 不能凭空批准。
+        assert!(ack(true).is_err(), "未进入等待的阶段不该能被批准");
+
+        // 置为 awaiting 后可批准。
+        let c = super::open_session_connection(&db).expect("open");
+        c.execute(
+            "UPDATE goal_phases SET human_ack='awaiting' WHERE id='deploy'",
+            [],
+        )
+        .expect("await");
+        drop(c);
+        let approved = ack(true).expect("批准应成功");
+        let deploy = approved
+            .goal
+            .phases
+            .iter()
+            .find(|p| p.id == "deploy")
+            .expect("deploy");
+        assert_eq!(deploy.human_ack.as_deref(), Some("approved"));
+        // 还有一个 blocked 的 other 阶段 → goal 不该被这次批准放出来。
+        assert_eq!(
+            approved.goal.status, "paused",
+            "还有其它阻塞时，批准不该解除暂停"
+        );
+
+        // 批准是终态：不能再被拒绝覆盖（并发场景的关键）。
+        assert!(ack(false).is_err(), "已批准的阶段不该还能被拒绝");
+    }
+
     /// GL-10：v14 迁移给 chat_handoffs 加 contract_json；结构化契约往返落库/读回，
     /// 旧记录（contract=None）向后兼容。
     #[test]
@@ -54858,7 +55640,7 @@ attach: last_assistant
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version");
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         let cols: Vec<String> = connection
             .prepare("PRAGMA table_info(chat_handoffs)")
             .expect("pragma")
@@ -55096,6 +55878,7 @@ attach: last_assistant
                         skills_required: Vec::new(),
                         output_artifacts: Vec::new(),
                         verification: None,
+                        requires_human_ack: false,
                     },
                     super::GoalPlanPhaseRequest {
                         id: "verify".to_string(),
@@ -55105,6 +55888,7 @@ attach: last_assistant
                         skills_required: Vec::new(),
                         output_artifacts: Vec::new(),
                         verification: None,
+                        requires_human_ack: false,
                     },
                 ],
             },
@@ -55215,6 +55999,7 @@ attach: last_assistant
                     skills_required: Vec::new(),
                     output_artifacts: Vec::new(),
                     verification: None,
+                    requires_human_ack: false,
                 }],
             },
         )
@@ -60093,8 +60878,10 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("function goalUpdatedAt"));
         assert!(WEB_APP_JS.contains("function selectTaskCardGoal"));
         assert!(WEB_APP_JS.contains("function taskCardVisibleGoals"));
+        // GL-13：集合里必须含 "paused"——为等人工确认而暂停的 goal 正是用户要处理的那个，
+        // 它此前不在集合里，导致一进入等待就从任务卡消失、批准按钮再也点不到。
         assert!(WEB_APP_JS.contains(
-            "new Set([\"created\", \"planning\", \"planned\", \"pending\", \"running\", \"in_progress\", \"blocked\"])"
+            "new Set([\"created\", \"planning\", \"planned\", \"pending\", \"running\", \"in_progress\", \"blocked\", \"paused\"])"
         ));
         assert!(WEB_APP_JS.contains("const ordered = Array.isArray(goals)"));
         assert!(WEB_APP_JS.contains("return ordered[0] || null;"));
@@ -60630,6 +61417,50 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("goal-paused"));
         assert!(WEB_APP_JS.contains("goal-resumed"));
         assert!(WEB_APP_JS.contains("goal-phase-dispatched"));
+    }
+
+    /// GL-14：每一类路由/刹车/人工介入事件都必须进前端 SSE 白名单**并有中文标签**，
+    /// 否则后端记了事件、界面却回看不到（新增事件类型最容易漏这一步）。
+    #[test]
+    fn web_frontend_goal_event_stream_covers_all_routing_events() {
+        for event_type in [
+            // 结论与回退（GL-04/05/06）
+            "goal-phase-verdict",
+            "goal-phase-retry",
+            "goal-phase-blocked",
+            "goal-phase-unblocked",
+            "goal-phase-verification-blocked",
+            "goal-phase-command-gate-failed",
+            "goal-phase-blocked-needs-replan",
+            // 全局刹车与预算（GL-08）
+            "goal-iteration-budget-exhausted",
+            "goal-budget-raised",
+            // 断点续跑（GL-12）
+            "goal-resumed-from-phase",
+            // 人工确认（GL-13）
+            "goal-phase-awaiting-ack",
+            "goal-phase-ack-approved",
+            "goal-phase-ack-rejected",
+        ] {
+            // codex 场景实测指出：光用 contains 会被"只出现在标签表里"蒙混过关。
+            // 白名单数组与标签表分别校验——前者决定事件是否被接收，后者决定是否可读。
+            let in_whitelist = WEB_APP_JS.contains(&format!("\n  \"{event_type}\","));
+            let in_labels = WEB_APP_JS.contains(&format!("\"{event_type}\": \""));
+            assert!(
+                in_whitelist,
+                "事件 {event_type} 不在前端 SSE 白名单数组里，界面收不到"
+            );
+            assert!(
+                in_labels,
+                "事件 {event_type} 没有中文标签，界面显示成原始事件名"
+            );
+        }
+        // GL-13：人工确认必须有可点的入口，否则断点只能靠 curl 解开。
+        assert!(WEB_APP_JS.contains("data-goal-action=\"phase-approve\""));
+        assert!(WEB_APP_JS.contains("data-goal-action=\"phase-reject\""));
+        assert!(WEB_APP_JS.contains("/ack"));
+        // GL-14：路由因果字段要真的渲染出来。
+        assert!(WEB_APP_JS.contains("route=${payload.route_reason}"));
     }
 
     #[test]
