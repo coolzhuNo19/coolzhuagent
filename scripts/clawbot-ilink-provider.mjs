@@ -16,7 +16,7 @@ const ilinkBaseUrl = (process.env.CLAWBOT_ILINK_BASE_URL || 'https://ilinkai.wei
 const ilinkCdnBaseUrl = (process.env.CLAWBOT_ILINK_CDN_BASE_URL || 'https://novac2c.cdn.weixin.qq.com/c2c').replace(/\/+$/, '');
 const channelVersion = process.env.CLAWBOT_ILINK_CHANNEL_VERSION || '2.4.6';
 const ilinkAppId = process.env.CLAWBOT_ILINK_APP_ID || 'bot';
-const botAgent = process.env.CLAWBOT_ILINK_BOT_AGENT || 'CoolzhuAgent/0.1.0';
+const botAgent = process.env.CLAWBOT_ILINK_BOT_AGENT || 'CoolzhuAgent/0.2.0';
 const accountId = process.env.CLAWBOT_ILINK_ACCOUNT_ID || 'wx-ilink';
 const providerToken = process.env.CLAWBOT_ILINK_PROVIDER_TOKEN || '';
 const startupBotToken = process.env.CLAWBOT_ILINK_BOT_TOKEN || '';
@@ -538,7 +538,7 @@ async function handle(req, res) {
     if (req.method === 'GET' && url.pathname === '/health') {
       jsonResponse(res, 200, {
         provider: 'coolzhu-ilink-provider',
-        provider_version: '0.1.0',
+        provider_version: '0.2.0',
         account_id: accountId,
         online: Boolean(state.botToken && state.sessionStarted),
         last_error: state.lastError,

@@ -6,6 +6,9 @@
     "steam streaming speakers",
     "cable input",
     "vb-audio",
+    "obs virtual",
+    "stereo mix",
+    "立体声混音",
   ];
 
   function isPhysicalOutputLabel(label) {
@@ -153,12 +156,21 @@
   function watchOutputDevice(selectedDeviceId, onChange) {
     if (!globalThis.navigator?.mediaDevices?.addEventListener) return () => {};
     const listener = async () => {
-      const outputs = await listPhysicalOutputs();
-      const selected = outputs.find((device) => device.deviceId === selectedDeviceId);
-      if (typeof onChange === "function") {
-        onChange(selected || outputs.find((device) => device.deviceId === "default") || null, {
-          fellBackToDefault: !selected,
-        });
+      try {
+        const outputs = await listPhysicalOutputs();
+        const selected = outputs.find((device) => device.deviceId === selectedDeviceId);
+        if (typeof onChange === "function") {
+          onChange(selected || outputs.find((device) => device.deviceId === "default") || null, {
+            fellBackToDefault: !selected,
+          });
+        }
+      } catch (error) {
+        if (typeof onChange === "function") {
+          onChange(null, {
+            fellBackToDefault: selectedDeviceId !== "default",
+            error: error?.message || String(error),
+          });
+        }
       }
     };
     navigator.mediaDevices.addEventListener("devicechange", listener);

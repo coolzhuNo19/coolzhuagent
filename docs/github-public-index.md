@@ -4,6 +4,7 @@
 
 ## 工程基础
 
+- [0.2.0 离线使用说明与基本交互验收表](user-guide/index.html)
 - [仓库结构](repository-structure.md)
 - [开发规范](development-standard.md)
 - [测试规范](testing-standard.md)

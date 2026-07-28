@@ -1,12 +1,12 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use computer_use::{
-    ComputerUseAction, ComputerUseAdapter, ComputerUseBudgets, ComputerUseCapabilities,
-    ComputerUseClock, ComputerUseController, ComputerUseError, ComputerUseEventSink,
-    ComputerUsePlanner, ComputerUseRequest, ComputerUseResult, ComputerUseRetryOwner,
-    ComputerUseRunContext, ComputerUseRunState, ComputerUseStage, ComputerUseSurface,
-    ComputerUseTerminalStatus, Observation, PlannerFuture, StepExecution, SupervisorSnapshot,
-    TaskIdempotencyKey, Verification,
+    ComputerUseAction, ComputerUseAdapter, ComputerUseApprovalPolicy, ComputerUseBudgets,
+    ComputerUseCapabilities, ComputerUseClock, ComputerUseController, ComputerUseError,
+    ComputerUseEventSink, ComputerUsePlanner, ComputerUseRequest, ComputerUseResult,
+    ComputerUseRetryOwner, ComputerUseRiskClass, ComputerUseRunContext, ComputerUseRunState,
+    ComputerUseStage, ComputerUseSurface, ComputerUseTerminalStatus, Observation, PlannerFuture,
+    StepExecution, SupervisorSnapshot, TaskIdempotencyKey, Verification,
 };
 use serde_json::Value as JsonValue;
 
@@ -95,6 +95,27 @@ impl ComputerUseClock for SystemClock {
     }
 }
 
+/// 聊天室 full-access 对 Computer Use 的受限批准映射。
+///
+/// 它只批准普通本地可逆动作和有状态动作；Sensitive/ForbiddenOrAmbiguous 永不放行。
+/// core 控制器还会在调用此策略前独立拦截删除、支付、外发、授权安装、凭据等宿主
+/// 语义敏感动作，因此 full-access 不能被用作这些高风险动作的通配批准。
+struct RoomFullAccessApprovalPolicy;
+
+impl ComputerUseApprovalPolicy for RoomFullAccessApprovalPolicy {
+    fn is_action_approved(
+        &self,
+        _request: &ComputerUseRequest,
+        action: &ComputerUseAction,
+        _observation: &Observation,
+    ) -> bool {
+        matches!(
+            action.risk,
+            ComputerUseRiskClass::ReversibleLocal | ComputerUseRiskClass::Stateful
+        )
+    }
+}
+
 struct PersistingEventSink<'a> {
     store: &'a ComputerUseRunStore,
     call_id: &'a str,
@@ -171,6 +192,37 @@ impl<'a> ComputerUseExecutor<'a> {
         input: &JsonValue,
         identity: &ToolCallIdentity,
     ) -> ComputerUseResult {
+        self.execute_in_room(input, identity, None).await
+    }
+
+    pub(crate) async fn execute_in_room(
+        &self,
+        input: &JsonValue,
+        identity: &ToolCallIdentity,
+        chat_room_id: Option<&str>,
+    ) -> ComputerUseResult {
+        self.execute_in_room_with_policy(input, identity, chat_room_id, false)
+            .await
+    }
+
+    /// 仅供已经完成聊天室 full-access 双确认校验的宿主路径调用。
+    pub(crate) async fn execute_in_room_with_full_access(
+        &self,
+        input: &JsonValue,
+        identity: &ToolCallIdentity,
+        chat_room_id: Option<&str>,
+    ) -> ComputerUseResult {
+        self.execute_in_room_with_policy(input, identity, chat_room_id, true)
+            .await
+    }
+
+    async fn execute_in_room_with_policy(
+        &self,
+        input: &JsonValue,
+        identity: &ToolCallIdentity,
+        chat_room_id: Option<&str>,
+        room_full_access_approved: bool,
+    ) -> ComputerUseResult {
         if let Ok(Some(existing)) = self.store.load(&identity.call_id) {
             if let Some(result) = existing.terminal_result {
                 return result;
@@ -205,7 +257,13 @@ impl<'a> ComputerUseExecutor<'a> {
                         ComputerUseRetryOwner::Model,
                     ),
                 );
-                self.create_and_finish(input, identity, ComputerUseSurface::Auto, &result);
+                self.create_and_finish(
+                    input,
+                    identity,
+                    ComputerUseSurface::Auto,
+                    chat_room_id,
+                    &result,
+                );
                 return result;
             }
         };
@@ -217,7 +275,7 @@ impl<'a> ComputerUseExecutor<'a> {
                 ComputerUseStage::IntentGuard,
                 error,
             );
-            self.create_and_finish(input, identity, request.surface, &result);
+            self.create_and_finish(input, identity, request.surface, chat_room_id, &result);
             return result;
         }
 
@@ -251,7 +309,7 @@ impl<'a> ComputerUseExecutor<'a> {
                     ComputerUseRetryOwner::None,
                 ),
             );
-            self.create_and_finish(input, identity, requested_surface, &result);
+            self.create_and_finish(input, identity, requested_surface, chat_room_id, &result);
             return result;
         }
 
@@ -275,7 +333,7 @@ impl<'a> ComputerUseExecutor<'a> {
                         ),
                     )
                 };
-                self.create_and_finish(input, identity, result.surface, &result);
+                self.create_and_finish(input, identity, result.surface, chat_room_id, &result);
                 return result;
             }
             Err(error) => {
@@ -285,7 +343,7 @@ impl<'a> ComputerUseExecutor<'a> {
                     ComputerUseStage::Supervisor,
                     persistence_error(error),
                 );
-                self.create_and_finish(input, identity, request.surface, &result);
+                self.create_and_finish(input, identity, request.surface, chat_room_id, &result);
                 return result;
             }
             Ok(None) => {}
@@ -300,12 +358,18 @@ impl<'a> ComputerUseExecutor<'a> {
                     ComputerUseStage::Classification,
                     error,
                 );
-                self.create_and_finish(input, identity, request.surface, &result);
+                self.create_and_finish(input, identity, request.surface, chat_room_id, &result);
                 return result;
             }
         };
 
-        if !self.create_run(input, identity, surface, Some(&idempotency_key)) {
+        if !self.create_run(
+            input,
+            identity,
+            surface,
+            chat_room_id,
+            Some(&idempotency_key),
+        ) {
             if let Ok(Some(existing)) = self.store.load(&identity.call_id) {
                 if let Some(result) = existing.terminal_result {
                     return result;
@@ -341,6 +405,9 @@ impl<'a> ComputerUseExecutor<'a> {
             SystemClock,
             self.budgets,
         );
+        if room_full_access_approved {
+            controller = controller.with_approval_policy(RoomFullAccessApprovalPolicy);
+        }
         let mut result = controller
             .run(
                 &ComputerUseRequest { surface, ..request },
@@ -375,9 +442,10 @@ impl<'a> ComputerUseExecutor<'a> {
         input: &JsonValue,
         identity: &ToolCallIdentity,
         surface: ComputerUseSurface,
+        chat_room_id: Option<&str>,
         result: &ComputerUseResult,
     ) {
-        if self.create_run(input, identity, surface, None) {
+        if self.create_run(input, identity, surface, chat_room_id, None) {
             let _ = self.store.finish(&identity.call_id, 0, result);
         }
     }
@@ -387,6 +455,7 @@ impl<'a> ComputerUseExecutor<'a> {
         input: &JsonValue,
         identity: &ToolCallIdentity,
         surface: ComputerUseSurface,
+        chat_room_id: Option<&str>,
         idempotency_key: Option<&str>,
     ) -> bool {
         let created_at_ms = now_ms();
@@ -408,7 +477,7 @@ impl<'a> ComputerUseExecutor<'a> {
                 provider_tool_call_id: Some(identity.provider_tool_call_id.clone()),
                 session_id: identity.session_id.clone(),
                 turn_id: identity.turn_id.clone(),
-                chat_room_id: None,
+                chat_room_id: chat_room_id.map(str::to_string),
                 idempotency_key,
                 objective_json: serde_json::to_string(input).unwrap_or_else(|_| "null".into()),
                 surface,
@@ -652,6 +721,7 @@ impl ComputerUseAdapterFactory for ProductionAdapterFactory {
 pub(crate) async fn execute_with_current_runtime(
     input: &JsonValue,
     identity: &ToolCallIdentity,
+    chat_room_id: Option<&str>,
 ) -> ComputerUseResult {
     let config = crate::read_config(|config| config.computer_use.clone());
     if !config.enabled || config.tool_mode != "task-controller" {
@@ -687,8 +757,33 @@ pub(crate) async fn execute_with_current_runtime(
         },
     };
     let planner = CurrentSessionComputerUsePlanner::new(identity.session_id.clone());
-    ComputerUseExecutor::new(&planner, &adapters, &store, config.budgets())
-        .execute(input, identity)
+    let executor = ComputerUseExecutor::new(&planner, &adapters, &store, config.budgets());
+    let room_grant = crate::room_permission_grant_view_for_path(
+        &crate::default_session_sqlite_path(),
+        chat_room_id,
+    );
+    if !room_grant.session_authorized || !room_grant.session_confirmed_twice {
+        let result = terminal_result(
+            identity,
+            ComputerUseSurface::Auto,
+            ComputerUseStage::IntentGuard,
+            ComputerUseError::blocked(
+                "computer_use_room_full_access_required",
+                "computer-use requires full-access authorization for the originating chat room",
+                ComputerUseRetryOwner::User,
+            ),
+        );
+        executor.create_and_finish(
+            input,
+            identity,
+            ComputerUseSurface::Auto,
+            chat_room_id,
+            &result,
+        );
+        return result;
+    }
+    executor
+        .execute_in_room_with_full_access(input, identity, chat_room_id)
         .await
 }
 
@@ -720,6 +815,9 @@ mod tests {
         assert!(!runtime.contains("UnavailableAdapterFactory"));
         assert!(runtime.contains("CurrentSessionComputerUsePlanner"));
         assert!(runtime.contains("ProductionAdapterFactory"));
+        assert!(runtime.contains("room_permission_grant_view_for_path"));
+        assert!(runtime.contains("computer_use_room_full_access_required"));
+        assert!(runtime.contains("execute_in_room_with_full_access(input, identity, chat_room_id)"));
     }
 
     #[test]
@@ -749,12 +847,24 @@ mod tests {
 
     impl FakePlanner {
         fn one_click() -> Self {
+            Self::one_action(
+                ComputerUseActionKind::Click,
+                "submit",
+                ComputerUseRiskClass::ReversibleLocal,
+            )
+        }
+
+        fn one_action(
+            kind: ComputerUseActionKind,
+            target: impl Into<String>,
+            risk: ComputerUseRiskClass,
+        ) -> Self {
             Self {
                 actions: Mutex::new(vec![ComputerUseAction {
-                    kind: ComputerUseActionKind::Click,
-                    target: "submit".into(),
+                    kind,
+                    target: target.into(),
                     arguments: json!({}),
-                    risk: ComputerUseRiskClass::ReversibleLocal,
+                    risk,
                 }]),
             }
         }
@@ -794,7 +904,10 @@ mod tests {
 
         fn capabilities(&self) -> ComputerUseCapabilities {
             ComputerUseCapabilities {
+                navigate: true,
                 click: true,
+                submit: true,
+                multiple_tabs: true,
                 ..ComputerUseCapabilities::default()
             }
         }
@@ -942,6 +1055,120 @@ mod tests {
             let persisted = store.load(&result.call_id).unwrap().unwrap();
             assert_eq!(persisted.terminal_result.as_ref(), Some(&result));
         }
+    }
+
+    #[tokio::test]
+    async fn originating_chat_room_is_persisted_with_the_run() {
+        let store = store();
+        let planner = FakePlanner::one_click();
+        let factory = factory(true);
+        let result =
+            ComputerUseExecutor::new(&planner, &factory, &store, ComputerUseBudgets::default())
+                .execute_in_room(
+                    &input("browser"),
+                    &identity("tool-room-audit"),
+                    Some("room-full-access"),
+                )
+                .await;
+
+        assert_eq!(result.status, ComputerUseTerminalStatus::Succeeded);
+        let persisted = store.load(&result.call_id).unwrap().unwrap();
+        assert_eq!(persisted.chat_room_id.as_deref(), Some("room-full-access"));
+    }
+
+    #[tokio::test]
+    async fn full_access_room_policy_executes_ordinary_stateful_browser_actions() {
+        for (label, kind) in [
+            ("open-tab", ComputerUseActionKind::OpenTab),
+            ("navigate", ComputerUseActionKind::Navigate),
+            ("submit", ComputerUseActionKind::Submit),
+        ] {
+            let store = store();
+            let planner = FakePlanner::one_action(
+                kind,
+                format!("safe-{label}"),
+                ComputerUseRiskClass::Stateful,
+            );
+            let factory = factory(true);
+            let result =
+                ComputerUseExecutor::new(&planner, &factory, &store, ComputerUseBudgets::default())
+                    .execute_in_room_with_full_access(
+                        &input("browser"),
+                        &identity(&format!("tool-full-access-{label}")),
+                        Some("room-full-access"),
+                    )
+                    .await;
+
+            assert_eq!(
+                result.status,
+                ComputerUseTerminalStatus::Succeeded,
+                "{label}"
+            );
+            assert_eq!(factory.action_count.load(Ordering::SeqCst), 1, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn full_access_room_policy_never_executes_sensitive_or_semantic_sensitive_actions() {
+        let sensitive_store = store();
+        let sensitive_planner = FakePlanner::one_action(
+            ComputerUseActionKind::Submit,
+            "confirm-settings",
+            ComputerUseRiskClass::Sensitive,
+        );
+        let sensitive_factory = factory(true);
+        let sensitive_result = ComputerUseExecutor::new(
+            &sensitive_planner,
+            &sensitive_factory,
+            &sensitive_store,
+            ComputerUseBudgets::default(),
+        )
+        .execute_in_room_with_full_access(
+            &input("browser"),
+            &identity("tool-full-access-sensitive"),
+            Some("room-full-access"),
+        )
+        .await;
+        assert_eq!(sensitive_result.status, ComputerUseTerminalStatus::Blocked);
+        assert_eq!(
+            sensitive_result
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("approval_required")
+        );
+        assert_eq!(sensitive_factory.action_count.load(Ordering::SeqCst), 0);
+
+        let semantic_store = store();
+        let semantic_planner = FakePlanner::one_action(
+            ComputerUseActionKind::Click,
+            "delete-project",
+            ComputerUseRiskClass::ReversibleLocal,
+        );
+        let semantic_factory = factory(true);
+        let mut semantic_input = input("browser");
+        semantic_input["objective"] = json!("永久删除项目");
+        let semantic_result = ComputerUseExecutor::new(
+            &semantic_planner,
+            &semantic_factory,
+            &semantic_store,
+            ComputerUseBudgets::default(),
+        )
+        .execute_in_room_with_full_access(
+            &semantic_input,
+            &identity("tool-full-access-semantic-sensitive"),
+            Some("room-full-access"),
+        )
+        .await;
+        assert_eq!(semantic_result.status, ComputerUseTerminalStatus::Blocked);
+        assert_eq!(
+            semantic_result
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("approval_required")
+        );
+        assert_eq!(semantic_factory.action_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

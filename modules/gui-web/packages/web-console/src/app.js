@@ -95,6 +95,7 @@ let messagePaging = { roomId: null, hasMore: false, nextBefore: null };
 let toolCatalog = { categories: [], summary: null, notes: [] };
 let toolDetailCache = new Map();
 let toolCallStatuses = new Map();
+let mcpServerRegistry = { servers: [], config_path: "" };
 let clawbotChannel = {
   status: null,
   commands: [],
@@ -142,6 +143,7 @@ let officeSceneState = null;
 let visionLastLocate = null;
 let realtimeSessionRunning = false;
 let realtimeSessionStatus = null;
+let realtimeVoiceCaptureDegradation = null;
 
 document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll("[data-bind]").forEach((node) => {
@@ -158,6 +160,12 @@ document.addEventListener("DOMContentLoaded", () => {
   actionButtons.get("stability-run")?.addEventListener("click", runStability);
   actionButtons.get("closed-loop")?.addEventListener("click", runClosedLoop);
   actionButtons.get("safe-click-test")?.addEventListener("click", runSafeClickTest);
+  actionButtons.get("safe-context-menu-test")?.addEventListener("click", (event) => {
+    runSafeIsolatedInputTest("context-menu", event.currentTarget);
+  });
+  actionButtons.get("safe-drag-select-test")?.addEventListener("click", (event) => {
+    runSafeIsolatedInputTest("drag-select", event.currentTarget);
+  });
   actionButtons.get("profile-run")?.addEventListener("click", runComputerUseProfile);
   actionButtons.get("send-message")?.addEventListener("click", sendMessage);
   actionButtons.get("showui-service-toggle")?.addEventListener("click", toggleShowUiService);
@@ -185,7 +193,9 @@ document.addEventListener("DOMContentLoaded", () => {
     .querySelector('[data-role="clawbot-binding-list"]')
     ?.addEventListener("click", handleClawbotBindingListClick);
   window.addEventListener("beforeunload", stopClawbotLoginPolling);
+  window.addEventListener("beforeunload", releaseVoiceResourcesOnUnload);
   initTtsVoiceSelector();
+  initAudioDeviceSelectors();
   startRealtimeSessionEventStream();
   document.querySelectorAll('[data-action="audio-realtime-start"]').forEach((node) => {
     node.addEventListener("click", audioRealtimeStart);
@@ -218,6 +228,7 @@ document.addEventListener("DOMContentLoaded", () => {
   actionButtons.get("chat-handoff-toggle")?.addEventListener("click", toggleHandoffDrawer);
   actionButtons.get("chat-handoff-manual")?.addEventListener("click", manualHandoffSelectedMessages);
   actionButtons.get("project-refresh")?.addEventListener("click", () => loadProjectTree());
+  actionButtons.get("project-symbol-index")?.addEventListener("click", buildProjectSymbolIndex);
   actionButtons.get("project-mode-toggle")?.addEventListener("click", () => toggleIdeViewDiffMode());
   document.querySelector('[data-role="ide-diff-right"]')?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
@@ -306,6 +317,9 @@ document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll('[data-action="tool-inventory-manage"]').forEach((node) => {
     node.addEventListener("click", onToolInventoryManage);
   });
+  actionButtons.get("mcp-servers-refresh")?.addEventListener("click", () => refreshMcpServers({ silent: false }));
+  document.querySelector('[data-role="mcp-server-list"]')?.addEventListener("click", onMcpServerListClick);
+  actionButtons.get("mcp-call")?.addEventListener("click", runMcpCall);
   actionButtons.get("tool-dispatch-run")?.addEventListener("click", runToolSemanticDispatch);
   document.querySelector('[data-role="tool-dispatch-intent"]')?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
@@ -320,7 +334,17 @@ document.addEventListener("DOMContentLoaded", () => {
   document.querySelector('[data-role="memory-constellation"]')?.addEventListener("click", onMemoryBeadListClick);
   document.querySelector('[data-role="memory-window-filters"]')?.addEventListener("input", memoryWindowApplyFilters);
   document.querySelector('[data-role="memory-window-filters"]')?.addEventListener("change", memoryWindowApplyFilters);
-  actionButtons.get("memory-window-refresh")?.addEventListener("click", memoryWindowRefresh);
+  actionButtons.get("memory-window-refresh")?.addEventListener("click", async () => {
+    const button = actionButtons.get("memory-window-refresh");
+    setBusy(button, true, "刷新中");
+    try {
+      await memoryWindowRefresh();
+    } catch (error) {
+      addMessage({ author: "记忆窗口", text: `刷新失败：${error.message}`, kind: "thought", icon: "error-log" });
+    } finally {
+      setBusy(button, false);
+    }
+  });
   actionButtons.get("browser-window-go")?.addEventListener("click", browserWindowNavigate);
   actionButtons.get("browser-window-reload")?.addEventListener("click", browserWindowReload);
   actionButtons.get("browser-window-back")?.addEventListener("click", browserWindowBack);
@@ -328,6 +352,15 @@ document.addEventListener("DOMContentLoaded", () => {
   actionButtons.get("browser-window-stop")?.addEventListener("click", browserWindowStop);
   actionButtons.get("browser-window-open-external")?.addEventListener("click", browserWindowOpenExternal);
   actionButtons.get("browser-proxy-save")?.addEventListener("click", browserProxySave);
+  actionButtons.get("browser-bridge-health")?.addEventListener("click", (event) => {
+    runBrowserBridgeDiagnostic("health", event.currentTarget);
+  });
+  actionButtons.get("browser-bridge-probe")?.addEventListener("click", (event) => {
+    runBrowserBridgeDiagnostic("probe", event.currentTarget);
+  });
+  actionButtons.get("browser-bridge-self-test")?.addEventListener("click", (event) => {
+    runBrowserBridgeDiagnostic("self-test", event.currentTarget);
+  });
   document.querySelector('[data-role="browser-window-input"]')?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
@@ -429,6 +462,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
   restoreComposerDraft();
+  browserWindowUpdateNavigationControls();
 
   chatMessageList()?.addEventListener("click", (event) => {
     if (event.target.closest(interactiveMessageSelector())) {
@@ -453,6 +487,12 @@ document.addEventListener("DOMContentLoaded", () => {
     ?.addEventListener("click", refreshToolAudit);
   actionButtons.get("task-refresh")?.addEventListener("click", taskRefreshWindow);
   actionButtons.get("goal-create")?.addEventListener("click", taskCreateGoal);
+  document.querySelector('[data-role="goal-consult-title"]')?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void taskCreateGoal();
+    }
+  });
   actionButtons.get("full-access-enable")?.addEventListener("click", enableFullAccessGrant);
   actionButtons.get("full-access-revoke")?.addEventListener("click", revokeFullAccessGrant);
   actionButtons.get("task-schedule-create")?.addEventListener("click", taskScheduleCreate);
@@ -1465,6 +1505,18 @@ function groundingCompactJson(value) {
 
 function diagnosticsWindowInitialize() {
   actionButtons.get("diagnostics-window-refresh")?.addEventListener("click", diagnosticsWindowRefresh);
+  diagnosticsSelfcheckHost()?.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-selfcheck-retry]");
+    if (!button) {
+      return;
+    }
+    setBusy(button, true, "重试中");
+    try {
+      await diagnosticsWindowRefresh({ silent: false });
+    } finally {
+      setBusy(button, false);
+    }
+  });
   diagnosticsWindowRefresh({ silent: true });
 }
 
@@ -1524,26 +1576,39 @@ function diagnosticsWindowRenderChecks(checks) {
   if (!host) {
     return;
   }
-  host.replaceChildren();
-  const list = document.createElement("ul");
-  list.className = "logs-window-list";
-  (checks || []).slice(0, 10).forEach((check) => {
-    const item = document.createElement("li");
-    const title = document.createElement("strong");
-    title.className = `status-${check.status || "unknown"}`;
-    title.textContent = `${check.label || check.id || "check"} · ${check.status || "unknown"}`;
-    const detail = document.createElement("small");
-    detail.textContent = check.detail || "";
-    item.append(title, detail);
-    list.append(item);
+  const availableChecks = Array.isArray(checks) ? checks : [];
+  const checkedAt = new Date().toLocaleTimeString();
+  host.querySelectorAll("[data-selfcheck-module]").forEach((row) => {
+    const moduleKey = row.dataset.selfcheckModule || "";
+    const keys = MODULE_SELFCHECK_HEALTH_KEYS[moduleKey] || [moduleKey];
+    const match = availableChecks.find((check) =>
+      keys.some((key) => String(check?.id || "").includes(key))
+    );
+    const status = String(match?.status || "unknown").toLowerCase();
+    const icon = row.querySelector(".module-selfcheck-icon");
+    if (icon) {
+      icon.src = moduleSelfcheckRowIcon(status);
+    }
+    row.classList.remove("is-ok", "is-warn", "is-error", "is-unknown");
+    row.classList.add(
+      status === "warning" ? "is-warn"
+        : status === "error" ? "is-error"
+          : status === "ok" ? "is-ok"
+            : "is-unknown",
+    );
+    const statusEl = row.querySelector('[data-selfcheck-field="status"]');
+    if (statusEl) {
+      statusEl.textContent = match?.status || "—";
+    }
+    const detailEl = row.querySelector('[data-selfcheck-field="detail"]');
+    if (detailEl) {
+      detailEl.textContent = match?.detail || "未接入健康检查";
+    }
+    const timeEl = row.querySelector('[data-selfcheck-field="time"]');
+    if (timeEl) {
+      timeEl.textContent = checkedAt;
+    }
   });
-  if (!list.children.length) {
-    const empty = document.createElement("p");
-    empty.textContent = "暂无 health check 数据。";
-    host.append(empty);
-    return;
-  }
-  host.append(list);
 }
 
 function diagnosticsWindowRenderSuggestions(suggestions) {
@@ -5120,7 +5185,7 @@ function goalTaskChainRows(goal) {
   (goal.phases || []).forEach((phase, index) => {
     const meta = taskChainPhaseStatusMeta(phase.status);
     // GL-11/13：verdict 徽标与人工确认入口挂在任务链弹窗（用户实际可达的地方）。
-    // 早先挂在 goal-consult-list 容器上，而那个容器已在界面精简中删除，等于人看不到也点不到。
+    // 与 Goal 列表和任务链弹窗共用同一套人工确认入口，确保两处状态一致。
     const awaitingAck = phase.human_ack === "awaiting";
     const ackControls = awaitingAck
       ? `<div class="task-chain-ack">
@@ -7533,6 +7598,21 @@ function browserWindowSetStatus(text) {
   }
 }
 
+const BROWSER_NAVIGATION_ACTIONS = ["back", "forward", "reload", "stop"];
+
+function browserWindowUpdateNavigationControls(hostName = activeBrowserHostName) {
+  const externalOnly = hostName === "systemBrowser";
+  const reason = "系统默认浏览器由外部进程管理，控制台无法发送此导航命令。";
+  BROWSER_NAVIGATION_ACTIONS.forEach((action) => {
+    const button = actionButtons.get(`browser-window-${action}`);
+    if (!button) {
+      return;
+    }
+    button.disabled = externalOnly;
+    button.title = externalOnly ? reason : "";
+  });
+}
+
 function browserCommandPayload(name, url) {
   return name === "Navigate" ? { Navigate: { url } } : name;
 }
@@ -7545,6 +7625,17 @@ async function browserWindowInvokeCommand(name, url) {
   return invoke("browser_window_command", {
     command: browserCommandPayload(name, url),
   });
+}
+
+async function browserWindowInvokeTauriControl(command, label) {
+  try {
+    await browserWindowInvokeCommand(command);
+    browserWindowSetStatus(`已向独立浏览器窗口发送${label}命令。`);
+    return { supported: true };
+  } catch (error) {
+    browserWindowSetStatus(`独立浏览器窗口${label}失败：${error.message}`);
+    throw error;
+  }
 }
 
 async function browserWindowOpenSystem(url) {
@@ -7629,13 +7720,15 @@ const browserHosts = {
       const { frame } = browserWindowElements();
       if (frame?.src) {
         frame.src = frame.src;
+        browserWindowSetStatus("已刷新主面板内嵌页面。");
       }
     },
     stop() {
       try {
         browserWindowElements().frame?.contentWindow?.stop?.();
-      } catch {
-        // Cross-origin iframes may reject stop; safe no-op.
+        browserWindowSetStatus("已尝试停止主面板内嵌页面加载。");
+      } catch (error) {
+        browserWindowSetStatus(`内嵌页面不允许停止加载：${error.message}`);
       }
     },
     focus() {
@@ -7660,42 +7753,52 @@ const browserHosts = {
         return { opened: "tauri" };
       } catch (error) {
         console.warn('browser_window_command Navigate 失败，降级系统浏览器', error);
+        browserWindowSetStatus(`独立浏览器窗口打开失败（${error.message}），正在降级到系统默认浏览器…`);
         const opened = await browserHosts.systemBrowser.open(url);
-        return { opened };
+        return {
+          opened: opened?.opened || opened,
+          degraded_from: "tauri",
+          error: error.message,
+        };
       }
     },
     async back() {
-      try { await browserWindowInvokeCommand("Back"); } catch { /* no-op */ }
+      return browserWindowInvokeTauriControl("Back", "后退");
     },
     async forward() {
-      try { await browserWindowInvokeCommand("Forward"); } catch { /* no-op */ }
+      return browserWindowInvokeTauriControl("Forward", "前进");
     },
     async reload() {
-      try { await browserWindowInvokeCommand("Reload"); } catch { /* no-op */ }
+      return browserWindowInvokeTauriControl("Reload", "刷新");
     },
     async stop() {
-      try { await browserWindowInvokeCommand("Stop"); } catch { /* no-op */ }
+      return browserWindowInvokeTauriControl("Stop", "停止");
     },
     async focus() {
-      try { await browserWindowInvokeCommand("Focus"); } catch { /* no-op */ }
+      return browserWindowInvokeTauriControl("Focus", "聚焦");
     },
     async close() {
-      try { await browserWindowInvokeCommand("Close"); } catch { /* no-op */ }
+      return browserWindowInvokeTauriControl("Close", "关闭");
     },
   },
   systemBrowser: {
     async open(url) {
-      return browserWindowOpenSystem(url);
+      return { opened: await browserWindowOpenSystem(url) };
     },
     async navigate(url) {
       return this.open(url);
     },
-    back() {},
-    forward() {},
-    reload() {},
-    stop() {},
-    focus() {},
-    close() {},
+    unsupported(action) {
+      const reason = `系统默认浏览器由外部进程管理，控制台无法${action}。`;
+      browserWindowSetStatus(reason);
+      return { supported: false, reason };
+    },
+    back() { return this.unsupported("后退"); },
+    forward() { return this.unsupported("前进"); },
+    reload() { return this.unsupported("刷新"); },
+    stop() { return this.unsupported("停止加载"); },
+    focus() { return this.unsupported("聚焦"); },
+    close() { return this.unsupported("关闭"); },
   },
 };
 
@@ -7705,7 +7808,7 @@ function browserOpenedHowLabel(how) {
 
 async function browserWindowOpenIndependent(url) {
   const result = await browserHosts.tauriWebview2.open(url);
-  return result.opened || result;
+  return typeof result === "object" ? result : { opened: result };
 }
 
 async function browserWindowNavigate() {
@@ -7720,26 +7823,44 @@ async function browserWindowNavigate() {
   }
   frame.dataset.currentUrl = url;
   activeBrowserHostName = browserWindowClassifyTarget(url);
-  const result = await browserHosts[activeBrowserHostName].navigate(url);
-  if (result?.opened && result.opened !== "iframe") {
-    browserWindowSetStatus(`已用${browserOpenedHowLabel(result.opened)}打开：${url}`);
+  browserWindowUpdateNavigationControls();
+  try {
+    const result = await browserHosts[activeBrowserHostName].navigate(url);
+    if (result?.opened && result.opened !== "iframe") {
+      browserWindowSetStatus(`已用${browserOpenedHowLabel(result.opened)}打开：${url}`);
+    }
+  } catch (error) {
+    browserWindowSetStatus(`浏览器打开失败：${error.message}`);
+  }
+}
+
+async function browserWindowRunNavigation(action, label) {
+  const host = browserHosts[activeBrowserHostName];
+  if (!host?.[action]) {
+    browserWindowSetStatus(`当前浏览器宿主不支持${label}。`);
+    return;
+  }
+  try {
+    await host[action]();
+  } catch (error) {
+    browserWindowSetStatus(`${label}失败：${error.message}`);
   }
 }
 
 function browserWindowReload() {
-  browserHosts[activeBrowserHostName]?.reload?.();
+  return browserWindowRunNavigation("reload", "刷新");
 }
 
 function browserWindowBack() {
-  browserHosts[activeBrowserHostName]?.back?.();
+  return browserWindowRunNavigation("back", "后退");
 }
 
 function browserWindowForward() {
-  browserHosts[activeBrowserHostName]?.forward?.();
+  return browserWindowRunNavigation("forward", "前进");
 }
 
 function browserWindowStop() {
-  browserHosts[activeBrowserHostName]?.stop?.();
+  return browserWindowRunNavigation("stop", "停止加载");
 }
 
 async function browserWindowOpenExternal() {
@@ -7750,9 +7871,72 @@ async function browserWindowOpenExternal() {
   if (!url || url === "about:blank") {
     return;
   }
-  const how = await browserWindowOpenIndependent(url);
-  if (status) {
-    status.textContent = `已用${browserOpenedHowLabel(how)}打开：${url}`;
+  try {
+    const result = await browserWindowOpenIndependent(url);
+    const how = result?.opened || "popup";
+    activeBrowserHostName = how === "tauri" ? "tauriWebview2" : "systemBrowser";
+    browserWindowUpdateNavigationControls();
+    if (status) {
+      status.textContent = result?.degraded_from
+        ? `独立浏览器窗口打开失败（${result.error || "未知错误"}），已用${browserOpenedHowLabel(how)}打开：${url}`
+        : `已用${browserOpenedHowLabel(how)}打开：${url}`;
+    }
+  } catch (error) {
+    browserWindowSetStatus(`独立窗口打开失败：${error.message}`);
+  }
+}
+
+function setBrowserBridgeOutput(value, { error = false } = {}) {
+  const output = document.querySelector('[data-role="browser-bridge-output"]');
+  if (!output) {
+    return;
+  }
+  output.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  output.classList.toggle("is-error", error);
+}
+
+async function runBrowserBridgeDiagnostic(action, button) {
+  const endpoints = {
+    health: "/api/computer-use/browser/health",
+    probe: "/api/computer-use/browser/probe",
+    "self-test": "/api/computer-use/browser/self-test",
+  };
+  const endpoint = endpoints[action];
+  if (!endpoint) {
+    return;
+  }
+  let options;
+  if (action === "self-test") {
+    const kind = document.querySelector('[data-role="browser-bridge-self-test-kind"]')?.value || "slider";
+    const url = document.querySelector('[data-role="browser-bridge-target-url"]')?.value?.trim() || "";
+    const value = Math.max(0, Math.min(100, Number(
+      document.querySelector('[data-role="browser-bridge-self-test-value"]')?.value || 80,
+    )));
+    if (!/^https?:\/\/\S+$/i.test(url)) {
+      setBrowserBridgeOutput("自测需要填写受控的 http/https 测试页 URL。", { error: true });
+      return;
+    }
+    if (!window.confirm(
+      `确认运行 Browser Bridge 自测？\n\n场景：${kind}\n测试页：${url}\n\n自测会操作浏览器测试页；多标签页场景会临时打开、激活并关闭标签页。`,
+    )) {
+      setBrowserBridgeOutput("已取消 Browser Bridge 自测。");
+      return;
+    }
+    options = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind, value, url }),
+    };
+  }
+  setBusy(button, true, action === "self-test" ? "自测中" : "探测中");
+  setBrowserBridgeOutput(`正在请求 ${endpoint}…`);
+  try {
+    const response = await requestJson(endpoint, options);
+    setBrowserBridgeOutput(response, { error: response?.ok === false });
+  } catch (error) {
+    setBrowserBridgeOutput(`Browser Bridge 诊断失败：${error.message}`, { error: true });
+  } finally {
+    setBusy(button, false);
   }
 }
 
@@ -8779,6 +8963,8 @@ function setSessionForm(session) {
   const endpoint = document.querySelector('[data-role="session-endpoint"]');
   const reasoningEffort = document.querySelector('[data-role="session-reasoning-effort"]');
   const apiSecret = document.querySelector('[data-role="session-api-secret"]');
+  const contextWindow = document.querySelector('[data-role="session-context-window"]');
+  const maxOutput = document.querySelector('[data-role="session-max-output"]');
   if (!session) {
     if (name) name.value = "";
     if (provider) provider.value = "DeepSeek";
@@ -8795,6 +8981,18 @@ function setSessionForm(session) {
     if (customModel) customModel.value = "";
     if (baseUrl) baseUrl.value = "";
     if (endpoint) endpoint.value = "";
+    if (contextWindow) {
+      contextWindow.value = "";
+      contextWindow.placeholder = "默认（留空沿用）";
+      contextWindow.title = "";
+      delete contextWindow.dataset.sessionId;
+    }
+    if (maxOutput) {
+      maxOutput.value = "";
+      maxOutput.placeholder = "默认（留空沿用）";
+      maxOutput.title = "";
+      delete maxOutput.dataset.sessionId;
+    }
     setSessionAvatarForm("");
     updateCustomProviderFields();
     setGoalRoleForm(null);
@@ -8833,10 +9031,17 @@ function loadSessionModelLimit(sessionId) {
   if (!ctxEl || !outEl || !sessionId) {
     return;
   }
+  ctxEl.dataset.sessionId = sessionId;
+  outEl.dataset.sessionId = sessionId;
   ctxEl.value = "";
   outEl.value = "";
+  ctxEl.title = "";
+  outEl.title = "";
   requestJson(`/api/sessions/${encodeURIComponent(sessionId)}/model-limit`)
     .then((d) => {
+      if (ctxEl.dataset.sessionId !== sessionId || outEl.dataset.sessionId !== sessionId) {
+        return;
+      }
       if (d.overridden) {
         if (d.context_window) ctxEl.value = d.context_window;
         if (d.max_output_tokens) outEl.value = d.max_output_tokens;
@@ -8845,6 +9050,9 @@ function loadSessionModelLimit(sessionId) {
       outEl.placeholder = `默认 ${d.default_max_output_tokens}（留空沿用）`;
     })
     .catch((error) => {
+      if (ctxEl.dataset.sessionId !== sessionId || outEl.dataset.sessionId !== sessionId) {
+        return;
+      }
       ctxEl.placeholder = "模型容量加载失败";
       outEl.placeholder = "模型容量加载失败";
       ctxEl.title = error?.message || "模型容量加载失败";
@@ -9171,16 +9379,30 @@ async function createSession() {
     });
     activeSessionId = result.session.id;
     updateSessionTrigger(result.session.display_name);
+    const configErrors = [];
+    try {
+      await persistSessionModelLimit(result.session.id);
+    } catch (error) {
+      configErrors.push(`模型容量：${error.message}`);
+    }
+    try {
+      await saveGoalRoleConfig(result.session.id);
+    } catch (error) {
+      configErrors.push(`Goal role：${error.message}`);
+    }
     await loadSessions();
     await loadAgents();
+    await loadGoalRoles();
     // 反馈：选中并载入新会话到表单 + 提示，避免“点了没反应”的错觉（修复新建会话不生效）。
     renderSessionList(sessionRegistry.sessions, activeSessionId);
     setSessionForm(result.session);
     addMessage({
       author: "会话管理",
-      text: `已新建会话：${result.session.display_name}`,
-      kind: "thought",
-      icon: "session-new",
+      text: configErrors.length
+        ? `已新建会话：${result.session.display_name}；初始化配置未完全保存：${configErrors.join("；")}`
+        : `已新建会话：${result.session.display_name}`,
+      kind: configErrors.length ? "tool-summary" : "thought",
+      icon: configErrors.length ? "error-log" : "session-new",
     });
   } catch (error) {
     addMessage({ author: "会话管理", text: `新建失败：${error.message}`, kind: "thought", icon: "error-log" });
@@ -9322,7 +9544,11 @@ function onToolInventoryManage(event) {
     return;
   }
   const requestedTarget = button.dataset.toolTarget || "catalog";
-  const detailTarget = requestedTarget.startsWith("catalog-") ? "catalog" : requestedTarget;
+  const detailTarget = requestedTarget === "catalog-mcp"
+    ? "mcp"
+    : requestedTarget.startsWith("catalog-")
+      ? "catalog"
+      : requestedTarget;
   const shouldClose =
     requestedTarget === "close"
     || (!controls.hidden && controls.dataset.activeTarget === requestedTarget);
@@ -9357,11 +9583,14 @@ function onToolInventoryManage(event) {
   }
 
   if (requestedTarget === "catalog-compute-use") {
-    toolCatalogSearch = "compute-use";
+    toolCatalogSearch = "computer";
     renderToolsCatalog(toolCatalog);
   } else if (detailTarget === "catalog" && toolCatalogSearch) {
     toolCatalogSearch = "";
     renderToolsCatalog(toolCatalog);
+  }
+  if (requestedTarget === "catalog-mcp") {
+    void refreshMcpServers({ silent: false });
   }
 
   window.requestAnimationFrame(() => {
@@ -9369,6 +9598,190 @@ function onToolInventoryManage(event) {
     activeSection?.scrollIntoView({ block: "nearest", behavior: "smooth" });
     activeSection?.querySelector("input, select, button")?.focus({ preventScroll: true });
   });
+}
+
+function setMcpOutput(value, { error = false } = {}) {
+  const output = document.querySelector('[data-role="mcp-output"]');
+  if (!output) {
+    return;
+  }
+  output.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  output.classList.toggle("is-error", error);
+}
+
+function setMcpServerStatus(text, { error = false } = {}) {
+  const status = document.querySelector('[data-role="mcp-server-status"]');
+  if (!status) {
+    return;
+  }
+  status.textContent = text || "";
+  status.classList.toggle("is-error", error);
+}
+
+function renderMcpServers(registry = mcpServerRegistry) {
+  const list = document.querySelector('[data-role="mcp-server-list"]');
+  const select = document.querySelector('[data-role="mcp-call-server"]');
+  const servers = Array.isArray(registry?.servers) ? registry.servers : [];
+  if (list) {
+    list.replaceChildren();
+    if (!servers.length) {
+      const empty = document.createElement("div");
+      empty.className = "tool-catalog-empty";
+      empty.textContent = "未配置 MCP server。请先在 MCP 配置文件中添加本地 server。";
+      list.append(empty);
+    } else {
+      servers.forEach((server) => {
+        const card = document.createElement("article");
+        card.className = `tool-mcp-server${server.connected ? " is-connected" : ""}${server.enabled === false ? " is-disabled" : ""}`;
+        const copy = document.createElement("div");
+        copy.className = "tool-mcp-server-copy";
+        const name = document.createElement("strong");
+        name.textContent = server.name || server.id || "MCP server";
+        const meta = document.createElement("small");
+        meta.textContent = [
+          server.id,
+          server.transport || "stdio",
+          server.connected ? `已连接 · ${server.tool_count || 0} tools` : "未连接",
+        ].filter(Boolean).join(" · ");
+        const command = document.createElement("code");
+        command.textContent = server.command || "未配置命令";
+        command.title = server.command || "";
+        copy.append(name, meta, command);
+
+        const action = document.createElement("button");
+        action.type = "button";
+        action.className = `mini-button${server.connected ? "" : " is-primary-control"}`;
+        action.dataset.mcpAction = server.connected ? "disconnect" : "connect";
+        action.dataset.serverId = server.id || "";
+        action.textContent = server.connected ? "断开" : "连接";
+        action.disabled = !server.id || server.enabled === false;
+        action.title = server.enabled === false ? "该 server 在配置中已禁用。" : "";
+        card.append(copy, action);
+        list.append(card);
+      });
+    }
+  }
+  if (select) {
+    const previous = select.value;
+    select.replaceChildren();
+    const emptyOption = document.createElement("option");
+    emptyOption.value = "";
+    emptyOption.textContent = servers.some((server) => server.connected) ? "选择已连接 server" : "无已连接 server";
+    select.append(emptyOption);
+    servers.filter((server) => server.connected).forEach((server) => {
+      const option = document.createElement("option");
+      option.value = server.id;
+      option.textContent = `${server.name || server.id} · ${server.tool_count || 0} tools`;
+      select.append(option);
+    });
+    if ([...select.options].some((option) => option.value === previous)) {
+      select.value = previous;
+    }
+  }
+}
+
+async function refreshMcpServers({ silent = true } = {}) {
+  const button = actionButtons.get("mcp-servers-refresh");
+  if (!silent) {
+    setBusy(button, true, "刷新中");
+    setMcpServerStatus("正在读取 MCP server 状态…");
+  }
+  try {
+    const response = await requestJson("/api/mcp/servers");
+    mcpServerRegistry = {
+      servers: Array.isArray(response?.servers) ? response.servers : [],
+      config_path: response?.config_path || "",
+    };
+    renderMcpServers(mcpServerRegistry);
+    const connected = mcpServerRegistry.servers.filter((server) => server.connected).length;
+    setMcpServerStatus(
+      `${mcpServerRegistry.servers.length} 个 server · ${connected} 个已连接${mcpServerRegistry.config_path ? ` · ${mcpServerRegistry.config_path}` : ""}`,
+    );
+    return mcpServerRegistry;
+  } catch (error) {
+    setMcpServerStatus(`MCP 状态加载失败：${error.message}`, { error: true });
+    if (!silent) {
+      setMcpOutput(`MCP 状态加载失败：${error.message}`, { error: true });
+    }
+    return null;
+  } finally {
+    if (!silent) {
+      setBusy(button, false);
+    }
+  }
+}
+
+async function onMcpServerListClick(event) {
+  const button = event.target.closest("[data-mcp-action][data-server-id]");
+  if (!button) {
+    return;
+  }
+  const serverId = button.dataset.serverId;
+  const action = button.dataset.mcpAction;
+  if (!serverId || !["connect", "disconnect"].includes(action)) {
+    return;
+  }
+  if (action === "connect" && !window.confirm(
+    `确认连接 MCP server “${serverId}”？\n\n连接可能启动配置中的本地进程；此操作不会自动调用任何工具。`,
+  )) {
+    return;
+  }
+  setBusy(button, true, action === "connect" ? "连接中" : "断开中");
+  setMcpOutput(`${action === "connect" ? "正在连接" : "正在断开"} ${serverId}…`);
+  try {
+    const response = await requestJson(
+      `/api/mcp/servers/${encodeURIComponent(serverId)}/${action}`,
+      { method: "POST" },
+    );
+    setMcpOutput(response);
+    await refreshMcpServers({ silent: true });
+  } catch (error) {
+    setMcpOutput(`${action === "connect" ? "连接" : "断开"}失败：${error.message}`, { error: true });
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function runMcpCall(event) {
+  const button = event?.currentTarget || actionButtons.get("mcp-call");
+  const serverId = document.querySelector('[data-role="mcp-call-server"]')?.value?.trim() || "";
+  const tool = document.querySelector('[data-role="mcp-call-tool"]')?.value?.trim() || "";
+  const rawArguments = document.querySelector('[data-role="mcp-call-arguments"]')?.value?.trim() || "{}";
+  if (!serverId || !tool) {
+    setMcpOutput("请选择已连接的 server，并填写工具名。", { error: true });
+    return;
+  }
+  let argumentsValue;
+  try {
+    argumentsValue = JSON.parse(rawArguments);
+  } catch (error) {
+    setMcpOutput(`Arguments JSON 无效：${error.message}`, { error: true });
+    return;
+  }
+  const confirmation = [
+    "确认执行原始 MCP 工具调用？",
+    `server: ${serverId}`,
+    `tool: ${tool}`,
+    `arguments:\n${JSON.stringify(argumentsValue, null, 2)}`,
+  ].join("\n\n");
+  if (!window.confirm(confirmation)) {
+    setMcpOutput("已取消 MCP 工具调用。");
+    return;
+  }
+  setBusy(button, true, "调用中");
+  setMcpOutput(`正在调用 ${serverId}/${tool}…`);
+  try {
+    const response = await requestJson("/api/mcp/call", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ server_id: serverId, tool, arguments: argumentsValue }),
+    });
+    setMcpOutput(response);
+  } catch (error) {
+    setMcpOutput(`MCP 调用失败：${error.message}`, { error: true });
+  } finally {
+    setBusy(button, false);
+  }
 }
 
 function renderToolInventoryCatalogStatus(catalog) {
@@ -9390,7 +9803,10 @@ function renderToolInventoryCatalogStatus(catalog) {
   }
   const available = items.some((item) => {
     const identity = `${item?.id || ""} ${item?.name || ""} ${item?.display_name || ""}`.toLowerCase();
-    return identity.includes("compute-use") || identity.includes("computer-use");
+    return identity.includes("compute-use")
+      || identity.includes("computer-use")
+      || identity.includes("computer_use")
+      || identity.includes("computer.");
   });
   const status = computeRow.querySelector(".tool-inventory-status");
   const button = computeRow.querySelector('[data-action="tool-inventory-manage"]');
@@ -9523,6 +9939,70 @@ async function runSafeClickTest() {
     addMessage({
       author: "真实输入测试",
       text: `执行失败：${error.message}`,
+      kind: "thought",
+      icon: "error-log",
+    });
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function runSafeIsolatedInputTest(kind, button) {
+  const specs = {
+    "context-menu": {
+      endpoint: "/api/computer-use/safe-context-menu",
+      busy: "右键中",
+      label: "隔离右键菜单",
+    },
+    "drag-select": {
+      endpoint: "/api/computer-use/safe-drag-select",
+      busy: "拖拽中",
+      label: "隔离拖拽选择",
+    },
+  };
+  const spec = specs[kind];
+  if (!spec) {
+    return;
+  }
+  setBusy(button, true, spec.busy);
+  const evidenceStatus = document.querySelector('[data-role="vision-window-evidence-status"]');
+  if (evidenceStatus) {
+    evidenceStatus.textContent = `${spec.label}执行中`;
+  }
+  try {
+    const result = await requestJson(spec.endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        execute: true,
+        layout: "random",
+        startup_delay_ms: 300,
+        startup_timeout_ms: 4000,
+        marker_timeout_ms: 6000,
+      }),
+    });
+    const hit = result?.marker?.hit === true;
+    const coordinates = kind === "context-menu"
+      ? `菜单点 (${result?.menu_point?.x ?? "-"}, ${result?.menu_point?.y ?? "-"})，选项点 (${result?.menu_item_point?.x ?? "-"}, ${result?.menu_item_point?.y ?? "-"})`
+      : `起点 (${result?.start?.x ?? "-"}, ${result?.start?.y ?? "-"})，终点 (${result?.end?.x ?? "-"}, ${result?.end?.y ?? "-"})`;
+    const failure = result?.input_error ? `；输入错误：${result.input_error}` : "";
+    const summary = `${spec.label}${hit ? "命中" : "未命中"}，目标数字 ${result?.target_number ?? "-"}，${coordinates}${failure}。`;
+    if (evidenceStatus) {
+      evidenceStatus.textContent = `${spec.label} · ${hit ? "命中" : result?.status || "未命中"}`;
+    }
+    addMessage({
+      author: "真实输入测试",
+      text: summary,
+      kind: hit ? "bot" : "thought",
+      icon: hit ? "success" : "fail",
+    });
+  } catch (error) {
+    if (evidenceStatus) {
+      evidenceStatus.textContent = `${spec.label}失败`;
+    }
+    addMessage({
+      author: "真实输入测试",
+      text: `${spec.label}执行失败：${error.message}`,
       kind: "thought",
       icon: "error-log",
     });
@@ -9810,6 +10290,38 @@ function isSpeakableAssistantReplyForTts(message) {
   return message.role === "assistant" || kind === "";
 }
 
+async function waitForRealtimeStreamingTtsOutcome(messageId) {
+  await realtimeTurn.ttsTail.catch(() => {});
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    if (realtimeTtsChunkPlaying || realtimeTtsChunkQueue.length > 0) {
+      await Promise.race([
+        realtimeTtsDrainPromise.catch(() => {}),
+        new Promise((resolve) => window.setTimeout(resolve, 1500)),
+      ]);
+      continue;
+    }
+    if (realtimeTurn.streamingFailedMessageIds.has(messageId)) return "failed";
+    if (realtimeTurn.streamingCancelledMessageIds.has(messageId)) return "cancelled";
+    const expectedSegments = realtimeTurn.streamingExpectedSegments.get(messageId) || 0;
+    const playedSegments = realtimeTurn.streamingPlayedSegments.get(messageId)?.size || 0;
+    if (
+      expectedSegments > 0
+      && playedSegments >= expectedSegments
+      && realtimeTurn.streamedMessageIds.has(messageId)
+    ) {
+      return "played";
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
+  const expectedSegments = realtimeTurn.streamingExpectedSegments.get(messageId) || 0;
+  const playedSegments = realtimeTurn.streamingPlayedSegments.get(messageId)?.size || 0;
+  return expectedSegments > 0
+    && playedSegments >= expectedSegments
+    && realtimeTurn.streamedMessageIds.has(messageId)
+    ? "played"
+    : "failed";
+}
+
 async function maybeAutoSpeakRealtimeReply(message) {
   // 门控：实时语音模式 或 语音输入触发的本轮回复，都自动朗读。
   const wantAuto = audioRealtimeAutoTtsEnabled || voiceInputAwaitingTts;
@@ -9820,13 +10332,22 @@ async function maybeAutoSpeakRealtimeReply(message) {
     return;
   }
   const messageId = message.id || `${message.author || "assistant"}:${message.created_at || ""}:${message.content || ""}`;
-  if (realtimeFullStreamOperational() && realtimeTurn.streamedMessageIds.has(messageId)) {
-    audioRealtimeSpokenMessageIds.add(messageId);
-    voiceInputAwaitingTts = false;
-    audioRealtimeAwaitingReplyTts = false;
-    audioRealtimeResumeAfterTts = false;
-    audioRealtimeAutoTtsEnabled = realtimeSessionRunning || audioRealtimeRunning;
-    return;
+  if (realtimeTurn.streamingAttemptedMessageIds.has(messageId)) {
+    const streamingOutcome = await waitForRealtimeStreamingTtsOutcome(messageId);
+    if (streamingOutcome === "played") {
+      audioRealtimeSpokenMessageIds.add(messageId);
+      voiceInputAwaitingTts = false;
+      audioRealtimeAwaitingReplyTts = false;
+      audioRealtimeResumeAfterTts = false;
+      audioRealtimeAutoTtsEnabled = realtimeSessionRunning || audioRealtimeRunning;
+      return;
+    }
+    if (streamingOutcome === "cancelled") {
+      voiceInputAwaitingTts = false;
+      audioRealtimeAwaitingReplyTts = false;
+      audioRealtimeResumeAfterTts = false;
+      return;
+    }
   }
   if (audioRealtimeSpokenMessageIds.has(messageId)) {
     return;
@@ -9835,7 +10356,6 @@ async function maybeAutoSpeakRealtimeReply(message) {
   if (!text) {
     return;
   }
-  audioRealtimeSpokenMessageIds.add(messageId);
   const wasVoiceInput = voiceInputAwaitingTts;
   voiceInputAwaitingTts = false; // 本轮回复已认领朗读，避免后续消息重复
   try {
@@ -9843,8 +10363,10 @@ async function maybeAutoSpeakRealtimeReply(message) {
       source: wasVoiceInput ? "voice-input-auto" : "realtime-auto",
       voice: selectedTtsVoice,
       segmented: true,
-      preferStreaming: realtimeStreamingTtsEnabled(),
+      // 增量流式播放失败时必须回落到可确认播放完成的普通 TTS。
+      preferStreaming: false,
     });
+    audioRealtimeSpokenMessageIds.add(messageId);
   } catch (error) {
     showSttStatus("实时朗读失败: " + error.message);
   } finally {
@@ -10159,11 +10681,23 @@ function renderTaskList(tasks) {
   const list = document.querySelector('[data-role="task-list"]');
   taskRuntimeItems = normalizeRuntimeTaskItems(tasks);
   syncTaskCardFromGoals(taskGoals, mergedRuntimeTaskItems());
+  const count = document.querySelector('[data-role="task-runtime-count"]');
+  if (count) {
+    count.textContent = `${taskRuntimeItems.length} 项`;
+  }
   if (!list) {
     return;
   }
   list.replaceChildren();
-  tasks.filter((task) => task.visible_in_chat).forEach((task) => {
+  const visibleTasks = (Array.isArray(tasks) ? tasks : []).filter((task) => task.visible_in_chat);
+  if (!visibleTasks.length) {
+    const empty = document.createElement("li");
+    empty.className = "task-window-empty";
+    empty.textContent = "暂无运行任务。";
+    list.append(empty);
+    return;
+  }
+  visibleTasks.forEach((task) => {
     const item = document.createElement("li");
     item.innerHTML = `<strong></strong><span></span><small></small>`;
     item.querySelector("strong").textContent = task.executor_agent;
@@ -10505,13 +11039,15 @@ function renderToolsCatalog(catalog) {
   controls.append(search);
   host.append(controls);
 
-  // CLI / MCP / Skill 三个紧凑下拉，各带「详情」按钮。
+  // CLI / MCP / Skill 三个紧凑下拉；下拉下方渲染当前项的真实动作，避免 inspect/dry-run 成为死代码。
   const query = toolCatalogSearch.trim().toLowerCase();
   let matchedTotal = 0;
   TOOL_GROUP_DEFS.forEach((def) => {
     const items = toolGroupItems(catalog, def, query);
     matchedTotal += items.length;
 
+    const group = document.createElement("section");
+    group.className = "tool-group";
     const row = document.createElement("div");
     row.className = "tool-group-row";
 
@@ -10552,8 +11088,18 @@ function renderToolsCatalog(catalog) {
       }
     });
 
+    const selectedHost = document.createElement("div");
+    selectedHost.className = "tool-group-selected";
+    const renderSelectedItem = () => {
+      const selected = items.find((item) => item.id === select.value);
+      selectedHost.replaceChildren(...(selected ? [renderToolItem(selected)] : []));
+      selectedHost.hidden = !selected;
+    };
+    select.addEventListener("change", renderSelectedItem);
     row.append(label, select, detailBtn);
-    host.append(row);
+    group.append(row, selectedHost);
+    host.append(group);
+    renderSelectedItem();
   });
 
   if (matchedTotal === 0 && query) {
@@ -10652,18 +11198,17 @@ function renderToolDetail(item, source = "catalog") {
     box.append(noteList);
   }
 
-  // P1: context 成本估算 + 安装（对 plugins/skills 可安装项，参考 Claude Code 的 Will install + scope）。
+  // Context 成本估算 + 本地源加载状态。远程 marketplace 下载尚未实现，不在这里承诺安装。
   const costLine = document.createElement("div");
   costLine.className = "tool-detail-cost";
   costLine.textContent = `Context 成本估算: ~${estimateContextCost(item)} tokens`;
   box.append(costLine);
 
-  const installable =
-    item.category_id === "plugins" ||
-    item.category_id === "skills" ||
-    /plugin|skill/i.test(item.category_name || "");
-  if (installable) {
-    box.append(renderToolInstallBox(item));
+  const isLocalLoadable =
+    ["local-plugin", "local-skill"].includes(String(item.source || "").toLowerCase())
+    && !["invalid", "candidate"].includes(String(item.status || "").toLowerCase());
+  if (isLocalLoadable) {
+    box.append(renderToolLoadStatusBox(item));
   }
 
   return box;
@@ -10677,77 +11222,46 @@ function estimateContextCost(item) {
   return Math.max(50, Math.round((summaryLen + schemaLen) / 4) + childCount * 40);
 }
 
-function renderToolInstallBox(item) {
-  const installBox = document.createElement("div");
-  installBox.className = "tool-install-box";
+function renderToolLoadStatusBox(item) {
+  const statusBox = document.createElement("div");
+  statusBox.className = "tool-install-box";
 
-  const willInstall = document.createElement("div");
-  willInstall.className = "tool-will-install";
+  const localStatus = document.createElement("div");
+  localStatus.className = "tool-will-install";
   const childCount = (item.children || []).length;
-  const permCount = (item.permissions || []).length;
-  willInstall.textContent = childCount
-    ? `Will install: ${childCount} 个工具/技能 · 权限 ${permCount} 项`
-    : `Will install: 权限 ${permCount} 项`;
-  installBox.append(willInstall);
+  localStatus.textContent = childCount
+    ? `本地源已发现：${childCount} 个子工具。此操作只确认加载状态，不下载或远程安装。`
+    : "本地源已发现。此操作只确认加载状态，不下载或远程安装。";
+  statusBox.append(localStatus);
 
-  const scopeRow = document.createElement("div");
-  scopeRow.className = "tool-scope-row";
-  const scopeLabel = document.createElement("span");
-  scopeLabel.textContent = "安装范围:";
-  scopeRow.append(scopeLabel);
-  const scopeChips = document.createElement("div");
-  scopeChips.className = "tool-scope-chips";
-  [
-    { id: "user", label: "用户" },
-    { id: "project", label: "项目" },
-    { id: "local", label: "本仓" },
-  ].forEach((scope, index) => {
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = `tool-scope-chip${index === 0 ? " is-active" : ""}`;
-    chip.dataset.scope = scope.id;
-    chip.textContent = scope.label;
-    chip.addEventListener("click", () => {
-      scopeChips
-        .querySelectorAll(".tool-scope-chip")
-        .forEach((node) => node.classList.remove("is-active"));
-      chip.classList.add("is-active");
-    });
-    scopeChips.append(chip);
-  });
-  scopeRow.append(scopeChips);
-  installBox.append(scopeRow);
-
-  const installBtn = document.createElement("button");
-  installBtn.type = "button";
-  installBtn.className = "mini-button tool-install-btn";
-  installBtn.textContent = "安装";
-  installBtn.addEventListener("click", () => installCatalogItem(item, installBox, installBtn));
-  installBox.append(installBtn);
-  return installBox;
+  const confirmButton = document.createElement("button");
+  confirmButton.type = "button";
+  confirmButton.className = "mini-button tool-install-btn";
+  confirmButton.textContent = "确认已加载";
+  confirmButton.addEventListener("click", () => confirmCatalogItemLoaded(item, statusBox, confirmButton));
+  statusBox.append(confirmButton);
+  return statusBox;
 }
 
-async function installCatalogItem(item, installBox, button) {
-  const scope =
-    installBox.querySelector(".tool-scope-chip.is-active")?.dataset.scope || "user";
-  setBusy(button, true, "安装中");
+async function confirmCatalogItemLoaded(item, statusBox, button) {
+  setBusy(button, true, "查询中");
   try {
     const response = await fetch("/api/plugins/install", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id: item.id, category_id: item.category_id || "", scope }),
+      body: JSON.stringify({ id: item.id, category_id: item.category_id || "", scope: "local" }),
     });
     const data = await response.json().catch(() => ({}));
-    installBox.querySelectorAll(".tool-install-result").forEach((node) => node.remove());
+    statusBox.querySelectorAll(".tool-install-result").forEach((node) => node.remove());
     const note = document.createElement("div");
     note.className = response.ok ? "tool-install-result" : "tool-install-result is-error";
-    note.textContent = data.message || (response.ok ? "已处理" : `失败：HTTP ${response.status}`);
-    installBox.append(note);
+    note.textContent = data.message || (response.ok ? "本地加载状态已确认。" : `查询失败：HTTP ${response.status}`);
+    statusBox.append(note);
   } catch (error) {
     const note = document.createElement("div");
     note.className = "tool-install-result is-error";
-    note.textContent = `安装失败：${error && error.message ? error.message : error}`;
-    installBox.append(note);
+    note.textContent = `加载状态查询失败：${error && error.message ? error.message : error}`;
+    statusBox.append(note);
   } finally {
     setBusy(button, false);
   }
@@ -11662,6 +12176,47 @@ function initIdeOmniSearch() {
       event.preventDefault();
       ideCtrlClickJump(word);
     });
+  }
+}
+
+async function buildProjectSymbolIndex(event) {
+  const button = event?.currentTarget || actionButtons.get("project-symbol-index");
+  const status = document.querySelector('[data-role="project-symbol-index-status"]');
+  setBusy(button, true, "索引中");
+  if (status) {
+    status.textContent = "正在增量构建符号索引…";
+    status.classList.remove("is-error");
+  }
+  try {
+    const response = await requestJson("/api/project/symbol-index", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ full: false }),
+    });
+    const summary = `增量索引完成：${response.file_count ?? 0} 个文件 · ${response.symbol_count ?? 0} 个符号 · ${response.elapsed_ms ?? 0}ms`;
+    if (status) {
+      status.textContent = summary;
+    }
+    const activeTab = ideState.tabs.find((tab) => tab.id === ideState.activeTabId);
+    const outlinePath = activeTab?.kind === "view" ? activeTab.path : selectedProjectPath;
+    await refreshIdeOutline(outlinePath || "");
+    const currentQuery = ideOmniState.input?.value?.trim() || "";
+    if (currentQuery) {
+      await runIdeOmniQuery(currentQuery);
+    }
+  } catch (error) {
+    if (status) {
+      status.textContent = `符号索引失败：${error.message}`;
+      status.classList.add("is-error");
+    }
+    addMessage({
+      author: "工程索引",
+      text: `增量索引失败：${error.message}`,
+      kind: "thought",
+      icon: "error-log",
+    });
+  } finally {
+    setBusy(button, false);
   }
 }
 
@@ -12902,6 +13457,11 @@ function initializeWorkbenchWindows() {
     if (folded) {
       loadOfficeScene({ silent: true });
     }
+    if (activeWindow === "memory") {
+      void memoryWindowRefresh().catch((error) => {
+        console.warn("memory window refresh failed", error);
+      });
+    }
     requestBridgeVisualEffectsResize();
   };
 
@@ -13685,7 +14245,15 @@ function attachmentLink(attachment, label) {
 
 async function refreshRealtimeSessionStatus() {
   try {
-    const status = await requestJson("/api/realtime/session/status");
+    const backendStatus = await requestJson("/api/realtime/session/status");
+    const status = backendStatus.running && realtimeVoiceCaptureDegradation
+      ? {
+        ...backendStatus,
+        active_mode: "half_duplex_guarded",
+        active_stt_transport: "segmented_mediarecorder",
+        mode_downgrade_reason: realtimeVoiceCaptureDegradation,
+      }
+      : backendStatus;
     realtimeSessionStatus = status;
     realtimeSessionRunning = Boolean(status.running);
     renderRealtimeSessionStatus(status);
@@ -13713,6 +14281,7 @@ async function realtimeSessionStart() {
   const button = actionButtons.get("realtime-session-start");
   setBusy(button, true, "启动中");
   audioRealtimeResumeAfterTts = false;
+  realtimeVoiceCaptureDegradation = null;
   try {
     const status = await requestJson("/api/realtime/session/start", {
       method: "POST",
@@ -13730,12 +14299,7 @@ async function realtimeSessionStart() {
     realtimeSessionRunning = true;
     renderRealtimeSessionStatus(status);
     syncRealtimeSessionTask(status);
-
-    try {
-      await audioRealtimeStart({ backendStarted: true, status });
-    } catch (error) {
-      console.warn("实时语音启动失败:", error);
-    }
+    await audioRealtimeStart({ backendStarted: true, status });
     await refreshRealtimeSessionStatus();
     await refreshAudioStatus();
   } catch (error) {
@@ -13756,14 +14320,12 @@ async function realtimeSessionStop() {
   audioRealtimeAwaitingReplyTts = false;
   stopActiveTtsPlayback("realtime-session-stop");
   try {
-    if (sttRecorder && sttRecorder.state !== "inactive") {
-      await sttStopDictation();
-    }
+    await stopRealtimeVoiceCapture();
     stopAudioRealtimePartialRecognition();
+    await discardSttCaptureResources();
+    await releaseRealtimeAudioOutputResources();
     const status = await requestJson("/api/realtime/session/stop", { method: "POST" });
     realtimeSessionStatus = status;
-    realtimeSessionRunning = false;
-    audioRealtimeRunning = false;
     renderRealtimeSessionStatus(status);
     syncRealtimeSessionTask(status);
     await refreshAudioStatus();
@@ -13773,8 +14335,14 @@ async function realtimeSessionStop() {
       node.textContent = `实时交互停止失败: ${error.message}`;
     }
   } finally {
+    realtimeSessionRunning = false;
+    audioRealtimeRunning = false;
+    realtimeVoiceCaptureDegradation = null;
+    audioRealtimeAutoTtsEnabled = false;
+    isDictating = false;
     setBusy(button, false);
     setRealtimeSessionButtons(false);
+    setAudioRealtimeButtons(false);
   }
 }
 
@@ -13923,12 +14491,19 @@ function renderRealtimeSessionStatus(status = {}) {
   }, null, 2);
 }
 
-function buildRealtimeAudioConstraints({ realtime = false } = {}) {
+function buildRealtimeAudioConstraints({
+  realtime = false,
+  deviceId = selectedAudioInputDeviceId,
+} = {}) {
+  const deviceConstraint = deviceId && deviceId !== "default"
+    ? { deviceId: { exact: deviceId } }
+    : {};
   if (!realtime) {
-    return true;
+    return Object.keys(deviceConstraint).length ? deviceConstraint : true;
   }
   const policy = realtimeSessionStatus?.barge_in_policy || {};
   return {
+    ...deviceConstraint,
     echoCancellation: policy.browser_echo_cancellation !== false,
     noiseSuppression: policy.noise_suppression !== false,
     autoGainControl: policy.auto_gain_control !== false,
@@ -13964,8 +14539,10 @@ let audioRealtimeRunning = false;
 let audioRealtimeAutoTtsEnabled = false;
 // 语音输入选中的朗读音色（持久化）；voiceInputAwaitingTts 标记"本轮回复需自动朗读"（语音输入触发）。
 let selectedTtsVoice = (() => { try { return localStorage.getItem("ttsVoice") || ""; } catch { return ""; } })();
+let selectedAudioInputDeviceId = (() => { try { return localStorage.getItem("audioInputDeviceId") || "default"; } catch { return "default"; } })();
 let selectedAudioOutputDeviceId = (() => { try { return localStorage.getItem("audioOutputDeviceId") || "default"; } catch { return "default"; } })();
 let stopAudioOutputDeviceWatcher = null;
+let stopAudioDeviceListWatcher = null;
 let voiceInputAwaitingTts = false;
 let audioRealtimeAwaitingReplyTts = false;
 let audioRealtimeResumeAfterTts = false;
@@ -13974,6 +14551,8 @@ let activeTtsPlaybackId = 0;
 let realtimeTtsChunkQueue = [];
 let realtimeTtsChunkPlaying = false;
 let realtimeTtsChunkPlaybackId = 0;
+let realtimeTtsActiveChunk = null;
+let realtimeTtsDrainPromise = Promise.resolve();
 let audioRealtimeLastSegmentReportAt = 0;
 let audioRealtimeRecognition = null;
 let audioRealtimePartialSpeechStartedAt = 0;
@@ -13991,6 +14570,12 @@ function createRealtimeTurnController() {
     nextSegmentIndex: 1,
     ttsTail: Promise.resolve(),
     streamedMessageIds: new Set(),
+    streamingAttemptedMessageIds: new Set(),
+    streamingFailedMessageIds: new Set(),
+    streamingCancelledMessageIds: new Set(),
+    streamingExpectedSegments: new Map(),
+    streamingPlayedSegments: new Map(),
+    diagnosticsSuppressed: false,
     finalTranscriptKeys: new Set(),
   };
 }
@@ -14007,13 +14592,26 @@ function realtimeFullStreamRequested() {
     && String(realtimeSessionStatus?.requested_mode || "") === "full_streaming";
 }
 
+function realtimeProviderNativePcmEligible(status = {}) {
+  const risk = status.streaming_risk || {};
+  const sttTransport = String(risk.stt_transport || status.active_stt_transport || "");
+  const sttGate = Array.isArray(risk.readiness_gates)
+    ? risk.readiness_gates.find((gate) => gate?.id === "provider_native_partial_asr")
+    : null;
+  return Boolean(status.running ?? true)
+    && (
+      String(status.active_mode || "") === "full_streaming"
+      || (
+        sttTransport === "provider_native_streaming_asr"
+        && sttGate?.ready === true
+      )
+    );
+}
+
 function realtimeFullStreamOperational() {
-  if (realtimeFullStreamActive()) return true;
-  if (!realtimeFullStreamRequested()) return false;
-  return Boolean(
-    realtimeSessionStatus?.provider_native_stream_ready
-    || audioRealtimeCaptureSession?.mode === "audio_worklet_pcm",
-  );
+  if (!realtimeSessionRunning) return false;
+  return realtimeFullStreamActive()
+    || realtimeSessionStatus?.streaming_risk?.full_streaming_ready === true;
 }
 
 async function stopRealtimeVoiceCapture() {
@@ -14029,21 +14627,81 @@ async function stopRealtimeVoiceCapture() {
   }
 }
 
+async function discardSttCaptureResources() {
+  const tailCapture = sttTailCapture;
+  sttTailCapture = null;
+  if (tailCapture) {
+    await tailCapture.stop().catch(() => {});
+  }
+  const recorder = sttRecorder;
+  sttRecorder = null;
+  if (recorder) {
+    recorder.ondataavailable = null;
+    recorder.onstop = null;
+    if (recorder.state !== "inactive") {
+      await new Promise((resolve) => {
+        const timeout = window.setTimeout(resolve, 1000);
+        recorder.addEventListener("stop", () => {
+          window.clearTimeout(timeout);
+          resolve();
+        }, { once: true });
+        try {
+          recorder.stop();
+        } catch {
+          window.clearTimeout(timeout);
+          resolve();
+        }
+      });
+    }
+    recorder.stream?.getTracks?.().forEach((track) => track.stop());
+  }
+  sttChunks = [];
+  sttSessionId = null;
+  isDictating = false;
+  renderSttDictationButton("语音输入");
+}
+
+function releaseVoiceResourcesOnUnload() {
+  stopAudioRealtimePartialRecognition();
+  stopActiveTtsPlayback("page-unload");
+  const capture = audioRealtimeCaptureSession;
+  audioRealtimeCaptureSession = null;
+  void capture?.stop?.();
+  const recorder = sttRecorder;
+  sttRecorder = null;
+  if (recorder) {
+    recorder.ondataavailable = null;
+    recorder.onstop = null;
+    try { recorder.stop(); } catch (_) {}
+    recorder.stream?.getTracks?.().forEach((track) => track.stop());
+  }
+  const tailCapture = sttTailCapture;
+  sttTailCapture = null;
+  void tailCapture?.stop?.();
+  stopAudioDeviceListWatcher?.();
+  stopAudioDeviceListWatcher = null;
+  void releaseRealtimeAudioOutputResources();
+}
+
 function handleRealtimeVoiceStreamEvent(event = {}) {
   const type = String(event.type || "");
   if (type === "partial" || type === "final") {
     audioRealtimeBargeInDetector?.transcriptObserved?.();
     const text = String(event.text || "").trim();
     if (!text) return;
-    reportAudioRealtimePartial({
-      text,
-      confidence: event.confidence,
-      isFinal: type === "final",
-      speechMs: event.speech_ms,
-      ttsPlaying: activeTtsPlaybackIsRunning(),
-      provider: event.provider || "provider_native_streaming_asr",
-      language: event.language || navigator.language || "zh-CN",
-    });
+    // Provider WebSocket 已由后端记录 partial/final；这里仅同步前端状态，避免再次
+    // POST /partial 导致同一条 transcript 被计数和调度两次。
+    realtimeSessionStatus = {
+      ...(realtimeSessionStatus || {}),
+      last_partial_text: text,
+      last_partial_confidence: event.confidence ?? null,
+      last_partial_is_final: type === "final",
+      partial_asr_provider: event.provider || "provider_native_streaming_asr",
+      provider_native_stream_ready: true,
+      updated_at_ms: Date.now(),
+    };
+    renderRealtimeSessionStatus(realtimeSessionStatus);
+    syncRealtimeSessionTask(realtimeSessionStatus);
     if (type === "final") {
       void submitRealtimeFinalTranscript(text, {
         provider: event.provider || "provider_native_streaming_asr",
@@ -14090,7 +14748,7 @@ function realtimeFinalTranscriptKey(text, now = Date.now()) {
 
 async function submitRealtimeFinalTranscript(text, { provider = "unknown" } = {}) {
   const transcript = String(text || "").trim();
-  if (!transcript || !realtimeFullStreamOperational()) return false;
+  if (!transcript || !realtimeSessionRunning || !audioRealtimeRunning) return false;
   const key = realtimeFinalTranscriptKey(transcript);
   if (realtimeTurn.finalTranscriptKeys.has(key)) return false;
   if (realtimeTurn.finalTranscriptKeys.size >= 64) {
@@ -14122,6 +14780,9 @@ function invalidateRealtimeGeneration(reason = "cancelled") {
   realtimeTurn.messageId = null;
   realtimeTurn.nextSegmentIndex = 1;
   realtimeTurn.ttsTail = Promise.resolve();
+  // 不在这里清除播放结果：barge-in/new-turn 先记录 cancelled，旧 message_done
+  // 仍可能异步到达；保留取消标记可阻止旧回复回落到普通 TTS 后“复活”。
+  realtimeTurn.diagnosticsSuppressed = false;
   emitLocalRealtimeSessionEvent("full_stream_generation_invalidated", {
     turn_id: realtimeTurn.turnId,
     generation_id: realtimeTurn.generationId,
@@ -14129,8 +14790,29 @@ function invalidateRealtimeGeneration(reason = "cancelled") {
   });
 }
 
+function splitAssistantSpeechTextForTts(text) {
+  const source = String(text || "").replace(/\r\n/g, "\n");
+  const marker = /(?:^|\n)\s*(?:---\s*\n\s*)?(?:Remote\s+)?Context usage\s*:/i;
+  const match = marker.exec(source);
+  if (!match) {
+    return { text: source, diagnosticsStarted: false };
+  }
+  return {
+    text: source.slice(0, match.index).replace(/\n+\s*---\s*$/, ""),
+    diagnosticsStarted: true,
+  };
+}
+
 function takeRealtimeSpeechSegments(text, { flush = false } = {}) {
-  const source = String(text || "");
+  let source = String(text || "");
+  let heldDiagnosticsPrefix = "";
+  if (!flush) {
+    const possibleDiagnosticsPrefix = /(?:^|\n)\s*---\s*\n?$/.exec(source);
+    if (possibleDiagnosticsPrefix) {
+      heldDiagnosticsPrefix = source.slice(possibleDiagnosticsPrefix.index);
+      source = source.slice(0, possibleDiagnosticsPrefix.index);
+    }
+  }
   const segments = [];
   let cursor = 0;
   const boundary = /[。！？!?；;\n]/g;
@@ -14152,17 +14834,25 @@ function takeRealtimeSpeechSegments(text, { flush = false } = {}) {
     segments.push(rest.trim());
     rest = "";
   }
+  rest += heldDiagnosticsPrefix;
   return { segments, rest };
 }
 
 function queueRealtimeSpeechSegment(text, messageId) {
-  const segment = String(text || "").trim();
+  const segment = sanitizeAssistantMessageTextForTts(text);
   if (!segment || !realtimeTurn.turnId) return;
   const turnId = realtimeTurn.turnId;
   const generationId = realtimeTurn.generationId;
   const segmentIndex = realtimeTurn.nextSegmentIndex++;
   realtimeTurn.committedText += segment;
-  if (messageId) realtimeTurn.streamedMessageIds.add(messageId);
+  if (messageId) {
+    realtimeTurn.streamingAttemptedMessageIds.add(messageId);
+    realtimeTurn.streamingExpectedSegments.set(
+      messageId,
+      (realtimeTurn.streamingExpectedSegments.get(messageId) || 0) + 1,
+    );
+    realtimeTurn.streamedMessageIds.delete(messageId);
+  }
   realtimeTurn.ttsTail = realtimeTurn.ttsTail
     .then(async () => {
       if (generationId !== realtimeTurn.generationId || turnId !== realtimeTurn.turnId) return null;
@@ -14176,6 +14866,7 @@ function queueRealtimeSpeechSegment(text, messageId) {
     })
     .catch((error) => {
       if (generationId === realtimeTurn.generationId) {
+        if (messageId) realtimeTurn.streamingFailedMessageIds.add(messageId);
         showSttStatus("实时增量朗读失败: " + error.message);
       }
       return null;
@@ -14183,11 +14874,18 @@ function queueRealtimeSpeechSegment(text, messageId) {
 }
 
 function commitRealtimeAssistantDelta(data = {}) {
-  if (!realtimeFullStreamOperational() || !realtimeTurn.turnId) return false;
+  if (!realtimeFullStreamOperational() || !realtimeStreamingTtsEnabled() || !realtimeTurn.turnId) {
+    return false;
+  }
+  if (realtimeTurn.diagnosticsSuppressed) return false;
   const messageId = data.id || realtimeTurn.messageId;
   if (realtimeTurn.messageId && messageId && realtimeTurn.messageId !== messageId) return false;
   realtimeTurn.messageId = messageId || realtimeTurn.messageId;
-  realtimeTurn.pendingText += String(data.delta || "");
+  const cleaned = splitAssistantSpeechTextForTts(
+    realtimeTurn.pendingText + String(data.delta || ""),
+  );
+  realtimeTurn.pendingText = cleaned.text;
+  realtimeTurn.diagnosticsSuppressed = cleaned.diagnosticsStarted;
   const extracted = takeRealtimeSpeechSegments(realtimeTurn.pendingText);
   realtimeTurn.pendingText = extracted.rest;
   extracted.segments.forEach((segment) => queueRealtimeSpeechSegment(segment, messageId));
@@ -14195,7 +14893,9 @@ function commitRealtimeAssistantDelta(data = {}) {
 }
 
 function flushRealtimeAssistantSpeech(data = {}) {
-  if (!realtimeFullStreamOperational() || !realtimeTurn.turnId) return false;
+  if (!realtimeFullStreamOperational() || !realtimeStreamingTtsEnabled() || !realtimeTurn.turnId) {
+    return false;
+  }
   const messageId = data.id || realtimeTurn.messageId;
   const extracted = takeRealtimeSpeechSegments(realtimeTurn.pendingText, { flush: true });
   realtimeTurn.pendingText = extracted.rest;
@@ -14299,6 +14999,7 @@ function setAudioRealtimeButtons(running) {
 async function stopAudioRealtimeState({ keepAutoTtsPending = false } = {}) {
   await stopRealtimeVoiceCapture();
   stopAudioRealtimePartialRecognition();
+  await releaseRealtimeAudioOutputResources();
   const status = await requestJson("/api/audio/realtime/stop", { method: "POST" });
   audioRealtimeRunning = false;
   if (!keepAutoTtsPending) {
@@ -14309,6 +15010,60 @@ async function stopAudioRealtimeState({ keepAutoTtsPending = false } = {}) {
   setText("audio.realtime", "待启动");
   renderAudioRealtimeStatus(status);
   return status;
+}
+
+function handleRealtimeVoiceCaptureDegraded(details = {}) {
+  realtimeVoiceCaptureDegradation = details.message || details.code || details.reason
+    || "provider-native PCM 流不可用";
+  realtimeSessionStatus = {
+    ...(realtimeSessionStatus || {}),
+    active_mode: "half_duplex_guarded",
+    active_stt_transport: "segmented_mediarecorder",
+    mode_downgrade_reason: realtimeVoiceCaptureDegradation,
+    last_error: details.message || details.code || null,
+    updated_at_ms: Date.now(),
+  };
+  renderRealtimeSessionStatus(realtimeSessionStatus);
+  syncRealtimeSessionTask(realtimeSessionStatus);
+  startAudioRealtimePartialRecognition();
+  showSttStatus(
+    `实时 PCM 已熔断，已显式降级到 MediaRecorder: ${
+      details.message || details.code || details.reason || "重试上限"
+    }`,
+  );
+}
+
+async function rollbackRealtimeAudioStart({ backendStarted = false } = {}) {
+  stopAudioRealtimePartialRecognition();
+  await stopRealtimeVoiceCapture();
+  await discardSttCaptureResources();
+  await releaseRealtimeAudioOutputResources();
+  try {
+    const endpoint = backendStarted
+      ? "/api/realtime/session/stop"
+      : "/api/audio/realtime/stop";
+    const stoppedStatus = await requestJson(endpoint, { method: "POST" });
+    if (backendStarted) {
+      realtimeSessionStatus = stoppedStatus;
+      renderRealtimeSessionStatus(stoppedStatus);
+      syncRealtimeSessionTask(stoppedStatus);
+    } else {
+      renderAudioRealtimeStatus(stoppedStatus);
+    }
+  } catch (error) {
+    console.warn("实时语音启动回滚后端状态失败:", error);
+  } finally {
+    if (backendStarted) realtimeSessionRunning = false;
+    realtimeVoiceCaptureDegradation = null;
+    audioRealtimeRunning = false;
+    audioRealtimeAutoTtsEnabled = false;
+    audioRealtimeAwaitingReplyTts = false;
+    audioRealtimeResumeAfterTts = false;
+    isDictating = false;
+    setText("audio.realtime", "待启动");
+    setAudioRealtimeButtons(false);
+    setRealtimeSessionButtons(false);
+  }
 }
 
 async function audioRealtimeStart({ backendStarted = false, status = null } = {}) {
@@ -14324,24 +15079,37 @@ async function audioRealtimeStart({ backendStarted = false, status = null } = {}
       realtimeStatus = await requestJson("/api/audio/realtime/status");
     }
     audioRealtimeRunning = Boolean(realtimeStatus?.audio_realtime_running ?? realtimeStatus?.running ?? true);
+    if (!audioRealtimeRunning) {
+      throw new Error(realtimeStatus?.last_error || "后端实时语音会话未进入运行状态");
+    }
     audioRealtimeAutoTtsEnabled = Boolean(realtimeStatus?.auto_tts_reply);
     audioRealtimeAwaitingReplyTts = false;
     audioRealtimeResumeAfterTts = false;
     setText("audio.realtime", audioRealtimeRunning ? "运行中" : "待启动");
     renderAudioRealtimeStatus(realtimeStatus || {});
     setAudioRealtimeButtons(audioRealtimeRunning);
-    if (realtimeFullStreamRequested() && globalThis.CoolzhuRealtimeVoiceCapture?.createSession) {
+    if (
+      realtimeProviderNativePcmEligible(realtimeStatus || {})
+      && globalThis.CoolzhuRealtimeVoiceCapture?.createSession
+    ) {
       await stopRealtimeVoiceCapture();
       sttSessionId = realtimeStatus?.session_id || realtimeSessionStatus?.session_id || newRealtimeTurnId();
       audioRealtimeBargeInDetector = globalThis.CoolzhuRealtimeAudioOutput?.createBargeInDetector?.();
       audioRealtimeCaptureSession = await globalThis.CoolzhuRealtimeVoiceCapture.createSession({
         sessionId: sttSessionId,
+        deviceId: selectedAudioInputDeviceId,
         frameMs: 20,
         reconnectBufferMs: 8000,
+        maxReconnectAttempts: 5,
         requirePhysical: true,
         onEvent: handleRealtimeVoiceStreamEvent,
         onAudioLevel: handleRealtimeAudioLevel,
         onSegment: (blob, metadata) => reportAudioRealtimeSegment(blob, metadata),
+        onDegraded: handleRealtimeVoiceCaptureDegraded,
+        onFatal: (details) => {
+          showSttStatus(`实时麦克风传输已停止: ${details?.message || details?.code || "不可恢复错误"}`);
+          void rollbackRealtimeAudioStart({ backendStarted: realtimeSessionRunning });
+        },
         onStats: (captureStats) => {
           realtimeSessionStatus = {
             ...realtimeSessionStatus,
@@ -14356,27 +15124,45 @@ async function audioRealtimeStart({ backendStarted = false, status = null } = {}
         },
       });
       isDictating = true;
-      showSttStatus(audioRealtimeCaptureSession.mode === "audio_worklet_pcm"
-        ? `实时麦克风已连接: ${audioRealtimeCaptureSession.selectedDevice.label}`
-        : "AudioWorklet 不可用，已降级为 MediaRecorder");
-    } else {
-      await sttStartDictation({ realtime: true });
-      startAudioRealtimePartialRecognition();
-    }
-  } catch (error) {
-    if (audioRealtimeRunning && !backendStarted) {
-      try {
-        await stopAudioRealtimeState();
-      } catch (_) {
-        audioRealtimeRunning = false;
-        setText("audio.realtime", "待启动");
+      if (audioRealtimeCaptureSession.mode === "audio_worklet_pcm") {
+        showSttStatus(`实时麦克风已连接: ${audioRealtimeCaptureSession.selectedDevice.label}`);
+      } else {
+        handleRealtimeVoiceCaptureDegraded({
+          reason: "audio_worklet_unavailable",
+          message: "AudioWorklet 不可用",
+        });
       }
+    } else {
+      await sttStartDictation({ realtime: true, throwOnError: true });
+      startAudioRealtimePartialRecognition();
+      const reason = realtimeStatus?.mode_downgrade_reason
+        || realtimeStatus?.streaming_risk?.readiness_gates
+          ?.find((gate) => gate?.id === "provider_native_partial_asr" && !gate.ready)?.reason
+        || "后端未声明 provider-native PCM 已就绪";
+      if (realtimeSessionRunning) {
+        realtimeVoiceCaptureDegradation = reason;
+      }
+      realtimeSessionStatus = {
+        ...(realtimeSessionStatus || realtimeStatus || {}),
+        active_mode: realtimeSessionRunning ? "half_duplex_guarded" : realtimeStatus?.active_mode,
+        active_stt_transport: "segmented_mediarecorder",
+        mode_downgrade_reason: reason,
+      };
+      renderRealtimeSessionStatus(realtimeSessionStatus);
+      showSttStatus(`已使用受控半双工录音，未启用 PCM: ${reason}`);
     }
-    if (backendStarted) {
-      audioRealtimeRunning = false;
-    }
+    await refreshAudioDeviceSelectors();
+    return true;
+  } catch (error) {
+    await rollbackRealtimeAudioStart({ backendStarted });
     showSttStatus("实时语音启动失败: " + error.message);
     await refreshAudioStatus();
+    audioRealtimeRunning = false;
+    if (backendStarted) realtimeSessionRunning = false;
+    setText("audio.realtime", "待启动");
+    setAudioRealtimeButtons(false);
+    setRealtimeSessionButtons(false);
+    throw error;
   }
 }
 
@@ -14477,7 +15263,7 @@ function startAudioRealtimePartialRecognition() {
           language: recognition.lang,
         });
         if (result.isFinal) {
-          if (realtimeFullStreamActive()) {
+          if (realtimeSessionRunning && audioRealtimeRunning) {
             void submitRealtimeFinalTranscript(text, { provider: "browser_speech_recognition" });
           }
           audioRealtimePartialSpeechStartedAt = 0;
@@ -14597,6 +15383,98 @@ async function audioRealtimeStop() {
   }
 }
 
+function renderAudioDeviceOptions(select, devices, selectedDeviceId, emptyLabel) {
+  if (!select) return selectedDeviceId;
+  const available = Array.isArray(devices) ? devices.slice() : [];
+  if (!available.some((device) => device.deviceId === "default")) {
+    available.unshift({ deviceId: "default", label: emptyLabel });
+  }
+  select.replaceChildren();
+  for (const device of available) {
+    const option = document.createElement("option");
+    option.value = device.deviceId;
+    option.textContent = device.label || emptyLabel;
+    select.append(option);
+  }
+  const resolved = available.some((device) => device.deviceId === selectedDeviceId)
+    ? selectedDeviceId
+    : "default";
+  select.value = resolved;
+  select.disabled = available.length === 0;
+  return resolved;
+}
+
+async function refreshAudioDeviceSelectors() {
+  const inputSelect = document.querySelector('[data-role="audio-input-device"]');
+  const outputSelect = document.querySelector('[data-role="audio-output-device"]');
+  const [inputResult, outputResult] = await Promise.allSettled([
+    globalThis.CoolzhuRealtimeVoiceCapture?.listMicrophones?.() || [],
+    globalThis.CoolzhuRealtimeAudioOutput?.listPhysicalOutputs?.() || [],
+  ]);
+  const inputs = inputResult.status === "fulfilled" ? inputResult.value : [];
+  const outputs = outputResult.status === "fulfilled" ? outputResult.value : [];
+  const resolvedInput = renderAudioDeviceOptions(
+    inputSelect,
+    inputs,
+    selectedAudioInputDeviceId,
+    "系统默认麦克风",
+  );
+  const resolvedOutput = renderAudioDeviceOptions(
+    outputSelect,
+    outputs,
+    selectedAudioOutputDeviceId,
+    "系统默认扬声器",
+  );
+  if (resolvedInput !== selectedAudioInputDeviceId) {
+    selectedAudioInputDeviceId = resolvedInput;
+    try { localStorage.setItem("audioInputDeviceId", resolvedInput); } catch (_) {}
+  }
+  if (resolvedOutput !== selectedAudioOutputDeviceId) {
+    selectedAudioOutputDeviceId = resolvedOutput;
+    try { localStorage.setItem("audioOutputDeviceId", resolvedOutput); } catch (_) {}
+    showSttStatus("所选扬声器不可用，已回退到系统默认输出。");
+  }
+}
+
+function initAudioDeviceSelectors() {
+  const inputSelect = document.querySelector('[data-role="audio-input-device"]');
+  const outputSelect = document.querySelector('[data-role="audio-output-device"]');
+  inputSelect?.addEventListener("change", () => {
+    selectedAudioInputDeviceId = inputSelect.value || "default";
+    try { localStorage.setItem("audioInputDeviceId", selectedAudioInputDeviceId); } catch (_) {}
+    showSttStatus("麦克风选择已保存，将在下次开始语音时生效。");
+  });
+  outputSelect?.addEventListener("change", () => {
+    selectedAudioOutputDeviceId = outputSelect.value || "default";
+    try { localStorage.setItem("audioOutputDeviceId", selectedAudioOutputDeviceId); } catch (_) {}
+    stopAudioOutputDeviceWatcher?.();
+    stopAudioOutputDeviceWatcher = null;
+    ensureAudioOutputDeviceWatcher();
+    if (activeTtsAudio) {
+      void globalThis.CoolzhuRealtimeAudioOutput?.applyOutputSink?.(
+        activeTtsAudio,
+        selectedAudioOutputDeviceId,
+        { generationId: realtimeTurn.generationId, currentGeneration: () => realtimeTurn.generationId },
+      );
+    }
+    if (aecReferenceCtx) {
+      void globalThis.CoolzhuRealtimeAudioOutput?.applyContextSink?.(
+        aecReferenceCtx,
+        selectedAudioOutputDeviceId,
+        { generationId: realtimeTurn.generationId, currentGeneration: () => realtimeTurn.generationId },
+      );
+    }
+    showSttStatus("扬声器选择已保存并应用。");
+  });
+  if (!stopAudioDeviceListWatcher && navigator.mediaDevices?.addEventListener) {
+    const listener = () => void refreshAudioDeviceSelectors();
+    navigator.mediaDevices.addEventListener("devicechange", listener);
+    stopAudioDeviceListWatcher = () =>
+      navigator.mediaDevices.removeEventListener("devicechange", listener);
+  }
+  void refreshAudioDeviceSelectors();
+}
+
 async function initTtsVoiceSelector() {
   const select = document.querySelector('[data-role="tts-voice"]');
   if (!select) return;
@@ -14646,10 +15524,8 @@ function realtimeStreamingTtsEnabled() {
 }
 
 function sanitizeAssistantMessageTextForTts(text) {
-  return String(text || "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\n+\s*---\s*\n+Remote context usage:[\s\S]*$/i, "")
-    .replace(/(^|\n)Remote context usage:[\s\S]*$/i, "$1")
+  return splitAssistantSpeechTextForTts(text).text
+    .replace(/(^|\n)\s*---\s*(?=\n|$)/g, "$1")
     .trim();
 }
 
@@ -14744,7 +15620,10 @@ async function ttsSpeakText(text, { source = "manual", voice = undefined, segmen
     ? result.audio_urls
     : (result.audio_url ? [result.audio_url] : []);
   if (audioUrls.length > 0) {
-    await playTtsAudioQueue(audioUrls, { source });
+    const playback = await playTtsAudioQueue(audioUrls, { source });
+    if (playback?.status === "stopped") {
+      throw new Error("TTS 音频播放已被中断");
+    }
   } else if (!result.played) {
     throw new Error("TTS 已合成但没有可播放的 audio_url");
   }
@@ -14755,8 +15634,12 @@ async function ttsSpeakText(text, { source = "manual", voice = undefined, segmen
 function stopActiveTtsPlayback(reason = "manual") {
   activeTtsPlaybackId += 1;
   if (reason !== "realtime-tts-chunk") {
+    [realtimeTtsActiveChunk, ...realtimeTtsChunkQueue].forEach((chunk) => {
+      if (chunk?.source === "realtime-delta" && chunk.message_id) {
+        realtimeTurn.streamingCancelledMessageIds.add(chunk.message_id);
+      }
+    });
     realtimeTtsChunkQueue = [];
-    realtimeTtsChunkPlaying = false;
     realtimeTtsChunkPlaybackId = 0;
   }
   const audio = activeTtsAudio;
@@ -14775,9 +15658,6 @@ function stopActiveTtsPlayback(reason = "manual") {
 }
 
 function realtimeTtsChunkMatchesActiveGeneration(payload = {}) {
-  if (!realtimeFullStreamOperational()) {
-    return true;
-  }
   const source = String(payload.source || "").trim();
   const payloadTurnId = String(payload.turn_id || "").trim();
   const payloadGenerationId = Number(payload.generation_id);
@@ -14805,6 +15685,11 @@ function enqueueRealtimeTtsChunk(payload = {}) {
     index: payload.index ?? payload.chunk_index ?? (realtimeTtsChunkQueue.length + 1),
     total: payload.total ?? payload.chunk_count ?? null,
     final_chunk: Boolean(payload.final_chunk),
+    turn_id: payload.turn_id || null,
+    generation_id: payload.generation_id ?? null,
+    segment_index: payload.segment_index ?? null,
+    message_id: payload.message_id
+      || (String(payload.source || "") === "realtime-delta" ? realtimeTurn.messageId : null),
   };
   if (!realtimeTtsChunkPlaying && realtimeTtsChunkQueue.length === 0) {
     stopActiveTtsPlayback("realtime-tts-chunk");
@@ -14817,78 +15702,118 @@ function enqueueRealtimeTtsChunk(payload = {}) {
     });
   }
   realtimeTtsChunkQueue.push(chunk);
-  void drainRealtimeTtsChunkQueue();
+  realtimeTtsDrainPromise = drainRealtimeTtsChunkQueue();
+  void realtimeTtsDrainPromise;
   return chunk;
 }
 
 async function drainRealtimeTtsChunkQueue() {
   if (realtimeTtsChunkPlaying) {
-    return;
+    return realtimeTtsDrainPromise;
   }
   realtimeTtsChunkPlaying = true;
   const playbackId = realtimeTtsChunkPlaybackId || activeTtsPlaybackId;
-  let played = 0;
-  let lastSource = "streaming_tts";
-  let sawFinal = false;
-  try {
-    while (realtimeTtsChunkQueue.length > 0) {
-      if (activeTtsPlaybackId !== playbackId) {
-        realtimeTtsChunkQueue = [];
-        emitLocalRealtimeSessionEvent("tts_playback_stopped", {
+  const run = (async () => {
+    let played = 0;
+    let lastSource = "streaming_tts";
+    let sawFinal = false;
+    try {
+      while (realtimeTtsChunkQueue.length > 0) {
+        if (activeTtsPlaybackId !== playbackId) {
+          [realtimeTtsActiveChunk, ...realtimeTtsChunkQueue].forEach((chunk) => {
+            if (chunk?.source === "realtime-delta" && chunk.message_id) {
+              realtimeTurn.streamingCancelledMessageIds.add(chunk.message_id);
+            }
+          });
+          realtimeTtsChunkQueue = [];
+          emitLocalRealtimeSessionEvent("tts_playback_stopped", {
+            source: lastSource,
+            backend: "browser-stream",
+            played,
+          });
+          return;
+        }
+        const next = realtimeTtsChunkQueue.shift();
+        if (!next) {
+          break;
+        }
+        realtimeTtsActiveChunk = next;
+        lastSource = next.source || lastSource;
+        emitLocalRealtimeSessionEvent("tts_playback_segment", {
           source: lastSource,
           backend: "browser-stream",
-          played,
-        });
-        return;
-      }
-      const next = realtimeTtsChunkQueue.shift();
-      if (!next) {
-        break;
-      }
-      lastSource = next.source || lastSource;
-      emitLocalRealtimeSessionEvent("tts_playback_segment", {
-        source: lastSource,
-        backend: "browser-stream",
-        index: next.index,
-        total: next.total,
-      });
-      const result = await playTtsAudioUrl(next.audio_url, {
-        source: lastSource,
-        replace: false,
-        playbackId,
-      });
-      played += 1;
-      sawFinal = sawFinal || next.final_chunk;
-      if (activeTtsPlaybackId !== playbackId || result?.status === "stopped") {
-        realtimeTtsChunkQueue = [];
-        emitLocalRealtimeSessionEvent("tts_playback_stopped", {
-          source: lastSource,
-          backend: "browser-stream",
-          played,
+          index: next.index,
           total: next.total,
         });
-        return;
+        const result = await playTtsAudioUrl(next.audio_url, {
+          source: lastSource,
+          replace: false,
+          playbackId,
+        });
+        played += 1;
+        sawFinal = sawFinal || next.final_chunk;
+        if (activeTtsPlaybackId !== playbackId || result?.status === "stopped") {
+          [next, ...realtimeTtsChunkQueue].forEach((chunk) => {
+            if (chunk?.source === "realtime-delta" && chunk.message_id) {
+              realtimeTurn.streamingCancelledMessageIds.add(chunk.message_id);
+            }
+          });
+          realtimeTtsChunkQueue = [];
+          emitLocalRealtimeSessionEvent("tts_playback_stopped", {
+            source: lastSource,
+            backend: "browser-stream",
+            played,
+            total: next.total,
+          });
+          return;
+        }
+        if (
+          next.source === "realtime-delta"
+          && next.final_chunk
+          && next.message_id
+          && realtimeTtsChunkMatchesActiveGeneration(next)
+        ) {
+          // 只有浏览器实际播放到 ended 才算该消息的流式朗读成功。
+          const playedSegments = realtimeTurn.streamingPlayedSegments.get(next.message_id)
+            || new Set();
+          playedSegments.add(next.segment_index ?? next.index);
+          realtimeTurn.streamingPlayedSegments.set(next.message_id, playedSegments);
+          const expectedSegments =
+            realtimeTurn.streamingExpectedSegments.get(next.message_id) || 0;
+          if (expectedSegments > 0 && playedSegments.size >= expectedSegments) {
+            realtimeTurn.streamedMessageIds.add(next.message_id);
+          }
+        }
+        realtimeTtsActiveChunk = null;
       }
-    }
-    if (sawFinal) {
-      emitLocalRealtimeSessionEvent("tts_playback_ended", {
+      if (sawFinal) {
+        emitLocalRealtimeSessionEvent("tts_playback_ended", {
+          source: lastSource,
+          backend: "browser-stream",
+          played,
+        });
+        realtimeTtsChunkPlaybackId = 0;
+      }
+    } catch (error) {
+      [realtimeTtsActiveChunk, ...realtimeTtsChunkQueue].forEach((chunk) => {
+        if (chunk?.source === "realtime-delta" && chunk.message_id) {
+          realtimeTurn.streamingFailedMessageIds.add(chunk.message_id);
+        }
+      });
+      realtimeTtsChunkQueue = [];
+      emitLocalRealtimeSessionEvent("tts_playback_stopped", {
         source: lastSource,
         backend: "browser-stream",
         played,
+        error: error.message,
       });
-      realtimeTtsChunkPlaybackId = 0;
+    } finally {
+      realtimeTtsActiveChunk = null;
+      realtimeTtsChunkPlaying = false;
     }
-  } catch (error) {
-    realtimeTtsChunkQueue = [];
-    emitLocalRealtimeSessionEvent("tts_playback_stopped", {
-      source: lastSource,
-      backend: "browser-stream",
-      played,
-      error: error.message,
-    });
-  } finally {
-    realtimeTtsChunkPlaying = false;
-  }
+  })();
+  realtimeTtsDrainPromise = run;
+  return run;
 }
 
 async function playTtsAudioQueue(audioUrls, { source = "manual" } = {}) {
@@ -14965,6 +15890,18 @@ async function playTtsAudioQueue(audioUrls, { source = "manual" } = {}) {
 // 实时会话运行中才会置 gate ready（后端校验）。播放结束上报 reference_active=false。
 let aecReferenceCtx = null;
 let aecReferenceLastReportMs = 0;
+
+async function releaseRealtimeAudioOutputResources() {
+  stopAudioOutputDeviceWatcher?.();
+  stopAudioOutputDeviceWatcher = null;
+  const context = aecReferenceCtx;
+  aecReferenceCtx = null;
+  aecReferenceLastReportMs = 0;
+  if (context && context.state !== "closed") {
+    await context.close().catch(() => {});
+  }
+}
+
 function attachAecFarEndReference(audio) {
   try {
     const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -15030,6 +15967,10 @@ function ensureAudioOutputDeviceWatcher() {
       if (!fellBackToDefault || selectedAudioOutputDeviceId === "default") return;
       selectedAudioOutputDeviceId = device?.deviceId || "default";
       try { localStorage.setItem("audioOutputDeviceId", selectedAudioOutputDeviceId); } catch (_) {}
+      stopAudioOutputDeviceWatcher?.();
+      stopAudioOutputDeviceWatcher = null;
+      ensureAudioOutputDeviceWatcher();
+      void refreshAudioDeviceSelectors();
       showSttStatus("所选扬声器已断开，已回退到系统默认输出。");
     },
   );
@@ -15102,14 +16043,17 @@ async function sttDictateToggle() {
   }
 }
 
-async function sttStartDictation({ realtime = false } = {}) {
+async function sttStartDictation({ realtime = false, throwOnError = false } = {}) {
   if (!navigator.mediaDevices?.getUserMedia) {
-    showSttStatus("浏览器不支持麦克风录音，请使用 Chrome/Edge 打开此页面");
-    return;
+    const error = new Error("浏览器不支持麦克风录音，请使用 Chrome/Edge 打开此页面");
+    showSttStatus(error.message);
+    if (throwOnError) throw error;
+    return false;
   }
 
+  let stream = null;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: buildRealtimeAudioConstraints({ realtime }),
     });
     sttChunks = [];
@@ -15169,9 +16113,24 @@ async function sttStartDictation({ realtime = false } = {}) {
     renderSttDictationButton("停止", { recording: true });
     setAudioRealtimeButtons(audioRealtimeRunning);
     showSttStatus("");
+    await refreshAudioDeviceSelectors();
+    return true;
   } catch (e) {
+    const recorder = sttRecorder;
+    sttRecorder = null;
+    if (recorder) {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      if (recorder.state !== "inactive") {
+        try { recorder.stop(); } catch (_) {}
+      }
+      recorder.stream?.getTracks?.().forEach((track) => track.stop());
+    }
+    stream?.getTracks?.().forEach((track) => track.stop());
     isDictating = false;
     sttTailCapture = null;
+    sttChunks = [];
+    sttSessionId = null;
     renderSttDictationButton("语音输入");
     if (e.name === "NotAllowedError") {
       showSttStatus("麦克风权限未授予，请点击浏览器地址栏左侧的锁图标，允许麦克风访问后刷新页面");
@@ -15182,6 +16141,8 @@ async function sttStartDictation({ realtime = false } = {}) {
     } else {
       showSttStatus("麦克风启动失败: " + e.message);
     }
+    if (throwOnError) throw e;
+    return false;
   }
 }
 

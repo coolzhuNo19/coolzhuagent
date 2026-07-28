@@ -1707,8 +1707,6 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
         candidates.push(home.join(".config").join("opencode").join("skills"));
         candidates.push(home.join(".codex").join("skills"));
     }
-    candidates.push(std::path::PathBuf::from("/home/bellman/.codex/skills"));
-
     for root in candidates {
         let direct = root.join(requested).join("SKILL.md");
         if direct.exists() {
@@ -4434,7 +4432,7 @@ mod tests {
 
         let timeout = execute_tool(
             "bash",
-            &json!({ "command": shell_sleep_command(), "timeout": 10 }),
+            &json!({ "command": shell_sleep_command(), "timeout": 1 }),
         )
         .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
@@ -4477,12 +4475,12 @@ mod tests {
 
     #[cfg(windows)]
     fn shell_sleep_command() -> &'static str {
-        "ping -n 2 127.0.0.1 >NUL"
+        "ping -n 4 127.0.0.1 >NUL"
     }
 
     #[cfg(not(windows))]
     fn shell_sleep_command() -> &'static str {
-        "sleep 1"
+        "sleep 3"
     }
 
     #[test]

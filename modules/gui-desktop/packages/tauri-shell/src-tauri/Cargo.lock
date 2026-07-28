@@ -499,11 +499,11 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-diagnostics"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "coolzhu-tauri-shell"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "coolzhu-diagnostics",
  "png",

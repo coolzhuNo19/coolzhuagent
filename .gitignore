@@ -12,9 +12,17 @@ node_modules/
 test-results/
 goal-artifacts/
 
+# Python caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
 # Model weights and binary artifacts
 /models/
 **/*.pth
+**/*.pt
+**/*.ckpt
 **/*.gguf
 **/*.onnx
 **/*.safetensors
@@ -31,16 +39,35 @@ goal-artifacts/
 !.coolzhu/plugins/**
 .claw-agents/
 **/.claw-agents/
-**/web-sessions.json
+.claude/
+**/.claude/
+.superpowers/
+**/.superpowers/
+**/web-sessions.*
 **/*.sqlite
 **/*.sqlite3
 **/*.sqlite3-wal
 **/*.sqlite3-shm
 **/*.db
+**/*.db-wal
+**/*.db-shm
 **/coolzhu.toml
 **/.env
 **/.env.*
 **/logs/
+**/*.log
+**/.claw-todos.json
+**/session-attachments/
+**/audio-realtime/
+**/credentials.json
+**/secrets.json
+**/token-cache.json
+**/*-qrcode.png
+**/*-qrcode.jpg
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
 
 # OS / editor
 Thumbs.db

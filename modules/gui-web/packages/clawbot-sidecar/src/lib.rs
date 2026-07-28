@@ -542,7 +542,7 @@ impl ClawbotProvider for MockClawbotProvider {
     fn health(&self, config: &ClawbotSidecarConfig) -> ClawbotProviderHealth {
         ClawbotProviderHealth {
             provider: "mock-clawbot".to_string(),
-            provider_version: "0.1.0".to_string(),
+            provider_version: "0.2.0".to_string(),
             account_id: self.configured.then(|| config.account_id.clone()),
             online: self.online,
             last_error: (!self.configured)

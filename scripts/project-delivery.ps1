@@ -26,14 +26,19 @@ function Test-DeliveryExcludedPath {
     if ((-not $isWorkspacePluginSource) -and $containsRuntimeStateDirectory) {
         return $true
     }
-    $blockedSegments = @('.git', '.claw-agents', 'target', 'node_modules', 'tmp', 'dist', 'package', 'output', 'test-results', 'models', 'logs', 'log', 'backup', 'backups')
+    $blockedSegments = @(
+        '.git', '.claude', '.superpowers', '.claw-agents', '__pycache__',
+        'target', 'node_modules', 'tmp', 'dist', 'package', 'output',
+        'test-results', 'models', 'logs', 'log', 'backup', 'backups',
+        'session-attachments', 'audio-realtime'
+    )
     if ($segments | Where-Object { $blockedSegments -contains $_.ToLowerInvariant() }) { return $true }
     if ($segments | Where-Object { $_ -match '(?i)^(backup-|.*-backup-)' }) { return $true }
     if ($segments | Where-Object { $_ -match '(?i)^generated-previews(?:-|$)' }) { return $true }
     if ($path -match '(?i)^modules\\gui-desktop\\packages\\tauri-shell\\src-tauri\\gen\\schemas\\') { return $true }
     if ($path -match '(?i)^modules\\[^\\]+\\docs\\') { return $true }
-    if ($path -match '(?i)(web-sessions|(^|\\)sessions?(\\|$)|\.sqlite3?$|\.db$|coolzhu\.toml$|(^|\\)\.env($|\.)|credentials|secrets|token-cache)') { return $true }
-    if ($path -match '(?i)(\.bak|\.old|\.orig|\.rej|\.msi|\.zip|\.7z|\.exe|\.dll|\.pdb|\.rlib|\.rmeta|\.obj|\.lib)$') { return $true }
+    if ($path -match '(?i)(web-sessions|(^|\\)sessions?(\\|$)|\.(sqlite3?|db)(-wal|-shm)?$|coolzhu\.toml$|(^|\\)\.env($|\.)|(^|\\)\.claw-todos\.json$|credentials|secrets|token-cache|(^|\\)[^\\]*-qrcode\.(png|jpe?g)$)') { return $true }
+    if ($path -match '(?i)(\.bak|\.old|\.orig|\.rej|\.pyc|\.pyo|\.log|\.pem|\.key|\.p12|\.pfx|\.pt|\.ckpt|\.pth|\.gguf|\.onnx|\.safetensors|\.msi|\.zip|\.7z|\.exe|\.dll|\.pdb|\.rlib|\.rmeta|\.obj|\.lib)$') { return $true }
     return $false
 }
 
@@ -162,7 +167,13 @@ function Invoke-PublicSourceSafetyScan {
 
     $resolvedRoot = (Resolve-Path -LiteralPath $Root).Path.TrimEnd('\', '/')
     $rootPrefix = $resolvedRoot + [System.IO.Path]::DirectorySeparatorChar
-    $textExtensions = @('.txt', '.json', '.toml', '.yaml', '.yml', '.ini', '.conf', '.config', '.md', '.ps1', '.cmd', '.bat', '.js', '.mjs', '.ts', '.tsx', '.html', '.css', '.rs', '.wxs', '.xml')
+    $textExtensions = @(
+        '.txt', '.json', '.toml', '.yaml', '.yml', '.ini', '.conf', '.config',
+        '.md', '.ps1', '.cmd', '.bat', '.sh', '.js', '.mjs', '.cjs', '.ts',
+        '.tsx', '.jsx', '.html', '.css', '.scss', '.rs', '.py', '.c', '.h',
+        '.cpp', '.hpp', '.java', '.kt', '.dart', '.sql', '.wxs', '.xml',
+        '.svg', '.lock'
+    )
     $credentialPattern = '(?im)^\s*["'']?(api[_-]?key|access[_-]?token|token|secret|password)["'']?\s*[:=]\s*["''](?!(test|dummy|example|sample|access-token|saved-access-token|expired-access-token|nope|not-a-real)\b)([A-Za-z0-9_\-\./+=]{16,})["'']'
     $bearerPattern = '(?im)^\s*(authorization\s*:\s*bearer\s+)[A-Za-z0-9_\-\./+=]{8,}'
     $currentUserPattern = if ($env:USERNAME) { '(?i)[A-Z]:[\\/]+Users[\\/]+' + [regex]::Escape($env:USERNAME) + '([\\/]|$)' } else { $null }
@@ -174,13 +185,30 @@ function Invoke-PublicSourceSafetyScan {
             $findings.Add([pscustomobject]@{ path = $relativePath; reason = 'blocked-path' })
             continue
         }
-        if ($file.Length -gt 2MB -or $textExtensions -notcontains $file.Extension.ToLowerInvariant()) { continue }
-        $content = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop
-        if ($content -match $credentialPattern -or $content -match $bearerPattern) {
-            $findings.Add([pscustomobject]@{ path = $relativePath; reason = 'credential-assignment' })
-        }
-        if ($currentUserPattern -and $content -match $currentUserPattern) {
-            $findings.Add([pscustomobject]@{ path = $relativePath; reason = 'private-user-path' })
+        if ($textExtensions -notcontains $file.Extension.ToLowerInvariant()) { continue }
+
+        # 大型源码（当前 main.rs 已超过 2 MB）也必须完整扫描。逐行读取既消除
+        # “大文件跳过”的隐私盲区，也避免一次把几十 MB 文本全部载入内存。
+        $credentialFound = $false
+        $privatePathFound = $false
+        $reader = [System.IO.StreamReader]::new($file.FullName, $true)
+        try {
+            while (-not $reader.EndOfStream) {
+                $line = $reader.ReadLine()
+                if (-not $credentialFound -and ($line -match $credentialPattern -or $line -match $bearerPattern)) {
+                    $findings.Add([pscustomobject]@{ path = $relativePath; reason = 'credential-assignment' })
+                    $credentialFound = $true
+                }
+                if (-not $privatePathFound -and $currentUserPattern -and $line -match $currentUserPattern) {
+                    $findings.Add([pscustomobject]@{ path = $relativePath; reason = 'private-user-path' })
+                    $privatePathFound = $true
+                }
+                if ($credentialFound -and ($privatePathFound -or -not $currentUserPattern)) {
+                    break
+                }
+            }
+        } finally {
+            $reader.Dispose()
         }
     }
 
@@ -284,9 +312,17 @@ $githubIgnoreLines = @(
     'test-results/',
     'goal-artifacts/',
     '',
+    '# Python caches',
+    '__pycache__/',
+    '**/__pycache__/',
+    '*.py[cod]',
+    '*$py.class',
+    '',
     '# Model weights and binary artifacts',
     '/models/',
     '**/*.pth',
+    '**/*.pt',
+    '**/*.ckpt',
     '**/*.gguf',
     '**/*.onnx',
     '**/*.safetensors',
@@ -303,16 +339,35 @@ $githubIgnoreLines = @(
     '!.coolzhu/plugins/**',
     '.claw-agents/',
     '**/.claw-agents/',
-    '**/web-sessions.json',
+    '.claude/',
+    '**/.claude/',
+    '.superpowers/',
+    '**/.superpowers/',
+    '**/web-sessions.*',
     '**/*.sqlite',
     '**/*.sqlite3',
     '**/*.sqlite3-wal',
     '**/*.sqlite3-shm',
     '**/*.db',
+    '**/*.db-wal',
+    '**/*.db-shm',
     '**/coolzhu.toml',
     '**/.env',
     '**/.env.*',
     '**/logs/',
+    '**/*.log',
+    '**/.claw-todos.json',
+    '**/session-attachments/',
+    '**/audio-realtime/',
+    '**/credentials.json',
+    '**/secrets.json',
+    '**/token-cache.json',
+    '**/*-qrcode.png',
+    '**/*-qrcode.jpg',
+    '**/*.pem',
+    '**/*.key',
+    '**/*.p12',
+    '**/*.pfx',
     '',
     '# OS / editor',
     'Thumbs.db',

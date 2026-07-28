@@ -1,8 +1,8 @@
 ﻿{
-    "generated_at":  "2026-07-19T02:24:16.0927396Z",
+    "generated_at":  "2026-07-28T23:15:09.0038654Z",
     "workspace":  ".",
-    "file_count":  981,
-    "total_bytes":  136447456,
+    "file_count":  983,
+    "total_bytes":  136831569,
     "files":  [
                   {
                       "relative_path":  ".coolzhu\\plugins\\coolzhu-agents-md-updater\\plugin.json",
@@ -216,8 +216,8 @@
                   },
                   {
                       "relative_path":  ".gitignore",
-                      "size":  603,
-                      "sha256":  "05685C845B3EA1CA4898BB6E3AFE494071702F37C0AEBD8297998DC6A2B061BE",
+                      "size":  984,
+                      "sha256":  "EA1E28ED101ADA011A59145703C5914E5C592E3FD835E04BCDEC09DE84D9C511",
                       "repository":  ".",
                       "git_status":  "tracked-clean"
                   },
@@ -238,14 +238,14 @@
                   {
                       "relative_path":  "Cargo.lock",
                       "size":  138251,
-                      "sha256":  "D636DD5ACD5B594E2CB85F0C93709FC29B15D38099C1E799D3FBA5F538506408",
+                      "sha256":  "498748250B68E5699911F83C22D22CDE67804F6F0A390603133D57F5BB57E6EF",
                       "repository":  ".",
                       "git_status":  "M"
                   },
                   {
                       "relative_path":  "Cargo.toml",
                       "size":  3314,
-                      "sha256":  "93338F1FCE953C0D694260B032BFFFAC40252E8F0A7CC72B1D943CD0B28AB78D",
+                      "sha256":  "1B367FD07568FF503F106A8EA2E34F379BD00661F0631A1FC5A257362ABBE53D",
                       "repository":  ".",
                       "git_status":  "M"
                   },
@@ -265,8 +265,8 @@
                   },
                   {
                       "relative_path":  "config\\package-manifest.json",
-                      "size":  5865,
-                      "sha256":  "7EF56458F07CA599ED35A887A5EF6D957ED990B67F966028EA4F8F451F2C5374",
+                      "size":  5561,
+                      "sha256":  "63D16345829FD8BBF7628ABE4889A7E349052A68B2E149F4717CCA91AE319BE7",
                       "repository":  ".",
                       "git_status":  "M"
                   },
@@ -279,15 +279,15 @@
                   },
                   {
                       "relative_path":  "docs\\github-public-docs.json",
-                      "size":  834,
-                      "sha256":  "077E0272541551D5F680E5DAC2C8CBDB9016C61C3998884A3143E83B653C9344",
+                      "size":  934,
+                      "sha256":  "4834967EE6EF283ACA3CD491229F055537DA4689347E46E3E172FE54302E74EA",
                       "repository":  ".",
                       "git_status":  "??"
                   },
                   {
                       "relative_path":  "docs\\github-public-index.md",
-                      "size":  1453,
-                      "sha256":  "E68424774A93A1107CC408AF6814335FAAB1D91A77B9034BF750260A3D327F0A",
+                      "size":  1529,
+                      "sha256":  "1FD3CAE9DFF96991CE110028A2A3823004F6E8C3951284721FD472FF90D0678E",
                       "repository":  ".",
                       "git_status":  "??"
                   },
@@ -321,8 +321,8 @@
                   },
                   {
                       "relative_path":  "docs\\superpowers\\plans\\2026-06-28-realtime-full-stream.md",
-                      "size":  12136,
-                      "sha256":  "72A2AEEC181CCC25C89DB9BF48A01A615B5F2F04DAAC782590E3805589635F46",
+                      "size":  12135,
+                      "sha256":  "7FA1E1755D5E7E268B61EA915E735445878A06B1E04915903AE48C83F1F4A7EB",
                       "repository":  ".",
                       "git_status":  "M"
                   },
@@ -376,9 +376,30 @@
                       "git_status":  "tracked-clean"
                   },
                   {
+                      "relative_path":  "docs\\user-guide\\guide.js",
+                      "size":  2255,
+                      "sha256":  "B310A2A249373C93FE3852D50E82BDDA31F7ACE76358F9543E501EA2F94A7A1D",
+                      "repository":  ".",
+                      "git_status":  "??"
+                  },
+                  {
+                      "relative_path":  "docs\\user-guide\\index.html",
+                      "size":  43017,
+                      "sha256":  "A5C7FADACDFEF6F7D3D8400233CC936FF78440B93A33D10CBDB01291C65060EE",
+                      "repository":  ".",
+                      "git_status":  "??"
+                  },
+                  {
+                      "relative_path":  "docs\\user-guide\\styles.css",
+                      "size":  17597,
+                      "sha256":  "D912A4BF04E3C08866D949C18679B43072D2E1D4D198DDE76D38C679BF657A25",
+                      "repository":  ".",
+                      "git_status":  "??"
+                  },
+                  {
                       "relative_path":  "installer\\Product.wxs",
-                      "size":  2128,
-                      "sha256":  "E318429D3658B607C5FD130692B64B20D87534D3DBA6344C1F9659E6F8AE895B",
+                      "size":  4299,
+                      "sha256":  "A55A4A4706B4CB0102162B6A46DED53911D7A16F6C2D14BAA4B673E7B3B73CE6",
                       "repository":  ".",
                       "git_status":  "??"
                   },
@@ -391,8 +412,8 @@
                   },
                   {
                       "relative_path":  "modules\\browser-extension\\content_script.js",
-                      "size":  14570,
-                      "sha256":  "FE84057C3121605DA3D9E54F90A5150EB3E6FFBA630FE890D0A562A9844B262E",
+                      "size":  18064,
+                      "sha256":  "ED97EDFB3E74BE9C4596412BD24E2AA7A7EB07AAD4DB423B480247D9B6D4B025",
                       "repository":  ".",
                       "git_status":  "ignored-or-untracked"
                   },
@@ -406,14 +427,14 @@
                   {
                       "relative_path":  "modules\\browser-extension\\manifest.json",
                       "size":  1025,
-                      "sha256":  "4667A2A0268E1C9B378A5DE1828E458AF477871DDE33AEB2332E327215F5F708",
+                      "sha256":  "996852EED0056CE8A449F9F0274BC4259EA2B19BCA3C785D1306BBB699C09C87",
                       "repository":  ".",
                       "git_status":  "ignored-or-untracked"
                   },
                   {
                       "relative_path":  "modules\\browser-extension\\service_worker.js",
-                      "size":  7024,
-                      "sha256":  "91436F503F539E58B6D9AB11527B7A378EBF92930CE60C784CB0D10E9A202A4F",
+                      "size":  12696,
+                      "sha256":  "6854B314C3849D2794DD86DE35082E843172B54D7264DD6A2457941C289C2DB5",
                       "repository":  ".",
                       "git_status":  "ignored-or-untracked"
                   },
@@ -421,6 +442,13 @@
                       "relative_path":  "modules\\browser-extension\\setup.html",
                       "size":  434,
                       "sha256":  "D99FC2F569AD576EE2D753E413C22EEEFE7A5B1A637877B861E8530B2D1D8E82",
+                      "repository":  ".",
+                      "git_status":  "ignored-or-untracked"
+                  },
+                  {
+                      "relative_path":  "modules\\browser-extension\\tests\\browser_extension_contract.test.mjs",
+                      "size":  15792,
+                      "sha256":  "8A70AB799A50F2A140972F8B591CF058DC5086EBF355CA5731AD3ED803D4360F",
                       "repository":  ".",
                       "git_status":  "ignored-or-untracked"
                   },
@@ -503,15 +531,15 @@
                   },
                   {
                       "relative_path":  "modules\\computer-use\\packages\\computer-use-core\\src\\contracts.rs",
-                      "size":  14048,
-                      "sha256":  "893C62E4BDDDFCAF2A43D1EE115C1307ABB65E44D013C211C7E258067F9CF7A1",
+                      "size":  14964,
+                      "sha256":  "1FB07BDC19B99AA9B371008A15F4D3E472076D308F6628FA5F47D42D5AF96905",
                       "repository":  "modules\\computer-use",
                       "git_status":  "M"
                   },
                   {
                       "relative_path":  "modules\\computer-use\\packages\\computer-use-core\\src\\controller.rs",
-                      "size":  30859,
-                      "sha256":  "E1A046500F2485AA5ECBA5E0E31084481BF3FC83650E22D3E9E0C7A8D056D5F1",
+                      "size":  51657,
+                      "sha256":  "C39C864986CB6A6D0065204FBB4828D3E560D5C7F6C569ABC1BF4E3A33E83A79",
                       "repository":  "modules\\computer-use",
                       "git_status":  "M"
                   },
@@ -524,8 +552,8 @@
                   },
                   {
                       "relative_path":  "modules\\computer-use\\packages\\computer-use-core\\src\\lib.rs",
-                      "size":  14232,
-                      "sha256":  "0AAEAC177602499F84A9D466982B15B6DE0A299F297B8C900801DBD16120BEE4",
+                      "size":  14259,
+                      "sha256":  "2373E0918A6B5A95CA03587F2F33CCB132E9019BD6ADC539BF4CC91A9684C48B",
                       "repository":  "modules\\computer-use",
                       "git_status":  "M"
                   },
@@ -931,14 +959,14 @@
                   {
                       "relative_path":  "modules\\gui-desktop\\packages\\tauri-shell\\src-tauri\\Cargo.lock",
                       "size":  142525,
-                      "sha256":  "3AD64ABC1D43DF25E1535AC878522B8604F1501110FAF53CA93E2A4C244A698E",
+                      "sha256":  "D6617B5C2CDA35C27362C504A72A6691DF3707EC652249EB1F4789BD1C2B907C",
                       "repository":  "modules\\gui-desktop",
                       "git_status":  "M"
                   },
                   {
                       "relative_path":  "modules\\gui-desktop\\packages\\tauri-shell\\src-tauri\\Cargo.toml",
                       "size":  995,
-                      "sha256":  "40A58B7AEBC4E332FA57700AD63761C57F661F9ADFD0251CAE93FED4317CE3E4",
+                      "sha256":  "299BC2A9835E5A636F9D10B610B4906762D47D84843E4B7F289939F82FC86ADD",
                       "repository":  "modules\\gui-desktop",
                       "git_status":  "M"
                   },
@@ -965,10 +993,10 @@
                   },
                   {
                       "relative_path":  "modules\\gui-desktop\\packages\\tauri-shell\\src-tauri\\tauri.conf.json",
-                      "size":  711,
-                      "sha256":  "B87950579639AEB8FB35E6628071DA5D2C574108541961F275D9794337BFF002",
+                      "size":  712,
+                      "sha256":  "A7B389640C0CC1BDEE616C59CF6ACA08B93F715EA24BB513BBDE1FBC76257D25",
                       "repository":  "modules\\gui-desktop",
-                      "git_status":  "tracked-clean"
+                      "git_status":  "M"
                   },
                   {
                       "relative_path":  "modules\\gui-desktop\\packages\\tauri-shell\\ui\\assets\\pet-actions\\attention.png",
@@ -1156,13 +1184,6 @@
                       "relative_path":  "modules\\gui-desktop\\packages\\tauri-shell\\ui\\assets\\pet-actions\\crowned-7.png",
                       "size":  83544,
                       "sha256":  "E19C65E8B74B493C3BC572AE4D8B8730A817452A921D64F8BF083151F0780EBB",
-                      "repository":  "modules\\gui-desktop",
-                      "git_status":  "??"
-                  },
-                  {
-                      "relative_path":  "modules\\gui-desktop\\packages\\tauri-shell\\ui\\assets\\pet-actions\\generated-sheets-20260617\\__pycache__\\stabilize_pet_frames.cpython-314.pyc",
-                      "size":  25390,
-                      "sha256":  "1E9C0A82AE724294020BFB982BC57058DF0C7FDD3063BDC86A46949EA0BCBD34",
                       "repository":  "modules\\gui-desktop",
                       "git_status":  "??"
                   },
@@ -3255,7 +3276,7 @@
                   {
                       "relative_path":  "modules\\gui-web\\packages\\clawbot-sidecar\\src\\lib.rs",
                       "size":  74166,
-                      "sha256":  "FA2AB18C0C147520164D5B2DCFBFECE20D6B19A2C999FA3DFDD6332B3E8EEE95",
+                      "sha256":  "3F80F451DF146A4D58B2753EC341D1775BECA10C5DC01834A420836E210275E8",
                       "repository":  "modules\\gui-web",
                       "git_status":  "??"
                   },
@@ -5956,8 +5977,8 @@
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\index.html",
-                      "size":  87004,
-                      "sha256":  "6AA2A42399524C3B2ABD1BB50899720520A277C721E243DBA8535F64BACCAC6C",
+                      "size":  96103,
+                      "sha256":  "EA574F0A04C1F26D6DFF65B26E8574F6BBE7B8D35BAA297B6B739D563A86E925",
                       "repository":  "modules\\gui-web",
                       "git_status":  "M"
                   },
@@ -5970,15 +5991,15 @@
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\app.js",
-                      "size":  556906,
-                      "sha256":  "8D8D82AF2B64F6BAAEC55ED23AE609865120A91F44AB81A8F5E3F6E706B5DDBE",
+                      "size":  603930,
+                      "sha256":  "292F150AFA859D0618F932B131A1C51696B3F3BBCD0A182665D5F6B3D76C21F0",
                       "repository":  "modules\\gui-web",
                       "git_status":  "M"
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\audio.rs",
-                      "size":  71115,
-                      "sha256":  "85A6DCF0D369EC558CDFF28527B55B48F462092D837043486620B27D63BB5B80",
+                      "size":  71334,
+                      "sha256":  "A30931B6B33DF4CFA7971DB3E10F51D54EDA3C568EA70F2D56D340B111F12AFD",
                       "repository":  "modules\\gui-web",
                       "git_status":  "M"
                   },
@@ -5991,8 +6012,8 @@
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\browser_bridge.rs",
-                      "size":  67736,
-                      "sha256":  "1B42FFE93360EAB7556424726CFB875F46ACCED107DE36A26E481F8F6BC9F3AB",
+                      "size":  81935,
+                      "sha256":  "945FAEF9550D6EFF1878A457D014366CB8255C8CE93A16C44BC998DC25F53593",
                       "repository":  "modules\\gui-web",
                       "git_status":  "??"
                   },
@@ -6012,8 +6033,8 @@
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\clawbot_gateway.rs",
-                      "size":  108241,
-                      "sha256":  "0EDB94E5CC0357DEDDCC2E1761FCD8F6702BE76DEBE6F88C5BF0D2543BF5F179",
+                      "size":  108233,
+                      "sha256":  "65FDE7EC6FC32EC0D9D9AB00AE20625FF5CE266EA071D24297ACAAB6FB2D208A",
                       "repository":  "modules\\gui-web",
                       "git_status":  "??"
                   },
@@ -6033,8 +6054,8 @@
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\computer_use_executor.rs",
-                      "size":  38215,
-                      "sha256":  "5546984018A0FBCE4A8217F7964672B220ED833E557BA7B557E0C8626975336F",
+                      "size":  46838,
+                      "sha256":  "D7A1121ECF558505C545CBF683AD73136D897885BB42F776A3B80D36E00E0AD1",
                       "repository":  "modules\\gui-web",
                       "git_status":  "M"
                   },
@@ -6047,8 +6068,8 @@
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\computer_use_store.rs",
-                      "size":  23743,
-                      "sha256":  "69EEC01C7DDDBB2AE4B7DD53A1A2785128BB43F57B8BA15AC4C26B9A4D64AE40",
+                      "size":  23979,
+                      "sha256":  "370FA93F5661F7A3663C0FDCE1891DE3803A8BDBCAE310992B94FF7332BAF7D3",
                       "repository":  "modules\\gui-web",
                       "git_status":  "M"
                   },
@@ -6061,8 +6082,8 @@
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\main.rs",
-                      "size":  2369908,
-                      "sha256":  "B1D0F7FD5D327BE656E0DB0FDEB8BE8D48D305F65DDF07FB3A8DE1E36AC24808",
+                      "size":  2534767,
+                      "sha256":  "B60D5130BFC3E2530C9929889A318C0DAD4DD4DEE8F8C1305DF74F65CF2B0BB5",
                       "repository":  "modules\\gui-web",
                       "git_status":  "M"
                   },
@@ -6075,15 +6096,15 @@
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\realtime_audio_output.js",
-                      "size":  6680,
-                      "sha256":  "A80480E2915F22F51481D08E12953B79AEFB899E1091A9E9D799382414E4C150",
+                      "size":  7010,
+                      "sha256":  "36A5D8DB5041183EF0D89FF382A3B1770AEACC69AC8219178A7992A5EA870629",
                       "repository":  "modules\\gui-web",
                       "git_status":  "??"
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\realtime_voice_capture.js",
-                      "size":  10567,
-                      "sha256":  "C11B64BC3483F5A5468E613AA88B1067E9F9A33A2169DEF35CBDA0EA9614F0B5",
+                      "size":  19343,
+                      "sha256":  "79EE7CACC520DAA47C161A453EF90842273DFC14504A5B0BC34FE72F58D22B42",
                       "repository":  "modules\\gui-web",
                       "git_status":  "??"
                   },
@@ -6103,43 +6124,43 @@
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\styles.css",
-                      "size":  288533,
-                      "sha256":  "5476B82FBF5C65D8C057E8354AF01A31F822693AABDADE7A96F169572DC71791",
+                      "size":  295924,
+                      "sha256":  "CA6D9617CC649FE8F7F152B8527D301045502444D015A71D6A7E99AB6BCBF341",
                       "repository":  "modules\\gui-web",
                       "git_status":  "M"
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\tool_loop_coordinator.rs",
-                      "size":  5666,
-                      "sha256":  "5C0D6887314B5C439FDA46106B8103341D231B0BA9260594D8791F020AA1BD1B",
+                      "size":  5680,
+                      "sha256":  "DF2DC1359A5E3616109A59AA2F432357F4AFA5BAD0D902D9F60CF30C941A1078",
                       "repository":  "modules\\gui-web",
                       "git_status":  "M"
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\wechat_authorization.rs",
-                      "size":  14510,
-                      "sha256":  "2E0C3EEFCD69B6CAF6E7564F7CBEA59A5760D7747D54E5089E2F1696ADBC926B",
+                      "size":  14498,
+                      "sha256":  "A9749FAB7818C6525827A0E0CC8FC37F0A8F831B8FF80508A1D4B8A8FC737510",
                       "repository":  "modules\\gui-web",
                       "git_status":  "??"
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\wechat_command.rs",
-                      "size":  26106,
-                      "sha256":  "6F741BAB0284DFE7BE04F3D295ACFEE6645FF9D4ADF7E197BED4488F874F5703",
+                      "size":  26087,
+                      "sha256":  "A6BC79FF90E790C72867A80524274DBA5D2DB733C415C18D5D3C5C1C65BD2682",
                       "repository":  "modules\\gui-web",
                       "git_status":  "??"
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\wechat_command_runtime.rs",
-                      "size":  7869,
-                      "sha256":  "BCF801DB81621534F2E4CC80A0FB2843B424AD0FD2F01E23CE8D86F72381EC58",
+                      "size":  7790,
+                      "sha256":  "A3ED32E3FBBA2A351A9321AAA187747DB0F44B9B535F82BBB06EEDFC3E1A1265",
                       "repository":  "modules\\gui-web",
                       "git_status":  "??"
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\src\\wechat_file.rs",
-                      "size":  18318,
-                      "sha256":  "12C05A10C8A0308D9DA27A98AA11F24E03FBE7DB6101C2F31592095CF9B6483F",
+                      "size":  18369,
+                      "sha256":  "C0591DA8A45A4F67229A492DAD7F757D733CF846823512E9068E23FC7B477088",
                       "repository":  "modules\\gui-web",
                       "git_status":  "??"
                   },
@@ -6201,8 +6222,8 @@
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\tools\\realtime_voice_capture_contract.test.mjs",
-                      "size":  2388,
-                      "sha256":  "F52AC901A308DC10BFAA3A81E9EC9030BA4FC8AD9430D576704CED9B42D34B36",
+                      "size":  6829,
+                      "sha256":  "59C2611E469C6CFE088F801807D4C7A37F3472491C67BE08469DA94E4C7C0D3B",
                       "repository":  "modules\\gui-web",
                       "git_status":  "??"
                   },
@@ -6222,8 +6243,8 @@
                   },
                   {
                       "relative_path":  "modules\\gui-web\\packages\\web-console\\tools\\tts_text_contract.test.mjs",
-                      "size":  1877,
-                      "sha256":  "7556223CA9DF46FBADF22886B7C7E176FE451B6CE97EC861CBB6849DCA5BCE91",
+                      "size":  5753,
+                      "sha256":  "6F97E6A690860ED7497BB28D9BCF31D0B5EEE8CE27023E7F5741642A57955594",
                       "repository":  "modules\\gui-web",
                       "git_status":  "??"
                   },
@@ -6292,8 +6313,8 @@
                   },
                   {
                       "relative_path":  "modules\\llm-adapter\\packages\\llm-adapter\\src\\lib.rs",
-                      "size":  4087,
-                      "sha256":  "9E831B11F189E00EFD32ADA6CE5D5EF69BB1CA70C2F694E3BA9D17D0A24B4426",
+                      "size":  6745,
+                      "sha256":  "CB9333E5B8D82A1E04DB74A5D848ED49F054B7F68A1C771EEA6AD143A21380FA",
                       "repository":  "modules\\llm-adapter",
                       "git_status":  "M"
                   },
@@ -6320,8 +6341,8 @@
                   },
                   {
                       "relative_path":  "modules\\llm-adapter\\packages\\llm-adapter\\src\\providers\\openai_compat.rs",
-                      "size":  57746,
-                      "sha256":  "0B4DEF17F45424F00037307DED817D9D613520BC2E54151B49C59CDEF271F9AB",
+                      "size":  61436,
+                      "sha256":  "D5F63D0895D0A49FFE1AEABE7BFE95DBEFDEEFCE2929D22E9002B14DD87382AE",
                       "repository":  "modules\\llm-adapter",
                       "git_status":  "M"
                   },
@@ -6369,8 +6390,8 @@
                   },
                   {
                       "relative_path":  "modules\\llm-adapter\\packages\\llm-adapter\\tests\\openai_compat_integration.rs",
-                      "size":  14441,
-                      "sha256":  "CD5ED072E50113B4BE26143E7132C9D8DF435B90543F469DF83D9DBC6800F143",
+                      "size":  14456,
+                      "sha256":  "333442617C7245EFD8B808EA39D396D5D4A6818783638A55CE57DA69B0887921",
                       "repository":  "modules\\llm-adapter",
                       "git_status":  "M"
                   },
@@ -6516,8 +6537,8 @@
                   },
                   {
                       "relative_path":  "modules\\tooling\\packages\\tool-registry\\src\\lib.rs",
-                      "size":  176583,
-                      "sha256":  "F62FAE1A32DA368767ED086C69DAEF76598D8B44660E8DC3C5CE456E28CA1199",
+                      "size":  176503,
+                      "sha256":  "7C0D07E216361C756EDF409664E16F348C68BDFD9E8F821AE9AA2DB178B2DB77",
                       "repository":  "modules\\tooling",
                       "git_status":  "M"
                   },
@@ -6620,13 +6641,6 @@
                       "git_status":  "??"
                   },
                   {
-                      "relative_path":  "modules\\vision\\resources\\uidetr\\__pycache__\\uidetr_service.cpython-314.pyc",
-                      "size":  9223,
-                      "sha256":  "17D1152EE4752B570A21B000FB483687FCC6A1F291F580E86FC6BB0E2813F099",
-                      "repository":  "modules\\vision",
-                      "git_status":  "??"
-                  },
-                  {
                       "relative_path":  "modules\\vision\\resources\\uidetr\\README.md",
                       "size":  2335,
                       "sha256":  "86EC060B87234A35DC1C9964519C86C917D5917E15684D7CBB0730C5C85DFF78",
@@ -6663,36 +6677,36 @@
                   },
                   {
                       "relative_path":  "packages\\app-launcher\\src\\lib.rs",
-                      "size":  36021,
-                      "sha256":  "8940B996020E641C972DC90CDE1C149B9337DA86B44C42DC9AE1F381CB6921A4",
+                      "size":  44133,
+                      "sha256":  "0A98A792F5729D03F8A1D288FE738FA79BCCEDC1BB7983172B7A34CD519A37E2",
                       "repository":  ".",
                       "git_status":  "M"
                   },
                   {
                       "relative_path":  "packages\\app-launcher\\src\\main.rs",
-                      "size":  11763,
-                      "sha256":  "605D92A7A1D4855FFE51CB8FDF6109E35B2FC39A54D6EF70E8AAC3F8FE7FCA22",
+                      "size":  12580,
+                      "sha256":  "5D232EB1C9CDFDF14ADA1D967D2D35C3712C3EECA3666A5BD58C4AC2E761DDBB",
                       "repository":  ".",
                       "git_status":  "M"
                   },
                   {
                       "relative_path":  "README.md",
-                      "size":  2557,
-                      "sha256":  "7BFA3EE7A4F527FB2C96EA9C255789F3C826566F8FF4C5CC572E3DE65A8FBDC0",
+                      "size":  2651,
+                      "sha256":  "34E6B737F34EAE59A0AC26910405DF8F0216C6AF50CF324FE88B0E7686D4A896",
                       "repository":  ".",
                       "git_status":  "??"
                   },
                   {
                       "relative_path":  "scripts\\build-msi.ps1",
-                      "size":  4012,
-                      "sha256":  "D8FE084D95B3D43F9168D45A686FEA164CFC5CD2D5FAC4BCC193F49516E82605",
+                      "size":  4839,
+                      "sha256":  "78D2B0558321F8671771884AA4A02490B72156BFEF1F1FF82E285F0E584C029E",
                       "repository":  ".",
                       "git_status":  "??"
                   },
                   {
                       "relative_path":  "scripts\\clawbot-ilink-provider.mjs",
                       "size":  21393,
-                      "sha256":  "47BAC085F8975C4427A3FAFEBFB10D9E7FD1911A10009FAB4437E9980591425D",
+                      "sha256":  "32296028713027570861853485483EFDA1AB4DE482C53A4F23794CC467DC8D57",
                       "repository":  ".",
                       "git_status":  "??"
                   },
@@ -6712,22 +6726,22 @@
                   },
                   {
                       "relative_path":  "scripts\\package-all.ps1",
-                      "size":  9528,
-                      "sha256":  "695A43448AA805382D1AB534C6639B5D6E7E51ACDF6877D904104BDEA6D81557",
+                      "size":  15916,
+                      "sha256":  "58B39DF5264D7143B218D4A26CD29C5BC1CD90B61E2ED57AB541257EF4E7D613",
                       "repository":  ".",
                       "git_status":  "M"
                   },
                   {
                       "relative_path":  "scripts\\package-safety.ps1",
-                      "size":  2520,
-                      "sha256":  "B975B397AF6A955755DFDD0FA950075A665A7CF9442EFCD13E6CBECB576727CA",
+                      "size":  3790,
+                      "sha256":  "41874C078EC01F4E1226E3ABFE41EFFF456A1E69EB0D791E67234B682C686FFF",
                       "repository":  ".",
                       "git_status":  "??"
                   },
                   {
                       "relative_path":  "scripts\\project-delivery.ps1",
-                      "size":  22931,
-                      "sha256":  "41DE19BADEA9546DE0C1AE00939CA82528A640CBE8BAC60438F1E7711FA197E4",
+                      "size":  24662,
+                      "sha256":  "534F49C26DCF33AF95C29ABDDE1E7B186A43FAE2C707744FCB2FFF48603FB4F3",
                       "repository":  ".",
                       "git_status":  "??"
                   },
@@ -6755,7 +6769,7 @@
                   {
                       "relative_path":  "scripts\\test-clawbot-ilink-provider.ps1",
                       "size":  7936,
-                      "sha256":  "744871A122BAD84EB7B57C82188D8368C92F923D80F41F0E7CEDE96CBD415175",
+                      "sha256":  "88E069193383559CC0961CA34AA07B007448B3CA756B6D1A851E541EE86B4A45",
                       "repository":  ".",
                       "git_status":  "??"
                   },
@@ -6803,22 +6817,22 @@
                   },
                   {
                       "relative_path":  "scripts\\test-package-manifest.ps1",
-                      "size":  2503,
-                      "sha256":  "F8A4214D75935D5836C35B8165DEAB66BC6ED2B4B2C2F5247651548E09E96390",
+                      "size":  2978,
+                      "sha256":  "9FE27FDBBC539E0140CD3596B9E0C5DBA26663AD229AE1E139AE7A4EF310C1E5",
                       "repository":  ".",
                       "git_status":  "??"
                   },
                   {
                       "relative_path":  "scripts\\test-package-safety.ps1",
-                      "size":  3757,
-                      "sha256":  "CD87F9DB19BF1EF1FEC47B7031F6A7991B97DB19E5A5E9D83D0F68B11B697294",
+                      "size":  12438,
+                      "sha256":  "6F86877E67BDC41E29A7E86BB88A3C5C196354185390BDACB47FFC761C7ABE86",
                       "repository":  ".",
                       "git_status":  "??"
                   },
                   {
                       "relative_path":  "scripts\\test-project-delivery.ps1",
-                      "size":  6946,
-                      "sha256":  "77B4F9EA153268FC71932CB3837C45AB7A38AE7C6AAA24D0693226107E481F65",
+                      "size":  9982,
+                      "sha256":  "C5DC0CCAB06266203A923E27F34924D54F5B4355EB609951111131483077A058",
                       "repository":  ".",
                       "git_status":  "??"
                   },

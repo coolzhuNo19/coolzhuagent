@@ -11,8 +11,8 @@ pub use contracts::{
     Verification,
 };
 pub use controller::{
-    ComputerUseAdapter, ComputerUseClock, ComputerUseController, ComputerUseEventSink,
-    ComputerUsePlanner, ComputerUseRunContext, PlannerFuture,
+    ComputerUseAdapter, ComputerUseApprovalPolicy, ComputerUseClock, ComputerUseController,
+    ComputerUseEventSink, ComputerUsePlanner, ComputerUseRunContext, PlannerFuture,
 };
 pub use supervisor::{
     ActionFingerprint, BeforeRunDecision, RunBudgetGuard, TaskIdempotencyKey,

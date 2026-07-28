@@ -55,4 +55,16 @@ if ([string]$sttModels.target -ne 'bin/models') {
     throw "unexpected STT models target: $($sttModels.target)"
 }
 
+if ($resourceIds -notcontains 'documentation.user-guide') {
+    throw 'package manifest must include documentation.user-guide resource'
+}
+
+$userGuide = @($manifest.resources | Where-Object { $_.id -eq 'documentation.user-guide' })[0]
+if ([string]$userGuide.source -ne 'docs/user-guide') {
+    throw "unexpected user guide source: $($userGuide.source)"
+}
+if ([string]$userGuide.target -ne 'docs/user-guide') {
+    throw "unexpected user guide target: $($userGuide.target)"
+}
+
 Write-Output 'PASS package-manifest'

@@ -71,7 +71,7 @@ const server = http.createServer(async (req, res) => {
     if (req.headers['ilink-app-id'] !== 'bot'
         || req.headers['ilink-app-clientversion'] !== '132102'
         || body?.base_info?.channel_version !== '2.4.6'
-        || body?.base_info?.bot_agent !== 'CoolzhuAgent/0.1.0') {
+        || body?.base_info?.bot_agent !== 'CoolzhuAgent/0.2.0') {
       send(res, 400, { ret: 1, errmsg: 'official protocol headers/base_info missing' });
       return;
     }
@@ -93,7 +93,7 @@ const server = http.createServer(async (req, res) => {
     if (req.headers['ilink-app-id'] !== 'bot'
         || req.headers['ilink-app-clientversion'] !== '132102'
         || body?.base_info?.channel_version !== '2.4.6'
-        || body?.base_info?.bot_agent !== 'CoolzhuAgent/0.1.0') {
+        || body?.base_info?.bot_agent !== 'CoolzhuAgent/0.2.0') {
       send(res, 400, { ret: 1, errmsg: 'official start headers/base_info missing' });
       return;
     }

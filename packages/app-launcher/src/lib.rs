@@ -12,7 +12,7 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -20,9 +20,37 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 pub const WEB_CONSOLE_MANAGED_ENV: &str = "COOLZHU_DESKTOP_SHELL_MANAGED";
+pub const WEB_CONSOLE_RUNTIME_ENV: &str = "COOLZHU_RUNTIME_DIR";
+pub const WEB_CONSOLE_SESSION_DB_ENV: &str = "COOLZHU_WEB_SESSION_DB";
+pub const WEB_CONSOLE_SESSION_STORE_ENV: &str = "COOLZHU_WEB_SESSION_STORE";
+pub const WEB_CONSOLE_ATTACHMENT_STORE_ENV: &str = "COOLZHU_WEB_ATTACHMENT_STORE";
 
 pub fn web_console_environment() -> [(&'static str, &'static str); 1] {
     [(WEB_CONSOLE_MANAGED_ENV, "1")]
+}
+
+/// 安装启动器显式指定运行态数据目录，避免会话、附件和兼容 JSON
+/// 随安装目录/开发工作区变化。直接 `cargo run` 不经过该函数，因此开发态仍沿用工作区。
+pub fn web_console_runtime_environment(runtime_dir: &Path) -> [(OsString, OsString); 4] {
+    let state_dir = runtime_dir.join(".coolzhu");
+    [
+        (
+            OsString::from(WEB_CONSOLE_RUNTIME_ENV),
+            runtime_dir.as_os_str().to_os_string(),
+        ),
+        (
+            OsString::from(WEB_CONSOLE_SESSION_DB_ENV),
+            state_dir.join("web-sessions.sqlite3").into_os_string(),
+        ),
+        (
+            OsString::from(WEB_CONSOLE_SESSION_STORE_ENV),
+            state_dir.join("web-sessions.json").into_os_string(),
+        ),
+        (
+            OsString::from(WEB_CONSOLE_ATTACHMENT_STORE_ENV),
+            state_dir.join("attachments").into_os_string(),
+        ),
+    ]
 }
 
 /// Outcome of a single health probe.
@@ -151,6 +179,8 @@ pub struct LauncherConfig {
     pub health_url: String,
     pub health_timeout: Duration,
     pub health_poll_interval: Duration,
+    /// 安装态子进程的可写工作目录。默认从 log_dir 推导到 LocalAppData/CoolzhuAgent。
+    pub runtime_dir: PathBuf,
     pub log_dir: PathBuf,
     /// Always `<log_dir>/package-selfcheck-last.json`.
     pub selfcheck_file: PathBuf,
@@ -196,6 +226,10 @@ impl LauncherConfig {
             .and_then(|v| v.as_u64())
             .ok_or_else(|| LaunchError::ConfigInvalid("missing health_poll_interval_ms".into()))?;
         let log_dir = Self::parse_path(&value, "log_dir", config_dir, &mut env_lookup)?;
+        let runtime_dir = match value.get("runtime_dir").and_then(|v| v.as_str()) {
+            Some(raw) => resolve_config_path_text(raw, config_dir, &mut env_lookup)?,
+            None => default_runtime_dir_from_log_dir(&log_dir),
+        };
         let selfcheck_file = log_dir.join("package-selfcheck-last.json");
 
         Ok(Self {
@@ -204,6 +238,7 @@ impl LauncherConfig {
             health_url,
             health_timeout: Duration::from_secs(health_timeout_secs),
             health_poll_interval: Duration::from_millis(health_poll_interval_ms),
+            runtime_dir,
             log_dir,
             selfcheck_file,
         })
@@ -247,6 +282,28 @@ impl LauncherConfig {
             .ok_or_else(|| LaunchError::ConfigInvalid(format!("missing {key}")))?;
         resolve_config_path_text(s, config_dir, env_lookup)
     }
+}
+
+fn default_runtime_dir_from_log_dir(log_dir: &Path) -> PathBuf {
+    let is_launcher_log_dir = log_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("package-launcher"));
+    let logs_dir = log_dir.parent();
+    let is_logs_dir = logs_dir
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("logs"));
+    if is_launcher_log_dir && is_logs_dir {
+        return logs_dir
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| log_dir.to_path_buf());
+    }
+    log_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| log_dir.to_path_buf())
 }
 
 fn resolve_config_path_text(
@@ -396,6 +453,7 @@ pub trait LaunchSpawner {
     fn spawn_web_console(
         &mut self,
         spec: &ExecutableSpec,
+        runtime_dir: &Path,
         log_file: &Path,
     ) -> Result<u32, LaunchError>;
     /// Spawn the Tauri shell with the given (already pid-injected) args.
@@ -404,8 +462,11 @@ pub trait LaunchSpawner {
         &mut self,
         spec: &ExecutableSpec,
         args: &[String],
+        runtime_dir: &Path,
         log_file: &Path,
     ) -> Result<u32, LaunchError>;
+    /// 回收本次 launcher 刚拉起的进程；失败路径必须调用，避免隐藏进程占用端口。
+    fn terminate_process(&mut self, pid: u32) -> io::Result<()>;
 }
 
 /// Result of a successful bring-up.
@@ -449,10 +510,11 @@ where
         });
     }
 
+    fs::create_dir_all(&config.runtime_dir).map_err(LaunchError::Persistence)?;
     fs::create_dir_all(&config.log_dir).map_err(LaunchError::Persistence)?;
     let log_file = config.log_dir.join("web-console.stdout.log");
 
-    let web_pid = spawner.spawn_web_console(&config.web_console, &log_file)?;
+    let web_pid = spawner.spawn_web_console(&config.web_console, &config.runtime_dir, &log_file)?;
 
     if let Err(e) = poll_health(
         &config.health_url,
@@ -462,12 +524,17 @@ where
         now_fn,
         sleep_fn,
     ) {
+        let cleanup_error = spawner.terminate_process(web_pid).err();
+        let error_text = match cleanup_error {
+            Some(cleanup) => format!("{e}; web console cleanup failed: {cleanup}"),
+            None => e.to_string(),
+        };
         let payload = SelfcheckPayload {
             ok: false,
             web_console_pid: Some(web_pid),
             tauri_pid: None,
             health_url: config.health_url.clone(),
-            error: Some(e.to_string()),
+            error: Some(error_text),
             timestamp_ms,
         };
         let _ = write_selfcheck(&config.selfcheck_file, &config.log_dir, &payload);
@@ -476,15 +543,25 @@ where
 
     let tauri_args = build_tauri_args(web_pid, &config.tauri.args);
     let tauri_log_file = config.log_dir.join("tauri.stdout.log");
-    let tauri_pid = match spawner.spawn_tauri(&config.tauri, &tauri_args, &tauri_log_file) {
+    let tauri_pid = match spawner.spawn_tauri(
+        &config.tauri,
+        &tauri_args,
+        &config.runtime_dir,
+        &tauri_log_file,
+    ) {
         Ok(pid) => pid,
         Err(e) => {
+            let cleanup_error = spawner.terminate_process(web_pid).err();
+            let error_text = match cleanup_error {
+                Some(cleanup) => format!("{e}; web console cleanup failed: {cleanup}"),
+                None => e.to_string(),
+            };
             let payload = SelfcheckPayload {
                 ok: false,
                 web_console_pid: Some(web_pid),
                 tauri_pid: None,
                 health_url: config.health_url.clone(),
-                error: Some(e.to_string()),
+                error: Some(error_text),
                 timestamp_ms,
             };
             let _ = write_selfcheck(&config.selfcheck_file, &config.log_dir, &payload);
@@ -500,7 +577,11 @@ where
         error: None,
         timestamp_ms,
     };
-    write_selfcheck(&config.selfcheck_file, &config.log_dir, &payload)?;
+    if let Err(error) = write_selfcheck(&config.selfcheck_file, &config.log_dir, &payload) {
+        let _ = spawner.terminate_process(tauri_pid);
+        let _ = spawner.terminate_process(web_pid);
+        return Err(error);
+    }
 
     Ok(LaunchOutcome {
         web_console_pid: web_pid,
@@ -610,6 +691,7 @@ mod tests {
         );
         assert_eq!(cfg.health_timeout, Duration::from_secs(12));
         assert_eq!(cfg.health_poll_interval, Duration::from_millis(250));
+        assert_eq!(cfg.runtime_dir, config_dir.join("../tmp"));
         assert_eq!(cfg.log_dir, config_dir.join("../tmp/logs/package-launcher"));
         assert_eq!(
             cfg.selfcheck_file,
@@ -633,6 +715,7 @@ mod tests {
         let cfg = LauncherConfig::from_json(cfg_text, config_dir).unwrap();
         assert_eq!(cfg.web_console.path, PathBuf::from("C:/abs/web.exe"));
         assert_eq!(cfg.tauri.path, PathBuf::from("C:/abs/tauri.exe"));
+        assert_eq!(cfg.runtime_dir, PathBuf::from("C:/abs"));
         assert_eq!(cfg.log_dir, PathBuf::from("C:/abs/logs"));
     }
 
@@ -656,6 +739,10 @@ mod tests {
         assert_eq!(
             cfg.log_dir,
             PathBuf::from("C:/Users/me/AppData/Local/CoolzhuAgent/logs/package-launcher")
+        );
+        assert_eq!(
+            cfg.runtime_dir,
+            PathBuf::from("C:/Users/me/AppData/Local/CoolzhuAgent")
         );
         assert_eq!(
             cfg.selfcheck_file,
@@ -766,6 +853,46 @@ mod tests {
     }
 
     #[test]
+    fn web_console_runtime_environment_stays_under_runtime_dir() {
+        let runtime_dir = PathBuf::from(r"C:\Users\me\AppData\Local\CoolzhuAgent");
+        let vars = web_console_runtime_environment(&runtime_dir)
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            vars.get(&OsString::from(WEB_CONSOLE_RUNTIME_ENV)),
+            Some(&runtime_dir.as_os_str().to_os_string())
+        );
+        assert_eq!(
+            vars.get(&OsString::from(WEB_CONSOLE_SESSION_DB_ENV)),
+            Some(
+                &runtime_dir
+                    .join(".coolzhu")
+                    .join("web-sessions.sqlite3")
+                    .into_os_string()
+            )
+        );
+        assert_eq!(
+            vars.get(&OsString::from(WEB_CONSOLE_SESSION_STORE_ENV)),
+            Some(
+                &runtime_dir
+                    .join(".coolzhu")
+                    .join("web-sessions.json")
+                    .into_os_string()
+            )
+        );
+        assert_eq!(
+            vars.get(&OsString::from(WEB_CONSOLE_ATTACHMENT_STORE_ENV)),
+            Some(
+                &runtime_dir
+                    .join(".coolzhu")
+                    .join("attachments")
+                    .into_os_string()
+            )
+        );
+    }
+
+    #[test]
     fn writes_selfcheck_file_with_payload() {
         let tmp = temp_dir_unique("selfcheck");
         let log_dir = tmp.join("logs");
@@ -817,7 +944,11 @@ mod tests {
         web_calls: u32,
         tauri_calls: u32,
         last_tauri_args: Vec<String>,
+        last_web_runtime_dir: Option<PathBuf>,
+        last_tauri_runtime_dir: Option<PathBuf>,
         last_tauri_log: Option<PathBuf>,
+        terminated_pids: Vec<u32>,
+        fail_tauri_spawn: bool,
     }
 
     impl FakeSpawner {
@@ -828,7 +959,11 @@ mod tests {
                 web_calls: 0,
                 tauri_calls: 0,
                 last_tauri_args: Vec::new(),
+                last_web_runtime_dir: None,
+                last_tauri_runtime_dir: None,
                 last_tauri_log: None,
+                terminated_pids: Vec::new(),
+                fail_tauri_spawn: false,
             }
         }
     }
@@ -837,21 +972,35 @@ mod tests {
         fn spawn_web_console(
             &mut self,
             _spec: &ExecutableSpec,
+            runtime_dir: &Path,
             _log_file: &Path,
         ) -> Result<u32, LaunchError> {
             self.web_calls += 1;
+            self.last_web_runtime_dir = Some(runtime_dir.to_path_buf());
             Ok(self.web_pid)
         }
         fn spawn_tauri(
             &mut self,
             _spec: &ExecutableSpec,
             args: &[String],
+            runtime_dir: &Path,
             log_file: &Path,
         ) -> Result<u32, LaunchError> {
             self.tauri_calls += 1;
             self.last_tauri_args = args.to_vec();
+            self.last_tauri_runtime_dir = Some(runtime_dir.to_path_buf());
             self.last_tauri_log = Some(log_file.to_path_buf());
+            if self.fail_tauri_spawn {
+                return Err(LaunchError::TauriSpawn(io::Error::other(
+                    "injected tauri spawn failure",
+                )));
+            }
             Ok(self.tauri_pid)
+        }
+
+        fn terminate_process(&mut self, pid: u32) -> io::Result<()> {
+            self.terminated_pids.push(pid);
+            Ok(())
         }
     }
 
@@ -865,6 +1014,10 @@ mod tests {
 
     fn config_with_paths(web: PathBuf, tauri: PathBuf, log_dir: PathBuf) -> LauncherConfig {
         let selfcheck_file = log_dir.join("package-selfcheck-last.json");
+        let runtime_dir = log_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| log_dir.clone());
         LauncherConfig {
             web_console: ExecutableSpec {
                 path: web,
@@ -877,6 +1030,7 @@ mod tests {
             health_url: "http://127.0.0.1:1/health".into(),
             health_timeout: Duration::from_millis(100),
             health_poll_interval: Duration::from_millis(10),
+            runtime_dir,
             log_dir,
             selfcheck_file,
         }
@@ -957,6 +1111,15 @@ mod tests {
         assert_eq!(spawner.web_calls, 1);
         assert_eq!(spawner.tauri_calls, 1);
         assert_eq!(
+            spawner.last_web_runtime_dir.as_deref(),
+            Some(cfg.runtime_dir.as_path())
+        );
+        assert_eq!(
+            spawner.last_tauri_runtime_dir.as_deref(),
+            Some(cfg.runtime_dir.as_path())
+        );
+        assert!(spawner.terminated_pids.is_empty());
+        assert_eq!(
             spawner.last_tauri_args,
             vec![
                 "--web-console-pid=111".to_string(),
@@ -999,6 +1162,7 @@ mod tests {
         assert!(matches!(res, Err(LaunchError::HealthTimeout { .. })));
         assert_eq!(spawner.web_calls, 1);
         assert_eq!(spawner.tauri_calls, 0);
+        assert_eq!(spawner.terminated_pids, vec![555]);
 
         let v: Value =
             serde_json::from_str(&fs::read_to_string(&cfg.selfcheck_file).unwrap()).unwrap();
@@ -1007,6 +1171,54 @@ mod tests {
         assert_eq!(v["tauri_pid"], Value::Null);
         assert!(v["error"].as_str().unwrap().contains("timed out"));
         assert_eq!(v["timestamp_ms"], 7);
+    }
+
+    #[test]
+    fn launch_reclaims_web_console_when_tauri_spawn_fails() {
+        let web = touch_executable("web-tauri-fail");
+        let tauri = touch_executable("tauri-spawn-fail");
+        let log_dir = temp_dir_unique("log-tauri-spawn-fail");
+        let cfg = config_with_paths(web, tauri, log_dir);
+        let mut spawner = FakeSpawner::new(701, 702);
+        spawner.fail_tauri_spawn = true;
+        let mut probe = || ProbeOutcome::Ready;
+
+        let result = launch(
+            &cfg,
+            &mut spawner,
+            &mut probe,
+            || Duration::ZERO,
+            |_| {},
+            12,
+        );
+
+        assert!(matches!(result, Err(LaunchError::TauriSpawn(_))));
+        assert_eq!(spawner.web_calls, 1);
+        assert_eq!(spawner.tauri_calls, 1);
+        assert_eq!(spawner.terminated_pids, vec![701]);
+    }
+
+    #[test]
+    fn launch_reclaims_both_processes_when_success_selfcheck_cannot_persist() {
+        let web = touch_executable("web-selfcheck-fail");
+        let tauri = touch_executable("tauri-selfcheck-fail");
+        let log_dir = temp_dir_unique("log-selfcheck-fail");
+        let mut cfg = config_with_paths(web, tauri, log_dir.clone());
+        cfg.selfcheck_file = log_dir;
+        let mut spawner = FakeSpawner::new(801, 802);
+        let mut probe = || ProbeOutcome::Ready;
+
+        let result = launch(
+            &cfg,
+            &mut spawner,
+            &mut probe,
+            || Duration::ZERO,
+            |_| {},
+            13,
+        );
+
+        assert!(matches!(result, Err(LaunchError::Persistence(_))));
+        assert_eq!(spawner.terminated_pids, vec![802, 801]);
     }
 
     #[test]

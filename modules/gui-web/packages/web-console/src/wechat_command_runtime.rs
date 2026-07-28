@@ -203,12 +203,7 @@ mod tests {
         );
 
         let error = runtime
-            .resolve_selector(
-                "wx-main",
-                "peer-a",
-                WechatCatalogKind::Sessions,
-                "GLM5.2",
-            )
+            .resolve_selector("wx-main", "peer-a", WechatCatalogKind::Sessions, "GLM5.2")
             .expect_err("重名会话不能静默选择第一个");
 
         assert_eq!(error.code, "selector_ambiguous");

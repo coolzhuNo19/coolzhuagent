@@ -1,5 +1,5 @@
 param(
-    [string]$Version = '0.1.0',
+    [string]$Version = '0.2.0',
     [ValidateSet('debug', 'release')]
     [string]$Configuration = 'debug',
     [string]$PackageRoot = 'package',
@@ -9,22 +9,37 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $workspace = Split-Path -Parent $PSScriptRoot
-$packageRoot = (Resolve-Path -LiteralPath (Join-Path $workspace $PackageRoot)).Path
+$workspacePath = [System.IO.Path]::GetFullPath($workspace).TrimEnd('\', '/')
+$workspacePrefix = $workspacePath + [System.IO.Path]::DirectorySeparatorChar
+$packageRootCandidate = if ([System.IO.Path]::IsPathRooted($PackageRoot)) {
+    $PackageRoot
+} else {
+    Join-Path $workspace $PackageRoot
+}
+$packageRoot = [System.IO.Path]::GetFullPath($packageRootCandidate).TrimEnd('\', '/')
 $productWxs = Join-Path $workspace 'installer\Product.wxs'
 $distDir = Join-Path $workspace 'dist'
 $localDotnetExe = Join-Path $workspace 'tmp\tools\dotnet\dotnet.exe'
 $wixToolDir = Join-Path $workspace 'tmp\tools\wix'
 $wixExe = Join-Path $wixToolDir 'wix.exe'
 
+function ConvertTo-WorkspaceRelativePath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not $fullPath.StartsWith($workspacePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "installer output must stay inside workspace: $fullPath"
+    }
+    return $fullPath.Substring($workspacePrefix.Length).Replace('\', '/')
+}
+
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "MSI Version must be three-part numeric SemVer, got: $Version"
 }
 
 if (-not $SkipPackageBuild) {
-    & (Join-Path $workspace 'package.ps1') all -Configuration $Configuration
-    if ($LASTEXITCODE -ne 0) {
-        throw "package.ps1 failed with exit code $LASTEXITCODE"
-    }
+    & (Join-Path $workspace 'scripts\package-all.ps1') `
+        -Configuration $Configuration `
+        -PackageRoot $packageRoot
 }
 
 if (-not (Test-Path -LiteralPath (Join-Path $packageRoot 'COOLZHU-AGENT.exe'))) {
@@ -93,13 +108,15 @@ if ($publishedHash -ne $msiHash) {
     throw "published MSI hash mismatch: $outMsi"
 }
 $wixVersion = (& $wixExe --version | Select-Object -First 1)
+$publishedMsiRelative = ConvertTo-WorkspaceRelativePath $outMsi
+$packageSafetyReportRelative = ConvertTo-WorkspaceRelativePath $packageSafetyReport
 $installerReport = [ordered]@{
     generated_at = (Get-Date).ToUniversalTime().ToString('o')
     version = $Version
     configuration = $Configuration
-    msi = $outMsi
+    msi = $publishedMsiRelative
     sha256 = $msiHash
-    package_safety_report = $packageSafetyReport
+    package_safety_report = $packageSafetyReportRelative
     wix_version = [string]$wixVersion
     signed = $false
     signing_status = 'unsigned'

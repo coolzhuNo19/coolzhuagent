@@ -4,6 +4,7 @@ use crate::{
     ComputerUseRunState, ComputerUseStage, ComputerUseSurface, ComputerUseTerminalStatus,
     Observation, RunBudgetGuard, StepExecution, Verification,
 };
+use serde_json::Value as JsonValue;
 
 pub type PlannerFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
@@ -47,6 +48,241 @@ pub trait ComputerUseClock {
     fn now_ms(&mut self) -> u64;
 }
 
+/// 由宿主提供的动作审批策略。
+///
+/// 策略只在动作风险要求明确审批时调用。实现方应将批准绑定到当前用户、
+/// 会话和具体动作，不能直接信任模型输出的风险等级或批准声明。
+///
+/// 宿主语义分类器识别出的删除、支付、外发、授权安装、凭据等敏感动作不会
+/// 交给这一通用策略放行；它们必须由更窄、可恢复且绑定具体动作的审批流程处理。
+pub trait ComputerUseApprovalPolicy: Send + Sync {
+    fn is_action_approved(
+        &self,
+        request: &ComputerUseRequest,
+        action: &ComputerUseAction,
+        observation: &Observation,
+    ) -> bool;
+}
+
+impl<F> ComputerUseApprovalPolicy for F
+where
+    F: Fn(&ComputerUseRequest, &ComputerUseAction, &Observation) -> bool + Send + Sync,
+{
+    fn is_action_approved(
+        &self,
+        request: &ComputerUseRequest,
+        action: &ComputerUseAction,
+        observation: &Observation,
+    ) -> bool {
+        self(request, action, observation)
+    }
+}
+
+fn host_sensitive_semantic_category(
+    request: &ComputerUseRequest,
+    action: &ComputerUseAction,
+    observation: &Observation,
+) -> Option<&'static str> {
+    let mut corpus = String::new();
+    push_bounded_semantic_text(&mut corpus, &request.objective);
+    push_bounded_semantic_text(&mut corpus, &action.target);
+
+    let mut remaining_argument_strings = 32usize;
+    collect_argument_strings(
+        &action.arguments,
+        &mut corpus,
+        &mut remaining_argument_strings,
+    );
+    collect_target_node_text(&observation.state, &action.target, &mut corpus);
+
+    classify_sensitive_semantics(&corpus)
+}
+
+fn push_bounded_semantic_text(corpus: &mut String, text: &str) {
+    const MAX_CORPUS_BYTES: usize = 32 * 1024;
+    const MAX_FIELD_CHARS: usize = 2_048;
+    if corpus.len() >= MAX_CORPUS_BYTES {
+        return;
+    }
+    corpus.push(' ');
+    for character in text.chars().take(MAX_FIELD_CHARS) {
+        if corpus.len().saturating_add(character.len_utf8()) > MAX_CORPUS_BYTES {
+            break;
+        }
+        corpus.push(character);
+    }
+}
+
+fn collect_argument_strings(value: &JsonValue, corpus: &mut String, remaining: &mut usize) {
+    if *remaining == 0 {
+        return;
+    }
+    match value {
+        JsonValue::String(text) => {
+            *remaining = remaining.saturating_sub(1);
+            push_bounded_semantic_text(corpus, text);
+        }
+        JsonValue::Array(values) => {
+            for value in values {
+                collect_argument_strings(value, corpus, remaining);
+                if *remaining == 0 {
+                    break;
+                }
+            }
+        }
+        JsonValue::Object(object) => {
+            for (key, value) in object {
+                push_bounded_semantic_text(corpus, key);
+                collect_argument_strings(value, corpus, remaining);
+                if *remaining == 0 {
+                    break;
+                }
+            }
+        }
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) => {}
+    }
+}
+
+fn collect_target_node_text(state: &JsonValue, target: &str, corpus: &mut String) {
+    const REFERENCE_FIELDS: &[&str] = &["reference", "ref", "id"];
+    const VISIBLE_TEXT_FIELDS: &[&str] = &[
+        "name",
+        "label",
+        "text",
+        "title",
+        "description",
+        "accessible_name",
+        "aria_label",
+        "automation_id",
+        "control_type",
+        "role",
+        "tag",
+        "input_type",
+        "value",
+    ];
+
+    match state {
+        JsonValue::Array(values) => {
+            for value in values {
+                collect_target_node_text(value, target, corpus);
+            }
+        }
+        JsonValue::Object(object) => {
+            let target_matches = REFERENCE_FIELDS
+                .iter()
+                .any(|field| object.get(*field).and_then(JsonValue::as_str) == Some(target));
+            if target_matches {
+                for field in VISIBLE_TEXT_FIELDS {
+                    if let Some(text) = object.get(*field).and_then(JsonValue::as_str) {
+                        push_bounded_semantic_text(corpus, text);
+                    }
+                }
+                return;
+            }
+            for value in object.values() {
+                collect_target_node_text(value, target, corpus);
+            }
+        }
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => {}
+    }
+}
+
+fn classify_sensitive_semantics(corpus: &str) -> Option<&'static str> {
+    let lower = corpus.to_lowercase();
+    let ascii_tokens = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let contains_word = |words: &[&str]| words.iter().any(|word| ascii_tokens.contains(word));
+    let contains_phrase = |phrase: &[&str]| {
+        ascii_tokens
+            .windows(phrase.len())
+            .any(|window| window == phrase)
+    };
+    let contains_text = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
+
+    if contains_text(&[
+        "删除",
+        "刪除",
+        "移除",
+        "销毁",
+        "銷毀",
+        "注销账号",
+        "註銷帳號",
+    ]) || contains_word(&["delete", "remove", "erase", "destroy", "wipe"])
+    {
+        return Some("destructive_change");
+    }
+    if contains_text(&[
+        "购买", "購買", "付款", "支付", "下单", "下單", "结账", "結賬", "订阅", "訂閱", "转账",
+        "轉賬", "充值", "提现", "提現",
+    ]) || contains_word(&[
+        "buy",
+        "purchase",
+        "pay",
+        "checkout",
+        "subscribe",
+        "transfer",
+        "withdraw",
+    ]) || contains_phrase(&["place", "order"])
+    {
+        return Some("purchase_or_payment");
+    }
+    if contains_text(&[
+        "发送", "發送", "发布", "發布", "发帖", "發帖", "推送", "分享",
+    ]) || contains_word(&["send", "publish", "post", "share"])
+    {
+        return Some("external_communication");
+    }
+    if contains_text(&[
+        "授权",
+        "授權",
+        "允许访问",
+        "允許存取",
+        "安装",
+        "安裝",
+        "卸载",
+        "解除安裝",
+    ]) || contains_word(&["authorize", "install", "uninstall"])
+        || contains_phrase(&["grant", "access"])
+        || contains_phrase(&["allow", "access"])
+    {
+        return Some("authorization_or_installation");
+    }
+    if contains_text(&[
+        "密码",
+        "密碼",
+        "口令",
+        "密钥",
+        "密鑰",
+        "私钥",
+        "私鑰",
+        "助记词",
+        "助記詞",
+        "恢复码",
+        "恢復碼",
+    ]) || contains_word(&[
+        "password",
+        "passcode",
+        "credential",
+        "credentials",
+        "otp",
+        "secret",
+    ]) || contains_phrase(&["api", "key"])
+        || contains_phrase(&["private", "key"])
+        || contains_phrase(&["secret", "key"])
+        || contains_phrase(&["access", "key"])
+        || contains_phrase(&["api", "token"])
+        || contains_phrase(&["access", "token"])
+        || contains_phrase(&["auth", "token"])
+        || contains_phrase(&["recovery", "code"])
+        || contains_phrase(&["seed", "phrase"])
+    {
+        return Some("credential_or_secret");
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputerUseRunContext {
     pub call_id: String,
@@ -59,6 +295,7 @@ pub struct ComputerUseController<P, A, E, C> {
     events: E,
     clock: C,
     budgets: ComputerUseBudgets,
+    approval_policy: Option<Box<dyn ComputerUseApprovalPolicy>>,
 }
 
 impl<P, A, E, C> ComputerUseController<P, A, E, C>
@@ -76,7 +313,18 @@ where
             events,
             clock,
             budgets,
+            approval_policy: None,
         }
+    }
+
+    /// 设置宿主审批策略。未设置时，所有需要明确审批的动作都会在输入前阻断。
+    #[must_use]
+    pub fn with_approval_policy<T>(mut self, approval_policy: T) -> Self
+    where
+        T: ComputerUseApprovalPolicy + 'static,
+    {
+        self.approval_policy = Some(Box::new(approval_policy));
+        self
     }
 
     #[must_use]
@@ -273,6 +521,50 @@ where
                     evidence,
                     guard.snapshot(),
                 );
+            }
+
+            let semantic_risk = host_sensitive_semantic_category(request, &action, &observation);
+            if action.risk.requires_explicit_approval() || semantic_risk.is_some() {
+                self.events
+                    .state_changed(ComputerUseRunState::AwaitingApproval);
+                // full-access 等通用授权只能批准风险等级本身要求审批的普通动作。
+                // 宿主从目标节点/参数/意图识别出的敏感语义不能被通用策略覆盖，
+                // 防止模型把“删除/支付/发送”等动作伪装成 ReversibleLocal 绕过看护。
+                let approved = semantic_risk.is_none()
+                    && self.approval_policy.as_ref().is_some_and(|policy| {
+                        policy.is_action_approved(request, &action, &observation)
+                    });
+                if !approved {
+                    return self.terminal(
+                        &context,
+                        surface,
+                        ComputerUseStage::Approval,
+                        ComputerUseError::blocked(
+                            "approval_required",
+                            semantic_risk.map_or_else(
+                                || {
+                                    format!(
+                                        "action {:?} with risk {:?} requires explicit host approval",
+                                        action.kind, action.risk
+                                    )
+                                },
+                                |category| {
+                                    format!(
+                                        "action {:?} matches host-sensitive category {category} \
+                                         and requires explicit host approval",
+                                        action.kind
+                                    )
+                                },
+                            ),
+                            ComputerUseRetryOwner::User,
+                        ),
+                        attempts,
+                        steps_completed,
+                        evidence,
+                        guard.snapshot(),
+                    );
+                }
+                self.events.state_changed(ComputerUseRunState::PolicyCheck);
             }
 
             let arguments = serde_json::to_string(&action.arguments).unwrap_or_default();
@@ -615,20 +907,34 @@ mod tests {
         .unwrap()
     }
 
+    fn request_with_objective(objective: &str) -> ComputerUseRequest {
+        let mut request = request();
+        request.objective = objective.into();
+        request
+    }
+
     fn observation(generation: u64, state: &str) -> Observation {
+        observation_with_state(generation, json!({ "state": state }))
+    }
+
+    fn observation_with_state(generation: u64, state: JsonValue) -> Observation {
         Observation {
             generation,
             surface: ComputerUseSurface::Browser,
             surface_identity: "tab-1".into(),
-            state: json!({ "state": state }),
-            evidence: vec![state.into()],
+            state,
+            evidence: vec![format!("generation-{generation}")],
         }
     }
 
     fn click() -> ComputerUseAction {
+        click_target("submit")
+    }
+
+    fn click_target(target: &str) -> ComputerUseAction {
         ComputerUseAction {
             kind: ComputerUseActionKind::Click,
-            target: "submit".into(),
+            target: target.into(),
             arguments: json!({}),
             risk: ComputerUseRiskClass::ReversibleLocal,
         }
@@ -641,6 +947,10 @@ mod tests {
             arguments: json!({ "to": 80 }),
             risk: ComputerUseRiskClass::ReversibleLocal,
         }
+    }
+
+    fn action_with_risk(risk: ComputerUseRiskClass) -> ComputerUseAction {
+        ComputerUseAction { risk, ..click() }
     }
 
     fn execution(summary: &str) -> StepExecution {
@@ -767,6 +1077,278 @@ mod tests {
         assert_eq!(result.stage, ComputerUseStage::PolicyCheck);
         assert_eq!(result.error.as_ref().unwrap().code, "unsupported_action");
         assert_eq!(controller.adapter().action_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn risky_actions_without_host_approval_are_blocked_before_input() {
+        for risk in [
+            ComputerUseRiskClass::Stateful,
+            ComputerUseRiskClass::Sensitive,
+            ComputerUseRiskClass::ForbiddenOrAmbiguous,
+        ] {
+            let planner = FakePlanner {
+                surface: ComputerUseSurface::Browser,
+                actions: Mutex::new(vec![Ok(Some(action_with_risk(risk)))].into()),
+            };
+            let adapter = adapter(
+                vec![Ok(observation(1, "before"))],
+                vec![Ok(verification(false, false, "not yet"))],
+            );
+            let mut controller = ComputerUseController::new(
+                planner,
+                adapter,
+                RecordingEvents::default(),
+                TickClock::default(),
+                crate::ComputerUseBudgets::default(),
+            );
+
+            let result = controller.run(&request(), context()).await;
+
+            assert_eq!(result.status, ComputerUseTerminalStatus::Blocked);
+            assert_eq!(result.stage, ComputerUseStage::Approval);
+            assert_eq!(result.error.as_ref().unwrap().code, "approval_required");
+            assert_eq!(
+                result.error.as_ref().unwrap().retry_owner,
+                ComputerUseRetryOwner::User
+            );
+            assert_eq!(controller.adapter().action_count.load(Ordering::SeqCst), 0);
+            assert!(controller
+                .event_sink()
+                .0
+                .contains(&ComputerUseRunState::AwaitingApproval));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_host_approval_allows_the_exact_risky_action_to_execute() {
+        let planner = FakePlanner {
+            surface: ComputerUseSurface::Browser,
+            actions: Mutex::new(
+                vec![Ok(Some(action_with_risk(ComputerUseRiskClass::Stateful)))].into(),
+            ),
+        };
+        let adapter = adapter(
+            vec![Ok(observation(1, "before")), Ok(observation(2, "success"))],
+            vec![
+                Ok(verification(false, false, "not yet")),
+                Ok(verification(true, true, "success visible")),
+            ],
+        );
+        let mut controller = ComputerUseController::new(
+            planner,
+            adapter,
+            RecordingEvents::default(),
+            TickClock::default(),
+            crate::ComputerUseBudgets::default(),
+        )
+        .with_approval_policy(
+            |_request: &ComputerUseRequest,
+             action: &ComputerUseAction,
+             observation: &Observation| {
+                action.kind == ComputerUseActionKind::Click
+                    && action.target == "submit"
+                    && action.risk == ComputerUseRiskClass::Stateful
+                    && observation.surface_identity == "tab-1"
+                    && observation.generation == 1
+            },
+        );
+
+        let result = controller.run(&request(), context()).await;
+
+        assert_eq!(result.status, ComputerUseTerminalStatus::Succeeded);
+        assert_eq!(controller.adapter().action_count.load(Ordering::SeqCst), 1);
+        assert!(controller
+            .event_sink()
+            .0
+            .contains(&ComputerUseRunState::AwaitingApproval));
+    }
+
+    #[tokio::test]
+    async fn host_semantics_cannot_be_bypassed_by_a_broad_approval_policy() {
+        let cases = vec![
+            (
+                "target_node_delete",
+                request_with_objective("管理项目列表"),
+                click_target("dom-7"),
+                observation_with_state(
+                    1,
+                    json!({
+                        "page": {
+                            "nodes": [{
+                                "reference": "dom-7",
+                                "role": "button",
+                                "name": "永久删除项目"
+                            }]
+                        }
+                    }),
+                ),
+                "destructive_change",
+            ),
+            (
+                "objective_purchase",
+                request_with_objective("购买当前商品"),
+                click_target("dom-8"),
+                observation_with_state(
+                    1,
+                    json!({
+                        "page": {
+                            "nodes": [{
+                                "reference": "dom-8",
+                                "role": "button",
+                                "name": "继续"
+                            }]
+                        }
+                    }),
+                ),
+                "purchase_or_payment",
+            ),
+            (
+                "action_target_send",
+                request_with_objective("完成消息操作"),
+                click_target("send-message"),
+                observation_with_state(
+                    1,
+                    json!({
+                        "page": {
+                            "nodes": [{
+                                "reference": "send-message",
+                                "role": "button",
+                                "name": "继续"
+                            }]
+                        }
+                    }),
+                ),
+                "external_communication",
+            ),
+        ];
+
+        for (name, request, action, before, expected_category) in cases {
+            assert_eq!(action.risk, ComputerUseRiskClass::ReversibleLocal);
+            let planner = FakePlanner {
+                surface: ComputerUseSurface::Browser,
+                actions: Mutex::new(vec![Ok(Some(action))].into()),
+            };
+            let adapter = adapter(
+                vec![Ok(before)],
+                vec![Ok(verification(false, false, "not yet"))],
+            );
+            let mut controller = ComputerUseController::new(
+                planner,
+                adapter,
+                RecordingEvents::default(),
+                TickClock::default(),
+                crate::ComputerUseBudgets::default(),
+            )
+            .with_approval_policy(
+                |_request: &ComputerUseRequest,
+                 _action: &ComputerUseAction,
+                 _observation: &Observation| true,
+            );
+
+            let result = controller.run(&request, context()).await;
+
+            assert_eq!(result.status, ComputerUseTerminalStatus::Blocked, "{name}");
+            assert_eq!(result.stage, ComputerUseStage::Approval, "{name}");
+            assert_eq!(
+                result.error.as_ref().map(|error| error.code.as_str()),
+                Some("approval_required"),
+                "{name}"
+            );
+            assert!(result.summary.contains(expected_category), "{name}");
+            assert_eq!(
+                controller.adapter().action_count.load(Ordering::SeqCst),
+                0,
+                "{name}"
+            );
+            assert!(
+                controller
+                    .event_sink()
+                    .0
+                    .contains(&ComputerUseRunState::AwaitingApproval),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_harmless_click_is_not_falsely_blocked_by_host_semantics() {
+        let request = request_with_objective("展开帮助详情");
+        let planner = FakePlanner {
+            surface: ComputerUseSurface::Browser,
+            actions: Mutex::new(vec![Ok(Some(click_target("dom-42")))].into()),
+        };
+        let adapter = adapter(
+            vec![
+                Ok(observation_with_state(
+                    1,
+                    json!({
+                        "page": {
+                            "nodes": [{
+                                "reference": "dom-42",
+                                "role": "button",
+                                "name": "查看详情"
+                            }]
+                        }
+                    }),
+                )),
+                Ok(observation_with_state(
+                    2,
+                    json!({
+                        "page": {
+                            "nodes": [{
+                                "reference": "dom-42",
+                                "role": "button",
+                                "name": "收起详情"
+                            }]
+                        }
+                    }),
+                )),
+            ],
+            vec![
+                Ok(verification(false, false, "not yet")),
+                Ok(verification(true, true, "details visible")),
+            ],
+        );
+        let mut controller = ComputerUseController::new(
+            planner,
+            adapter,
+            RecordingEvents::default(),
+            TickClock::default(),
+            crate::ComputerUseBudgets::default(),
+        );
+
+        let result = controller.run(&request, context()).await;
+
+        assert_eq!(result.status, ComputerUseTerminalStatus::Succeeded);
+        assert_eq!(controller.adapter().action_count.load(Ordering::SeqCst), 1);
+        assert!(!controller
+            .event_sink()
+            .0
+            .contains(&ComputerUseRunState::AwaitingApproval));
+    }
+
+    #[test]
+    fn host_semantic_classifier_covers_arguments_authorization_install_and_secrets() {
+        for (corpus, expected) in [
+            ("grant access", "authorization_or_installation"),
+            ("安装浏览器扩展", "authorization_or_installation"),
+            ("输入 API key", "credential_or_secret"),
+            ("password field", "credential_or_secret"),
+        ] {
+            assert_eq!(classify_sensitive_semantics(corpus), Some(expected));
+        }
+
+        let request = request_with_objective("完成下一步");
+        let mut action = click_target("dom-9");
+        action.arguments = json!({"confirmation_label": "授权安装"});
+        assert_eq!(
+            host_sensitive_semantic_category(
+                &request,
+                &action,
+                &observation_with_state(1, json!({"page":{"nodes":[]}}))
+            ),
+            Some("authorization_or_installation")
+        );
     }
 
     #[tokio::test]

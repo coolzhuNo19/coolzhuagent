@@ -33,16 +33,6 @@
       }
     },
     {
-      "id": "gui-desktop.desktop-console",
-      "source": "modules/gui-desktop/target/{profile}/coolzhu-desktop-console.exe",
-      "target": "bin/coolzhu-desktop-console.exe",
-      "build": {
-        "command": "cargo",
-        "args": ["build", "-p", "coolzhu-desktop-console", "--bin", "coolzhu-desktop-console", "--offline", "--target-dir", "modules/gui-desktop/target"],
-        "working_dir": "."
-      }
-    },
-    {
       "id": "cli.command-line",
       "source": "modules/cli/target/{profile}/coolzhu-cli.exe",
       "target": "bin/coolzhu-cli.exe",
@@ -161,6 +151,11 @@
       "source": "modules/gui-desktop/packages/tauri-shell/ui",
       "target": "modules/gui-desktop/packages/tauri-shell/ui",
       "optional": true
+    },
+    {
+      "id": "documentation.user-guide",
+      "source": "docs/user-guide",
+      "target": "docs/user-guide"
     }
   ]
 }

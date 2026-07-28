@@ -96,6 +96,72 @@ mod resolver_contract_tests {
         );
     }
 
+    /// 锁定线上真实 base_url 常量：多数常量自带版本段（/v1、/v2、/v3、/v4），
+    /// resolver 只能补终端路径；仅当 base_url 是裸主机时才注入 v1/。
+    #[test]
+    fn resolver_appends_version_segment_at_most_once_for_shipped_base_urls() {
+        use crate::providers::openai_compat::{
+            DEFAULT_ALIBABA_BASE_URL, DEFAULT_BAIDU_BASE_URL, DEFAULT_BYTEDANCE_BASE_URL,
+            DEFAULT_CUSTOM_BASE_URL, DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_OPENAI_BASE_URL,
+            DEFAULT_XAI_BASE_URL, DEFAULT_ZHIPU_BASE_URL,
+        };
+
+        let cases = [
+            (DEFAULT_XAI_BASE_URL, "https://api.x.ai/v1/chat/completions"),
+            (
+                DEFAULT_OPENAI_BASE_URL,
+                "https://api.openai.com/v1/chat/completions",
+            ),
+            (
+                DEFAULT_ZHIPU_BASE_URL,
+                "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            ),
+            (
+                DEFAULT_ALIBABA_BASE_URL,
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            ),
+            (
+                DEFAULT_BAIDU_BASE_URL,
+                "https://qianfan.baidubce.com/v2/chat/completions",
+            ),
+            (
+                DEFAULT_BYTEDANCE_BASE_URL,
+                "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+            ),
+            // 裸主机：resolver 补上 OpenAI 标准的 /v1 挂载点
+            (
+                DEFAULT_DEEPSEEK_BASE_URL,
+                "https://api.deepseek.com/v1/chat/completions",
+            ),
+            (
+                DEFAULT_CUSTOM_BASE_URL,
+                "http://127.0.0.1:11434/v1/chat/completions",
+            ),
+        ];
+
+        for (base_url, expected) in cases {
+            let resolved =
+                EndpointResolver::resolve(base_url, ProviderProtocol::OpenAiChatCompletions, None)
+                    .expect("shipped base url should resolve");
+            assert_eq!(resolved, expected, "base_url={base_url}");
+            assert!(
+                !resolved.contains("/v1/v1"),
+                "版本段重复拼接 base_url={base_url}: {resolved}"
+            );
+            // 已解析出的完整 endpoint 再次解析必须幂等
+            assert_eq!(
+                EndpointResolver::resolve(
+                    &resolved,
+                    ProviderProtocol::OpenAiChatCompletions,
+                    None
+                )
+                .expect("resolved endpoint should be stable"),
+                resolved,
+                "重复解析不幂等 base_url={base_url}"
+            );
+        }
+    }
+
     #[test]
     fn resolver_deduplicates_media_endpoints_and_rejects_unsupported_capability() {
         assert_eq!(

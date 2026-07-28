@@ -171,6 +171,78 @@ if (!globalThis.__coolzhuBrowserBridgeInstalled) {
     selection.addRange(range);
   }
 
+  function associatedForm(target) {
+    if (target instanceof HTMLFormElement) return target;
+    if (target.form instanceof HTMLFormElement) return target.form;
+    const closest = target.closest?.("form");
+    return closest instanceof HTMLFormElement ? closest : null;
+  }
+
+  function submitterFor(form, target) {
+    if (
+      (target instanceof HTMLButtonElement && String(target.type || "submit").toLowerCase() === "submit")
+      || (target instanceof HTMLInputElement && ["submit", "image"].includes(target.type.toLowerCase()))
+    ) {
+      return target;
+    }
+    return form.querySelector(
+      "button[type='submit']:not([disabled]),button:not([type]):not([disabled]),input[type='submit']:not([disabled]),input[type='image']:not([disabled])",
+    );
+  }
+
+  function performEnterSemanticFallback(target, keys, keydownAccepted, submitObserved) {
+    if (!keydownAccepted || submitObserved) return "page_handled";
+    if (keys.some((key) => ["ctrl", "shift", "alt"].includes(key))) return "modified_enter";
+    if (target instanceof HTMLTextAreaElement || target.isContentEditable) return "multiline_no_submit";
+
+    const form = associatedForm(target);
+    const inputType = target instanceof HTMLInputElement ? target.type.toLowerCase() : "";
+    const isSubmitControl = (target instanceof HTMLButtonElement
+      && String(target.type || "submit").toLowerCase() === "submit")
+      || (target instanceof HTMLInputElement && ["submit", "image"].includes(inputType));
+    if (isSubmitControl && form) {
+      if (typeof form.requestSubmit === "function") {
+        form.requestSubmit(target);
+        return "form_request_submit";
+      }
+      target.click();
+      return "submitter_click";
+    }
+
+    const isExplicitButton = target instanceof HTMLButtonElement
+      || (target instanceof HTMLInputElement && ["button", "reset"].includes(inputType))
+      || String(target.getAttribute("role") || "").toLowerCase() === "button";
+    if (isExplicitButton && typeof target.click === "function") {
+      target.click();
+      return "target_click";
+    }
+
+    const implicitSubmitInputTypes = new Set([
+      "text", "search", "tel", "url", "email", "date", "month", "week",
+      "time", "datetime-local", "number",
+    ]);
+    const canImplicitlySubmit = target instanceof HTMLFormElement
+      || (target instanceof HTMLInputElement && implicitSubmitInputTypes.has(inputType));
+    if (form && canImplicitlySubmit) {
+      const submitter = submitterFor(form, target);
+      if (typeof form.requestSubmit === "function") {
+        form.requestSubmit(submitter || undefined);
+        return "form_request_submit";
+      }
+      if (submitter && typeof submitter.click === "function") {
+        submitter.click();
+        return "submitter_click";
+      }
+      return "form_submit_unavailable";
+    }
+
+    if (isSubmitControl && typeof target.click === "function") {
+      target.click();
+      return "target_click";
+    }
+    return "synthetic_key_only";
+  }
+
   function performKeyCombination(target, rawKeys) {
     const keys = normalizedKeys(rawKeys);
     const allowed = new Set(["ctrl", "shift", "alt", "enter", "escape", "tab", "home", "end", "a", "c", "v", "x", "z", "y"]);
@@ -182,20 +254,28 @@ if (!globalThis.__coolzhuBrowserBridgeInstalled) {
     for (const modifier of keys.filter((key) => ["ctrl", "shift", "alt"].includes(key))) {
       target.dispatchEvent(new KeyboardEvent("keydown", keyInit(keys, modifier)));
     }
-    target.dispatchEvent(new KeyboardEvent("keydown", keyInit(keys, primary)));
+    const relatedForm = primary === "enter" ? associatedForm(target) : null;
+    let submitObserved = false;
+    const markSubmit = () => { submitObserved = true; };
+    relatedForm?.addEventListener("submit", markSubmit, { capture: true, once: true });
+    const keydownAccepted = target.dispatchEvent(new KeyboardEvent("keydown", keyInit(keys, primary)));
+    relatedForm?.removeEventListener("submit", markSubmit, { capture: true });
+    let semantic = "synthetic_key";
     if (keys.includes("ctrl") && primary === "a") {
       if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) target.select();
       else if (target.isContentEditable) selectContentEditable(target);
+      semantic = "select_all";
     } else if (primary === "enter") {
-      const form = target instanceof HTMLFormElement ? target : target.closest("form");
-      if (form) form.requestSubmit();
+      semantic = performEnterSemanticFallback(target, keys, keydownAccepted, submitObserved);
     } else if (primary === "escape") {
       target.blur();
+      semantic = "blur";
     }
     target.dispatchEvent(new KeyboardEvent("keyup", keyInit(keys, primary)));
     for (const modifier of keys.filter((key) => ["ctrl", "shift", "alt"].includes(key)).reverse()) {
       target.dispatchEvent(new KeyboardEvent("keyup", keyInit(keys, modifier)));
     }
+    return semantic;
   }
 
   function snapshot(requestId) {
@@ -244,6 +324,7 @@ if (!globalThis.__coolzhuBrowserBridgeInstalled) {
     if (!visible(target) || target.disabled) return fail(requestId, "target_unavailable", "DOM target is hidden or disabled");
     const inputType = target instanceof HTMLInputElement ? target.type.toLowerCase() : "";
     if (inputType === "password" || inputType === "file") return fail(requestId, "sensitive_target_blocked", "password and file inputs are blocked");
+    let actionEvidence = "";
     switch (action.action) {
       case "click":
         target.click();
@@ -294,7 +375,7 @@ if (!globalThis.__coolzhuBrowserBridgeInstalled) {
         break;
       case "key_combination":
         try {
-          performKeyCombination(target, action.keys);
+          actionEvidence = `:semantic=${performKeyCombination(target, action.keys)}`;
         } catch (error) {
           return fail(requestId, String(error?.message || "key_combination_failed"), "key combination failed");
         }
@@ -312,7 +393,7 @@ if (!globalThis.__coolzhuBrowserBridgeInstalled) {
         return fail(requestId, "unsupported_action", "action is not allowlisted in the content bridge");
     }
     revision += 1;
-    return { request_id: requestId, ok: true, document_id: documentId, url: location.href, title: document.title, dom_revision: revision, evidence: `dom_action:${action.action}:${action.target}` };
+    return { request_id: requestId, ok: true, document_id: documentId, url: location.href, title: document.title, dom_revision: revision, evidence: `dom_action:${action.action}:${action.target}${actionEvidence}` };
   }
 
   chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {

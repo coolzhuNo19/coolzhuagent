@@ -5,9 +5,15 @@
   const DEFAULT_FRAME_MS = 20;
   const DEFAULT_RECONNECT_BUFFER_MS = 8000;
   const DEFAULT_BARGE_IN_BUFFER_MS = 1500;
+  const DEFAULT_MAX_RECONNECT_ATTEMPTS = 5;
   const VIRTUAL_MICROPHONE_LABELS = [
     "steam streaming microphone",
     "virtual desktop audio",
+    "cable output",
+    "vb-audio",
+    "obs virtual",
+    "stereo mix",
+    "立体声混音",
   ];
 
   const frameSamples = (sampleRate, frameMs) =>
@@ -43,6 +49,63 @@
     const normalized = String(label || "").trim().toLowerCase();
     return Boolean(normalized)
       && !VIRTUAL_MICROPHONE_LABELS.some((blocked) => normalized.includes(blocked));
+  }
+
+  function stopStreamTracks(stream) {
+    stream?.getTracks?.().forEach((track) => {
+      try {
+        track.stop();
+      } catch {
+        // 轨道可能已由浏览器回收。
+      }
+    });
+  }
+
+  async function listMicrophones() {
+    if (!globalThis.navigator?.mediaDevices?.enumerateDevices) return [];
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices
+      .filter((device) => device.kind === "audioinput")
+      .filter((device) =>
+        device.deviceId === "default"
+        || !String(device.label || "").trim()
+        || isPhysicalMicrophoneLabel(device.label))
+      .map((device) => ({
+        deviceId: device.deviceId,
+        groupId: device.groupId,
+        label: device.label || (device.deviceId === "default" ? "系统默认麦克风" : "未命名麦克风"),
+      }));
+  }
+
+  class ReconnectGuard {
+    constructor(maxAttempts = DEFAULT_MAX_RECONNECT_ATTEMPTS) {
+      this.maxAttempts = Math.max(0, Number(maxAttempts) || 0);
+      this.consecutiveAttempts = 0;
+    }
+
+    ready() {
+      this.consecutiveAttempts = 0;
+    }
+
+    next({ retryable = true } = {}) {
+      if (retryable === false) {
+        return { retry: false, reason: "non_retryable", attempt: this.consecutiveAttempts };
+      }
+      this.consecutiveAttempts += 1;
+      if (this.consecutiveAttempts > this.maxAttempts) {
+        return {
+          retry: false,
+          reason: "retry_limit_reached",
+          attempt: this.consecutiveAttempts,
+        };
+      }
+      return {
+        retry: true,
+        reason: "retryable",
+        attempt: this.consecutiveAttempts,
+        delayMs: Math.min(2000, 250 * this.consecutiveAttempts),
+      };
+    }
   }
 
   function pcm16FromFloat32(samples) {
@@ -97,12 +160,20 @@ registerProcessor("coolzhu-pcm-capture", CoolzhuPcmCaptureProcessor);
 
   async function selectMicrophone(requestedDeviceId, requirePhysical) {
     const permissionStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const microphones = devices.filter((device) => device.kind === "audioinput");
-    const selected = requestedDeviceId
+    let microphones = [];
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      microphones = devices.filter((device) => device.kind === "audioinput");
+    } finally {
+      stopStreamTracks(permissionStream);
+    }
+    const requested = requestedDeviceId
       ? microphones.find((device) => device.deviceId === requestedDeviceId)
-      : microphones.find((device) => isPhysicalMicrophoneLabel(device.label)) || microphones[0];
-    permissionStream.getTracks().forEach((track) => track.stop());
+      : null;
+    const selected = requested
+      || microphones.find((device) => device.deviceId === "default")
+      || microphones.find((device) => isPhysicalMicrophoneLabel(device.label))
+      || microphones[0];
     if (!selected) throw new Error("physical_microphone_not_found");
     if (requirePhysical && !isPhysicalMicrophoneLabel(selected.label)) {
       throw new Error(`virtual_microphone_rejected:${selected.label || selected.deviceId}`);
@@ -115,13 +186,21 @@ registerProcessor("coolzhu-pcm-capture", CoolzhuPcmCaptureProcessor);
       audio: { deviceId: { exact: selected.deviceId } },
     });
     if (typeof MediaRecorder !== "function") {
-      stream.getTracks().forEach((track) => track.stop());
+      stopStreamTracks(stream);
       throw new Error("audio_worklet_and_mediarecorder_unavailable");
     }
     const recorder = new MediaRecorder(stream);
+    const recordedChunks = [];
+    stats.mode = "mediarecorder_degraded";
     recorder.addEventListener("dataavailable", (event) => {
-      if (event.data?.size && typeof options.onSegment === "function") {
-        options.onSegment(event.data, { finalSegment: false, mode: "mediarecorder_degraded" });
+      if (event.data?.size) {
+        recordedChunks.push(event.data);
+        if (typeof options.onSegment === "function") {
+          options.onSegment(event.data, {
+            finalSegment: false,
+            mode: "mediarecorder_degraded",
+          });
+        }
       }
     });
     recorder.start(250);
@@ -129,9 +208,29 @@ registerProcessor("coolzhu-pcm-capture", CoolzhuPcmCaptureProcessor);
       mode: "mediarecorder_degraded",
       selectedDevice: { deviceId: selected.deviceId, label: selected.label },
       stats,
-      stop() {
-        if (recorder.state !== "inactive") recorder.stop();
-        stream.getTracks().forEach((track) => track.stop());
+      async stop() {
+        if (recorder.state !== "inactive") {
+          await new Promise((resolve) => {
+            const timeout = setTimeout(resolve, 1000);
+            recorder.addEventListener("stop", () => {
+              clearTimeout(timeout);
+              resolve();
+            }, { once: true });
+            try {
+              recorder.stop();
+            } catch {
+              clearTimeout(timeout);
+              resolve();
+            }
+          });
+        }
+        if (recordedChunks.length && typeof options.onSegment === "function") {
+          await options.onSegment(
+            new Blob(recordedChunks, { type: recorder.mimeType || recordedChunks[0]?.type }),
+            { finalSegment: true, mode: "mediarecorder_degraded" },
+          );
+        }
+        stopStreamTracks(stream);
       },
       bargeInFrames() { return []; },
     };
@@ -179,28 +278,63 @@ registerProcessor("coolzhu-pcm-capture", CoolzhuPcmCaptureProcessor);
     stats.autoGainControl = trackSettings.autoGainControl === true;
     const context = new AudioContext();
     const sourceUrl = URL.createObjectURL(new Blob([workletSource()], { type: "application/javascript" }));
-    await context.audioWorklet.addModule(sourceUrl);
-    URL.revokeObjectURL(sourceUrl);
+    try {
+      await context.audioWorklet.addModule(sourceUrl);
+    } catch (error) {
+      stopStreamTracks(stream);
+      await context.close().catch(() => {});
+      throw error;
+    } finally {
+      URL.revokeObjectURL(sourceUrl);
+    }
 
     const reconnectBuffer = new FrameRingBuffer(Math.ceil(reconnectBufferMs / frameMs));
     const bargeInBuffer = new FrameRingBuffer(Math.ceil(DEFAULT_BARGE_IN_BUFFER_MS / frameMs));
-    const source = context.createMediaStreamSource(stream);
-    const node = new AudioWorkletNode(context, "coolzhu-pcm-capture", {
-      numberOfInputs: 1,
-      numberOfOutputs: 0,
-      channelCount: 1,
-      processorOptions: {
-        targetRate: TARGET_SAMPLE_RATE,
-        frameSize: frameSamples(TARGET_SAMPLE_RATE, frameMs),
-      },
-    });
-    source.connect(node);
+    let source;
+    let node;
+    try {
+      source = context.createMediaStreamSource(stream);
+      node = new AudioWorkletNode(context, "coolzhu-pcm-capture", {
+        numberOfInputs: 1,
+        numberOfOutputs: 0,
+        channelCount: 1,
+        processorOptions: {
+          targetRate: TARGET_SAMPLE_RATE,
+          frameSize: frameSamples(TARGET_SAMPLE_RATE, frameMs),
+        },
+      });
+      source.connect(node);
+    } catch (error) {
+      try {
+        source?.disconnect();
+      } catch {
+        // 初始化未完成时允许静默清理。
+      }
+      stopStreamTracks(stream);
+      await context.close().catch(() => {});
+      throw error;
+    }
 
     let stopped = false;
+    let transportStopped = false;
+    let degradedRecorder = null;
+    let degradedRecordedChunks = [];
     let sequence = 0;
     let socket = null;
     let reconnectTimer = null;
+    let lastStreamError = null;
     const endpoint = options.endpoint || "/api/audio/realtime/stream";
+    const reconnectGuard = new ReconnectGuard(
+      options.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS,
+    );
+    const controller = {
+      mode: "audio_worklet_pcm",
+      sessionId,
+      selectedDevice: { deviceId: selected.deviceId, label: selected.label },
+      stats,
+      bargeInFrames() { return bargeInBuffer.snapshot(); },
+      stop: async () => {},
+    };
 
     const emitStats = () => {
       stats.droppedFrames = reconnectBuffer.dropped;
@@ -215,10 +349,101 @@ registerProcessor("coolzhu-pcm-capture", CoolzhuPcmCaptureProcessor);
       }
     };
 
+    const stopPcmTransport = async ({ notifyProvider = false } = {}) => {
+      if (transportStopped) return;
+      transportStopped = true;
+      clearTimeout(reconnectTimer);
+      if (notifyProvider && socket?.readyState === WebSocket.OPEN) {
+        try {
+          socket.send(JSON.stringify({ type: "stop", session_id: sessionId }));
+        } catch {
+          // WebSocket 可能在发送前已关闭。
+        }
+      }
+      try {
+        socket?.close();
+      } catch {
+        // ignore close failures
+      }
+      socket = null;
+      try {
+        node?.port?.removeEventListener("message", handleWorkletMessage);
+        node?.disconnect();
+      } catch {
+        // ignore disconnected worklet
+      }
+      try {
+        source?.disconnect();
+      } catch {
+        // ignore disconnected source
+      }
+      await context.close().catch(() => {});
+    };
+
+    const degradeToMediaRecorder = async (reason) => {
+      if (stopped || degradedRecorder) return;
+      await stopPcmTransport();
+      if (stopped) {
+        stopStreamTracks(stream);
+        return;
+      }
+      if (typeof MediaRecorder !== "function") {
+        stopStreamTracks(stream);
+        if (typeof options.onFatal === "function") {
+          options.onFatal({ ...reason, code: reason?.code || "mediarecorder_unavailable" });
+        }
+        return;
+      }
+      stats.mode = "mediarecorder_degraded";
+      controller.mode = "mediarecorder_degraded";
+      try {
+        degradedRecorder = new MediaRecorder(stream);
+        degradedRecorder.addEventListener("dataavailable", (event) => {
+          if (event.data?.size) {
+            degradedRecordedChunks.push(event.data);
+            if (typeof options.onSegment === "function") {
+              options.onSegment(event.data, {
+                finalSegment: false,
+                mode: "mediarecorder_degraded",
+              });
+            }
+          }
+        });
+        degradedRecorder.start(250);
+      } catch (error) {
+        degradedRecorder = null;
+        stopStreamTracks(stream);
+        if (typeof options.onFatal === "function") {
+          options.onFatal({
+            ...reason,
+            code: "mediarecorder_degrade_failed",
+            message: error?.message || String(error),
+            retryable: false,
+          });
+        }
+        return;
+      }
+      emitStats();
+      if (typeof options.onDegraded === "function") {
+        options.onDegraded({
+          ...reason,
+          mode: "mediarecorder_degraded",
+          selectedDevice: controller.selectedDevice,
+        });
+      }
+    };
+
+    const openCircuit = (reason) => {
+      if (stopped || transportStopped) return;
+      lastStreamError = reason;
+      void degradeToMediaRecorder(reason);
+    };
+
     const connect = () => {
-      if (stopped) return;
+      if (stopped || transportStopped) return;
       socket = new WebSocket(websocketUrl(endpoint));
       socket.addEventListener("open", () => {
+        if (stopped || transportStopped) return;
         socket.send(JSON.stringify({
           type: "start",
           session_id: sessionId,
@@ -232,6 +457,18 @@ registerProcessor("coolzhu-pcm-capture", CoolzhuPcmCaptureProcessor);
       socket.addEventListener("message", (event) => {
         try {
           const message = JSON.parse(String(event.data));
+          if (message?.type === "ready") {
+            reconnectGuard.ready();
+            lastStreamError = null;
+          } else if (message?.type === "error") {
+            lastStreamError = message;
+            if (message.retryable === false) {
+              openCircuit({
+                ...message,
+                reason: "non_retryable",
+              });
+            }
+          }
           if (typeof options.onEvent === "function") options.onEvent(message);
         } catch (error) {
           if (typeof options.onEvent === "function") {
@@ -240,16 +477,37 @@ registerProcessor("coolzhu-pcm-capture", CoolzhuPcmCaptureProcessor);
         }
       });
       socket.addEventListener("close", () => {
-        if (stopped) return;
+        if (stopped || transportStopped) return;
         stats.reconnects += 1;
-        clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(connect, Math.min(2000, 250 * stats.reconnects));
         emitStats();
+        const decision = reconnectGuard.next({
+          retryable: lastStreamError?.retryable !== false,
+        });
+        if (!decision.retry) {
+          openCircuit({
+            type: "error",
+            code: lastStreamError?.code || decision.reason,
+            message: lastStreamError?.message || "实时语音流已达到重试上限",
+            retryable: false,
+            reason: decision.reason,
+            attempt: decision.attempt,
+          });
+          return;
+        }
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, decision.delayMs);
       });
-      socket.addEventListener("error", () => socket.close());
+      socket.addEventListener("error", () => {
+        try {
+          socket?.close();
+        } catch {
+          // 关闭竞争不应制造新的未捕获异常。
+        }
+      });
     };
 
-    node.port.addEventListener("message", (event) => {
+    function handleWorkletMessage(event) {
+      if (stopped || transportStopped) return;
       const now = Date.now();
       if (stats.lastFrameAtMs) {
         stats.maxFrameGapMs = Math.max(stats.maxFrameGapMs, now - stats.lastFrameAtMs);
@@ -273,36 +531,74 @@ registerProcessor("coolzhu-pcm-capture", CoolzhuPcmCaptureProcessor);
       bargeInBuffer.push(frame);
       sendFrame(frame);
       emitStats();
-    });
+    }
+    node.port.addEventListener("message", handleWorkletMessage);
     node.port.start();
-    connect();
-
-    return {
-      mode: "audio_worklet_pcm",
-      sessionId,
-      selectedDevice: { deviceId: selected.deviceId, label: selected.label },
-      stats,
-      bargeInFrames() { return bargeInBuffer.snapshot(); },
-      async stop() {
-        if (stopped) return;
-        stopped = true;
-        clearTimeout(reconnectTimer);
-        if (socket?.readyState === WebSocket.OPEN) {
-          socket.send(JSON.stringify({ type: "stop", session_id: sessionId }));
-        }
-        socket?.close();
+    try {
+      connect();
+    } catch (error) {
+      transportStopped = true;
+      try {
+        node.port.removeEventListener("message", handleWorkletMessage);
         node.disconnect();
         source.disconnect();
-        stream.getTracks().forEach((track) => track.stop());
-        await context.close();
-      },
+      } catch {
+        // 初始化失败时尽力释放已创建的 WebAudio 节点。
+      }
+      await context.close().catch(() => {});
+      stopStreamTracks(stream);
+      throw error;
+    }
+
+    controller.stop = async () => {
+      if (stopped) return;
+      stopped = true;
+      if (degradedRecorder?.state !== "inactive") {
+        await new Promise((resolve) => {
+          const timeout = setTimeout(resolve, 1000);
+          degradedRecorder.addEventListener("stop", () => {
+            clearTimeout(timeout);
+            resolve();
+          }, { once: true });
+          try {
+            degradedRecorder.stop();
+          } catch {
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
+      }
+      if (degradedRecordedChunks.length && typeof options.onSegment === "function") {
+        await options.onSegment(
+          new Blob(degradedRecordedChunks, {
+            type: degradedRecorder?.mimeType || degradedRecordedChunks[0]?.type,
+          }),
+          { finalSegment: true, mode: "mediarecorder_degraded" },
+        );
+      }
+      degradedRecordedChunks = [];
+      degradedRecorder = null;
+      if (!transportStopped) {
+        await stopPcmTransport({ notifyProvider: true });
+      } else {
+        clearTimeout(reconnectTimer);
+        try {
+          socket?.close();
+        } catch {
+          // ignore close failures
+        }
+      }
+      stopStreamTracks(stream);
     };
+    return controller;
   }
 
   globalThis.CoolzhuRealtimeVoiceCapture = {
     frameSamples,
     FrameRingBuffer,
+    ReconnectGuard,
     isPhysicalMicrophoneLabel,
+    listMicrophones,
     createSession,
   };
 })();

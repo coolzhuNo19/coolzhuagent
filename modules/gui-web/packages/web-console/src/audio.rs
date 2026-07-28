@@ -2181,7 +2181,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_temp_audio_no_files() {
-        let cleaned = cleanup_temp_audio(0).await;
+        // 系统临时目录可能包含真实运行产生的 tts_/stt_ 文件；测试不得删除或
+        // 计入这些外部文件。使用不可能达到的年龄阈值验证“无符合项”语义。
+        let cleaned = cleanup_temp_audio(u64::MAX).await;
         assert_eq!(cleaned, 0);
     }
 
