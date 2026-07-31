@@ -143,6 +143,8 @@ const DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
 const ATTACHMENT_MULTIPART_OVERHEAD_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_STT_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
 const STT_MULTIPART_OVERHEAD_BYTES: usize = 1024 * 1024;
+/// 单句 TTS 上游响应的最大体积。HTTP 传输分块不是独立音频，必须先在此上限内聚合。
+const MAX_TTS_STREAM_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const COMPUTER_USE_PERMISSION_GATE: &str =
     "execute=false; human confirmation and screenshot evidence required before real input";
 
@@ -718,20 +720,14 @@ fn app() -> Router {
             "/api/channels/clawbot/bindings",
             get(api_clawbot_bindings).post(api_clawbot_upsert_binding),
         )
-        .route(
-            "/api/channels/clawbot/contacts",
-            get(api_clawbot_contacts),
-        )
+        .route("/api/channels/clawbot/contacts", get(api_clawbot_contacts))
         .route(
             "/api/channels/clawbot/administrator",
             get(api_clawbot_administrator)
                 .put(api_clawbot_claim_administrator)
                 .delete(api_clawbot_clear_administrator),
         )
-        .route(
-            "/api/channels/clawbot/groups",
-            get(api_clawbot_groups),
-        )
+        .route("/api/channels/clawbot/groups", get(api_clawbot_groups))
         .route(
             "/api/channels/clawbot/groups/{group_id}",
             get(api_clawbot_group),
@@ -1539,10 +1535,26 @@ fn workspace_state() -> &'static Mutex<WorkspaceState> {
     })
 }
 
+fn default_workspace_path_from(
+    runtime_dir: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+    current_dir: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(runtime_dir) = runtime_dir.filter(|path| !path.as_os_str().is_empty()) {
+        return runtime_dir;
+    }
+    home_dir
+        .or(current_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(DEFAULT_WORKSPACE_DIR)
+}
+
 fn default_workspace_path() -> PathBuf {
-    let workspace = user_home_dir()
-        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .join(DEFAULT_WORKSPACE_DIR);
+    let workspace = default_workspace_path_from(
+        env::var_os("COOLZHU_RUNTIME_DIR").map(PathBuf::from),
+        user_home_dir(),
+        env::current_dir().ok(),
+    );
     let _ = std::fs::create_dir_all(&workspace);
     workspace.canonicalize().unwrap_or(workspace)
 }
@@ -2107,6 +2119,8 @@ struct PendingApprovalRecord {
     workspace_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_room_id: Option<String>,
     input_summary: String,
     permission: PendingApprovalPermission,
     #[serde(skip)]
@@ -2161,6 +2175,15 @@ fn enqueue_pending_approval(
     invoke: &ToolInvoke,
     gate: &runtime::PermissionGateReport,
 ) {
+    enqueue_pending_approval_for_room(call_id, invoke, gate, None);
+}
+
+fn enqueue_pending_approval_for_room(
+    call_id: &str,
+    invoke: &ToolInvoke,
+    gate: &runtime::PermissionGateReport,
+    chat_room_id: Option<&str>,
+) {
     let Ok(mut pending) = pending_approvals().lock() else {
         return;
     };
@@ -2172,6 +2195,7 @@ fn enqueue_pending_approval(
         caller: invoke.caller.as_str().to_string(),
         workspace_id: invoke.workspace_id.clone(),
         session_id: invoke.session_id.clone(),
+        chat_room_id: chat_room_id.map(str::to_string),
         input_summary: build_input_summary(&invoke.tool_name, &invoke.input),
         permission: PendingApprovalPermission {
             required: gate.required.as_str().to_string(),
@@ -4182,19 +4206,36 @@ async fn api_tools_approve(
     Json(payload): Json<ApproveRequest>,
 ) -> ApiResult<Json<ApproveResponse>> {
     let scope = payload.scope.as_deref().unwrap_or("once").to_string();
-    let record = pending_approvals()
-        .lock()
-        .ok()
-        .and_then(|mut pending| pending.remove(&payload.call_id));
+    let record = pending_approvals().lock().ok().and_then(|mut pending| {
+        let record = pending.get(&payload.call_id)?.clone();
+        if record.permission.decision == PermissionDecision::RequireConfirm.as_str()
+            && !payload.confirmed_twice
+        {
+            return None;
+        }
+        pending.remove(&payload.call_id)
+    });
     let Some(record) = record else {
+        let needs_second_confirmation = pending_approvals()
+            .lock()
+            .ok()
+            .and_then(|pending| pending.get(&payload.call_id).cloned())
+            .is_some_and(|record| {
+                record.permission.decision == PermissionDecision::RequireConfirm.as_str()
+            });
+        if needs_second_confirmation && !payload.confirmed_twice {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "该工具调用需要 confirmed_twice=true 的二次确认",
+            ));
+        }
         return Err(api_error(
             StatusCode::NOT_FOUND,
             "未找到对应待审批的工具调用，可能已过期或已被处理",
         ));
     };
 
-    let confirmed_twice = payload.confirmed_twice
-        || record.permission.decision == PermissionDecision::RequireConfirm.as_str();
+    let confirmed_twice = payload.confirmed_twice;
     let ttl_secs = if scope == "session" {
         record_session_grant(
             &record.workspace_id,
@@ -4209,7 +4250,7 @@ async fn api_tools_approve(
 
     let outcome = execute_approved_pending_record(&record, confirmed_twice).await;
 
-    append_tool_result_to_session(&record, &outcome);
+    append_tool_terminal_result_to_context(&record, &outcome);
 
     broadcast_tool_event(ToolEvent::Approved {
         call_id: payload.call_id.clone(),
@@ -4242,7 +4283,7 @@ async fn execute_approved_pending_record(
         invoke.clone(),
         record.workspace_root.clone(),
         timeout_ms,
-        None,
+        record.chat_room_id.clone(),
     )
     .await;
     append_tool_audit_record(&invoke, &outcome);
@@ -4268,9 +4309,30 @@ async fn api_tools_reject(Json(payload): Json<RejectRequest>) -> ApiResult<Json<
         .lock()
         .ok()
         .and_then(|mut pending| pending.remove(&payload.call_id));
-    if removed.is_none() {
+    let Some(record) = removed else {
         return Err(api_error(StatusCode::NOT_FOUND, "未找到对应待审批的工具调"));
-    }
+    };
+    let reason = payload
+        .reason
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "用户拒绝了该工具调用".to_string());
+    let gate = runtime::PermissionGateReport {
+        required: required_permission_for_tool(&record.tool_name),
+        decision: PermissionDecision::Deny,
+        reason: reason.clone(),
+        protected_match: record.permission.protected_match.clone(),
+        workspace_relative: record.permission.workspace_relative,
+        affected_paths: record.permission.affected_paths.clone(),
+    };
+    let outcome = ToolOutcome::rejected(
+        &record.invoke,
+        gate,
+        format!("工具 '{}' 未执行：{reason}", record.tool_name),
+    );
+    append_tool_audit_record(&record.invoke, &outcome);
+    emit_pet_event_for_tool_outcome(&record.tool_name, &outcome);
+    append_tool_terminal_result_to_context(&record, &outcome);
     broadcast_tool_event(ToolEvent::Rejected {
         call_id: payload.call_id.clone(),
         reason: payload.reason.clone(),
@@ -4329,11 +4391,12 @@ async fn api_tools_runtime_execute(
         .unwrap_or_else(|| format!("rt-{}", unix_timestamp_millis()));
     let workspace_root = active_workspace_path();
     let workspace_id = workspace_identity(&workspace_root);
+    let normalized_input = runtime_tool_input_with_defaults(&payload.tool_name, &payload.input);
 
     let invoke = ToolInvoke {
         call_id: call_id.clone(),
         tool_name: payload.tool_name.clone(),
-        input: payload.input.clone(),
+        input: normalized_input.clone(),
         caller: ToolCaller::WebUi,
         workspace_id: workspace_id.clone(),
         session_id: payload.session_id.clone(),
@@ -4341,7 +4404,7 @@ async fn api_tools_runtime_execute(
         user_confirmed_twice: payload.user_confirmed_twice,
     };
 
-    let timeout_ms = tool_timeout_ms_for(&payload.tool_name, &payload.input);
+    let timeout_ms = tool_timeout_ms_for(&payload.tool_name, &normalized_input);
     let outcome =
         execute_runtime_tool_with_timeout(invoke.clone(), workspace_root.clone(), timeout_ms, None)
             .await;
@@ -10364,12 +10427,9 @@ async fn api_clawbot_upsert_binding(
     Json(payload): Json<clawbot_channel::ClawbotConversationBinding>,
 ) -> ApiResult<Json<clawbot_channel::ClawbotConversationBinding>> {
     let payload = {
-        let store = session_store().lock().map_err(|_| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "会话存储锁已损坏",
-            )
-        })?;
+        let store = session_store()
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
         normalize_clawbot_binding_routes(payload, &store.state)
             .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))?
     };
@@ -10398,12 +10458,9 @@ async fn api_clawbot_upsert_group_binding(
         ));
     }
     let binding = {
-        let store = session_store().lock().map_err(|_| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "会话存储锁已损坏",
-            )
-        })?;
+        let store = session_store()
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
         normalize_clawbot_binding_routes(payload.binding, &store.state)
             .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))?
     };
@@ -10518,7 +10575,10 @@ async fn api_clawbot_execute_direct_command(
     let command = clawbot_channel::parse_clawbot_command(command_text)
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "请输入以 / 开头的有效微信命令"))?;
     if matches!(command, clawbot_channel::ClawbotCommand::Unknown { .. }) {
-        return Err(api_error(StatusCode::BAD_REQUEST, "未识别微信命令，请先查看 /help"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "未识别微信命令，请先查看 /help",
+        ));
     }
     let permission_profile = binding
         .chat_room_id
@@ -10548,13 +10608,7 @@ async fn api_clawbot_execute_direct_command(
         media_refs: Vec::new(),
         received_at_ms: now_ms,
     };
-    match execute_clawbot_command_runtime(
-        &message,
-        &command,
-        permission_profile.as_deref(),
-    )
-    .await
-    {
+    match execute_clawbot_command_runtime(&message, &command, permission_profile.as_deref()).await {
         Ok(result) => {
             let delivery_queued = if payload.deliver_to_wechat {
                 !clawbot_queue_command_result(&message, &result, now_ms)?.is_empty()
@@ -10701,8 +10755,7 @@ fn clawbot_sidecar_base_url() -> String {
     if let Some(url) = current_clawbot_sidecar_url_override_for_test() {
         return url;
     }
-    env::var("COOLZHU_CLAWBOT_SIDECAR_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string())
+    env::var("COOLZHU_CLAWBOT_SIDECAR_URL").unwrap_or_else(|_| "http://127.0.0.1:8787".to_string())
 }
 
 async fn call_clawbot_sidecar_login_refresh(
@@ -10928,19 +10981,17 @@ async fn api_clawbot_outbox_fail(
     let (item, detached_group) = {
         let store = clawbot_gateway_lock()?;
         let item = store
-        .mark_outbox_failed(
-            id,
-            error,
-            uuid_timestamp(),
-            clawbot_gateway::RetryPolicy::default(),
-        )
-        .map_err(|store_error| api_error(StatusCode::BAD_REQUEST, &store_error))?;
+            .mark_outbox_failed(
+                id,
+                error,
+                uuid_timestamp(),
+                clawbot_gateway::RetryPolicy::default(),
+            )
+            .map_err(|store_error| api_error(StatusCode::BAD_REQUEST, &store_error))?;
         let group = if clawbot_gateway::is_terminal_group_send_error(error) {
             store
                 .group_record(&item.account_id, &item.peer_id)
-                .map_err(|store_error| {
-                    api_error(StatusCode::INTERNAL_SERVER_ERROR, &store_error)
-                })?
+                .map_err(|store_error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &store_error))?
         } else {
             None
         };
@@ -11033,9 +11084,7 @@ fn clawbot_queue_command_result(
 const CLAWBOT_FAILURE_REPLAY_WINDOW_MS: u64 = 10 * 60 * 1_000;
 const CLAWBOT_DENIAL_NOTICE_WINDOW_MS: u64 = 5 * 60 * 1_000;
 
-fn clawbot_should_guard_repeated_failure(
-    action: &clawbot_channel::ClawbotDispatchAction,
-) -> bool {
+fn clawbot_should_guard_repeated_failure(action: &clawbot_channel::ClawbotDispatchAction) -> bool {
     matches!(
         action,
         clawbot_channel::ClawbotDispatchAction::DispatchToCoolzhu
@@ -11091,7 +11140,7 @@ fn clawbot_chat_response_text(response: &SendMessageResponse) -> String {
         .messages
         .iter()
         .filter(|message| message.role == "assistant" && message.kind == "assistant-reply")
-        .map(|message| clawbot_strip_context_usage_footer(&message.content))
+        .map(|message| strip_context_usage_footer(&message.content))
         .filter(|content| !content.is_empty())
         .collect::<Vec<_>>();
     if parts.is_empty() {
@@ -11112,7 +11161,7 @@ fn clawbot_chat_response_text(response: &SendMessageResponse) -> String {
     }
 }
 
-fn clawbot_strip_context_usage_footer(content: &str) -> String {
+fn strip_context_usage_footer(content: &str) -> String {
     let mut visible_lines = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim_start();
@@ -11377,12 +11426,7 @@ fn clawbot_update_binding(
             .map_err(|error| {
                 ClawbotRuntimeCommandError::new("gateway_unavailable", api_error_message(error))
             })?
-            .upsert_group_binding(
-                &message.account_id,
-                group_id,
-                &binding,
-                uuid_timestamp(),
-            )
+            .upsert_group_binding(&message.account_id, group_id, &binding, uuid_timestamp())
             .map_err(|error| ClawbotRuntimeCommandError::new("binding_save_failed", error))?;
     }
     Ok(binding)
@@ -11940,9 +11984,8 @@ fn clawbot_require_group_identity(
             "该命令仅可在已识别微信群中使用。",
         ));
     }
-    clawbot_group_identity(message).map_err(|(code, reason)| {
-        ClawbotRuntimeCommandError::new(code, reason)
-    })
+    clawbot_group_identity(message)
+        .map_err(|(code, reason)| ClawbotRuntimeCommandError::new(code, reason))
 }
 
 fn clawbot_require_operation_administrator(
@@ -12084,8 +12127,12 @@ fn clawbot_current_group_text(
         group.lifecycle_state,
         group.sync_evidence,
         group.recognized_member_count,
-        binding.and_then(|value| value.chat_room_id.as_deref()).unwrap_or("未绑定"),
-        binding.and_then(|value| value.default_session_id.as_deref()).unwrap_or("未选择"),
+        binding
+            .and_then(|value| value.chat_room_id.as_deref())
+            .unwrap_or("未绑定"),
+        binding
+            .and_then(|value| value.default_session_id.as_deref())
+            .unwrap_or("未选择"),
     ))
 }
 
@@ -12201,9 +12248,7 @@ async fn execute_clawbot_command_runtime(
             clawbot_select_existing_session(message, "", true)?,
         )),
         clawbot_channel::ClawbotCommand::UseSessionOrModel { selector } => Ok(
-            clawbot_runtime_command_ok(clawbot_select_existing_session(
-                message, selector, false,
-            )?),
+            clawbot_runtime_command_ok(clawbot_select_existing_session(message, selector, false)?),
         ),
         clawbot_channel::ClawbotCommand::SelectTargets { target_agent_ids } => {
             let mut selected_ids = Vec::new();
@@ -12257,9 +12302,9 @@ async fn execute_clawbot_command_runtime(
             "group.current" => Ok(clawbot_runtime_command_ok(clawbot_current_group_text(
                 message,
             )?)),
-            "group.detach" => Ok(clawbot_runtime_command_ok(
-                clawbot_detach_current_group(message)?,
-            )),
+            "group.detach" => Ok(clawbot_runtime_command_ok(clawbot_detach_current_group(
+                message,
+            )?)),
             "models" => Ok(clawbot_runtime_command_ok(clawbot_model_catalog(message)?)),
             "model.status" => {
                 let binding = clawbot_current_binding(message)?;
@@ -12360,11 +12405,11 @@ async fn execute_clawbot_command_runtime(
                 message, arguments,
             )?)),
             "file.get" => {
-                let attachment = wechat_file::file_get_attachment(
-                    &active_workspace_path(),
-                    arguments.trim(),
-                )
-                .map_err(|error| ClawbotRuntimeCommandError::new(error.code, error.message))?;
+                let attachment =
+                    wechat_file::file_get_attachment(&active_workspace_path(), arguments.trim())
+                        .map_err(|error| {
+                            ClawbotRuntimeCommandError::new(error.code, error.message)
+                        })?;
                 let summary = format!(
                     "文件附件已准备：{}\n大小：{} bytes\n校验：{}",
                     attachment.relative_path, attachment.size_bytes, attachment.checksum
@@ -12398,7 +12443,9 @@ async fn execute_clawbot_command_runtime(
                 message,
                 permission_profile,
             )?)),
-            "members" => Ok(clawbot_runtime_command_ok(clawbot_group_members_text(message)?)),
+            "members" => Ok(clawbot_runtime_command_ok(clawbot_group_members_text(
+                message,
+            )?)),
             "member.set" => Ok(clawbot_runtime_command_ok(clawbot_set_group_member_role(
                 message, arguments,
             )?)),
@@ -12552,8 +12599,7 @@ async fn api_clawbot_inbound_dispatch(
                             now_ms,
                         )
                         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error))?;
-                    "已记录机器人加入微信群事件，等待首条真实群消息确认成员身份。"
-                        .to_string()
+                    "已记录机器人加入微信群事件，等待首条真实群消息确认成员身份。".to_string()
                 }
                 wechat_group::WechatGroupEventKind::BotRemoved => {
                     {
@@ -12595,8 +12641,7 @@ async fn api_clawbot_inbound_dispatch(
                         }
                     }
                     clawbot_remove_compat_binding(&envelope.message.account_id, &group_id)?;
-                    "已记录机器人移出微信群事件，并清理群绑定、成员权限和待发送消息。"
-                        .to_string()
+                    "已记录机器人移出微信群事件，并清理群绑定、成员权限和待发送消息。".to_string()
                 }
             };
             clawbot_mark_inbox_terminal(inbox.id, false, &lifecycle_message, &[], now_ms)?;
@@ -12701,7 +12746,13 @@ async fn api_clawbot_inbound_dispatch(
                 .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error))?;
             let online = snapshot.state == clawbot_gateway::ClawbotLoginState::Online
                 && snapshot.account_id.as_deref() == Some(envelope.message.account_id.as_str());
-            (online, Some(member), is_administrator, aliases, group.binding)
+            (
+                online,
+                Some(member),
+                is_administrator,
+                aliases,
+                group.binding,
+            )
         } else {
             let store = clawbot_gateway_lock()?;
             store
@@ -12733,10 +12784,8 @@ async fn api_clawbot_inbound_dispatch(
             state.preview_inbound(envelope.message.clone())
         }
     };
-    let silently_ignore_group = clawbot_group_message_without_confirmed_mention(
-        &envelope.message,
-        &mention_aliases,
-    );
+    let silently_ignore_group =
+        clawbot_group_message_without_confirmed_mention(&envelope.message, &mention_aliases);
     let mentioned_bot = envelope.message.is_group && !silently_ignore_group;
     if silently_ignore_group {
         let feedback = "[bot_mention_unconfirmed] 群消息没有明确 @当前微信机器人，已静默忽略。";
@@ -12799,7 +12848,11 @@ async fn api_clawbot_inbound_dispatch(
                     .then(|| clawbot_queue_feedback(&envelope.message, &feedback, now_ms))
                     .transpose()?
             } else {
-                Some(clawbot_queue_feedback(&envelope.message, &feedback, now_ms)?)
+                Some(clawbot_queue_feedback(
+                    &envelope.message,
+                    &feedback,
+                    now_ms,
+                )?)
             };
             return Ok(Json(ClawbotInboundDispatchResponse {
                 status: "authorization_denied".to_string(),
@@ -15071,15 +15124,22 @@ async fn api_chat_send_stream(
                         dispatch.route == "computer-use-task-controller" && dispatch.is_error
                     })
                     .map(|dispatch| dispatch.summary_text.clone());
+                let dispatch_error_count =
+                    dispatches.iter().filter(|dispatch| dispatch.is_error).count();
+                let dispatch_terminal_status = if dispatch_error_count == 0 {
+                    "completed"
+                } else {
+                    "failed"
+                };
                 emit_active_realtime_session_event(
                     "action_step",
                     json!({
                         "message_id": assistant_id.clone(),
                         "agent_id": agent.id.clone(),
                         "agent_name": agent.display_name.clone(),
-                        "status": "completed",
+                        "status": dispatch_terminal_status,
                         "tool_call_count": dispatches.len(),
-                        "error_count": dispatches.iter().filter(|dispatch| dispatch.is_error).count()
+                        "error_count": dispatch_error_count
                     }),
                 );
                 let tool_result_blocks: Vec<InputContentBlock> = dispatches
@@ -15094,34 +15154,44 @@ async fn api_chat_send_stream(
                 .collect();
                 streamed_tool_calls_dispatched = true;
 
-                // Round 1 user turn（round 0 prompt）复"result.user_content。
-                // Round 1 assistant turn 用模型返回的 ToolUse 块；
-                // Round 2 user turn 放我们的 ToolResult 块。
-                let round_messages = vec![
-                    InputMessage::user_text(result.user_content.clone()),
-                    InputMessage {
-                        role: "assistant".to_string(),
-                        content: assistant_tool_use_blocks,
-                    },
-                    InputMessage {
-                        role: "user".to_string(),
-                        content: tool_result_blocks,
-                    },
-                ];
+                // 工具反馈轮必须延续首轮已经组装好的完整上下文。这里不能只重建
+                // `current user + ToolUse + ToolResult`，否则聊天室历史、记忆、图片和
+                // collaboration roster 会从 round2 起全部丢失。
+                let (mut loop_messages, loop_system_prompt) =
+                    if let Some(assembly) = stream_context_assembly.as_ref() {
+                        (assembly.messages.clone(), assembly.system_prompt.clone())
+                    } else {
+                        (
+                            vec![InputMessage::user_text(result.user_content.clone())],
+                            build_agent_system_prompt(agent),
+                        )
+                    };
+                loop_messages.push(InputMessage {
+                    role: "assistant".to_string(),
+                    content: assistant_tool_use_blocks,
+                });
+                loop_messages.push(InputMessage {
+                    role: "user".to_string(),
+                    content: tool_result_blocks,
+                });
                 // 多轮工具循环（round2+）：与非流式 call_agent_model_with_tool_loop 对齐。
                 // 修复 CUR-GOAL-LOOP-001：此前流式只做单轮反馈，round2 模型再请求工具即被忽略，
                 // 导致多步任务（建多文件 / 分步执行）必然 stall（"模型未返回最终回复"）。
                 // round1 已流式执行并喂回；此处逐轮用非流式 send_message 推进，直到模型返回纯文本
                 // 或达 max_feedback_rounds 上限。工具循环期间不流式 token（属"执行中"），最终整条回复。
-                let mut loop_messages = round_messages;
                 let max_rounds = tool_execution_policy().max_feedback_rounds.max(1) as u32;
                 let mut multi_round_answer = String::new();
+                let mut feedback_watchdog_hit = false;
                 let mut last_loop_sig: Option<u64> = None;
                 let mut loop_repeat: u32 = 0;
                 let mut round_no: u32 = 2;
                 loop {
-                    let request =
-                        agent_message_request_with_history(agent, false, loop_messages.clone());
+                    let request = agent_message_request_with_context_messages(
+                        agent,
+                        false,
+                        &loop_system_prompt,
+                        loop_messages.clone(),
+                    );
                     let response = match provider_client_for_agent(agent) {
                         Ok(client) => match client.send_message(&request).await {
                             Ok(resp) => resp,
@@ -15159,10 +15229,25 @@ async fn api_chat_send_stream(
                         }
                     }
                     if round_no > max_rounds {
-                        multi_round_answer = answer_text(&response.content);
+                        feedback_watchdog_hit = true;
+                        multi_round_answer = tool_feedback_watchdog_message(
+                            max_rounds as usize,
+                            tool_requests.len(),
+                        );
                         diag!(
                             "[TOOL-LOOP-STREAM] reached max rounds ({max_rounds}); stopping with {} pending tool call(s)",
                             tool_requests.len()
+                        );
+                        emit_active_realtime_session_event(
+                            "action_step",
+                            json!({
+                                "message_id": assistant_id.clone(),
+                                "agent_id": agent.id.clone(),
+                                "agent_name": agent.display_name.clone(),
+                                "status": "blocked",
+                                "error_code": "tool_feedback_round_limit",
+                                "pending_tool_call_count": tool_requests.len()
+                            }),
                         );
                         break;
                     }
@@ -15269,6 +15354,9 @@ async fn api_chat_send_stream(
                 assistant_started = true;
                 if !multi_round_answer.trim().is_empty() {
                     assistant_message.content = multi_round_answer;
+                } else if feedback_watchdog_hit {
+                    assistant_message.content =
+                        tool_feedback_watchdog_message(max_rounds as usize, 1);
                 } else if !tool_result_summaries.is_empty() {
                     // 多轮后模型仍无文字总结：用工具结果摘要兜底（比单轮"未返回最终回复"信息更全）。
                     assistant_message.content = format!(
@@ -15671,13 +15759,13 @@ fn default_mcp_transport() -> String {
 const DEFAULT_MCP_SERVERS_JSON: &str = r#"[
   {"id":"mcp-everything","name":"MCP Everything（协议验证）","category":"00-验证","command":"cmd","args":["/c","npx","-y","@modelcontextprotocol/server-everything"],"enabled":true,"notes":"官方测试 server：验证 initialize/tools/list/tools/call 全链路（实测 13 工具）"},
   {"id":"godot-mcp","name":"Godot MCP（游戏开发）","category":"02-游戏开发","command":"cmd","args":["/c","npx","-y","godot-mcp"],"enabled":true,"notes":"npm godot-mcp@0.1.6+；实测 14 工具；未装引擎时连接自检可用，引擎类工具如实报错"},
-  {"id":"blender-mcp","name":"Blender MCP（建模）","category":"01-CAD-3D","command":"C:\\Python314\\python.exe","args":["-m","uv","tool","run","blender-mcp"],"enabled":true,"notes":"PyPI blender-mcp@1.6.2（ahujasid 官方）；调用需 Blender + addon 开启 socket"},
+  {"id":"blender-mcp","name":"Blender MCP（建模）","category":"01-CAD-3D","command":"uv","args":["tool","run","blender-mcp"],"enabled":false,"notes":"PyPI blender-mcp@1.6.2（ahujasid 官方）；需先安装 uv，并在 Blender 中启用 addon/socket 后于 workspace 配置开启"},
   {"id":"mobile-mcp","name":"Mobile MCP（应用开发）","category":"03-应用开发","command":"cmd","args":["/c","npx","-y","@mobilenext/mobile-mcp@latest"],"enabled":true,"notes":"npm @mobilenext/mobile-mcp@0.0.59；调用需 adb + 设备/模拟器"},
   {"id":"kicad-mcp","name":"KiCad MCP（EDA）","category":"04-EDA","command":"cmd","args":["/c","npx","-y","kicad-mcp"],"enabled":true,"notes":"npm kicad-mcp@0.1.6（python wrapper，首次拉依赖较慢）；调用需 KiCad 9+"},
-  {"id":"obsidian-mcp","name":"Obsidian MCP（笔记）","category":"05-笔记","command":"cmd","args":["/c","npx","-y","mcp-obsidian","C:\\Users\\zhupu\\Desktop\\codex\\tmp\\obsidian-vault"],"enabled":true,"notes":"npm mcp-obsidian@1.0.0：本地 vault 直读（末位参数为 vault 目录，可在 workspace mcp_servers.json 改为真实库路径）"},
+  {"id":"obsidian-mcp","name":"Obsidian MCP（笔记）","category":"05-笔记","command":"cmd","args":["/c","npx","-y","mcp-obsidian","knowledge\\obsidian-vault"],"enabled":false,"notes":"npm mcp-obsidian@1.0.0：路径相对当前 workspace；请创建 knowledge/obsidian-vault 或在 workspace mcp_servers.json 配置真实 vault 后开启"},
   {"id":"resolve-mcp","name":"DaVinci Resolve MCP（视频编辑）","category":"06-视频编辑","command":"cmd","args":["/c","npx","-y","davinci-resolve-mcp"],"enabled":false,"notes":"npm davinci-resolve-mcp@2.45.0：依赖 anyio 未声明且需 Resolve Studio 脚本环境；宿主就绪后于 workspace 配置开启"},
-  {"id":"ableton-mcp","name":"Ableton MCP（音频编辑）","category":"07-音频编辑","command":"C:\\Python314\\python.exe","args":["-m","uv","tool","run","ableton-mcp"],"enabled":true,"notes":"PyPI ableton-mcp@1.2.0（ahujasid 官方）；调用需 Ableton Live + Remote Script"},
-  {"id":"minimax-mcp","name":"MiniMax MCP（视频/图像生成）","category":"08-视频生成","command":"C:\\Python314\\python.exe","args":["-m","uv","tool","run","minimax-mcp"],"env":{"MINIMAX_API_KEY":"","MINIMAX_API_HOST":"https://api.minimaxi.com"},"enabled":true,"notes":"PyPI minimax-mcp@0.0.18（官方）：文生视频/图像/语音；需 MINIMAX_API_KEY（workspace mcp_servers.json 配置，勿硬编码）"},
+  {"id":"ableton-mcp","name":"Ableton MCP（音频编辑）","category":"07-音频编辑","command":"uv","args":["tool","run","ableton-mcp"],"enabled":false,"notes":"PyPI ableton-mcp@1.2.0（ahujasid 官方）；需先安装 uv、配置 Ableton Live Remote Script 后于 workspace 配置开启"},
+  {"id":"minimax-mcp","name":"MiniMax MCP（视频/图像生成）","category":"08-视频生成","command":"uv","args":["tool","run","minimax-mcp"],"env":{"MINIMAX_API_KEY":"","MINIMAX_API_HOST":"https://api.minimaxi.com"},"enabled":false,"notes":"PyPI minimax-mcp@0.0.18（官方）：需先安装 uv，并在 workspace mcp_servers.json 配置 MINIMAX_API_KEY 后开启，勿硬编码密钥"},
   {"id":"yahoo-finance-mcp","name":"Yahoo Finance MCP（金融量化）","category":"09-金融量化","command":"cmd","args":["/c","npx","-y","yahoo-finance-mcp"],"enabled":true,"notes":"npm yahoo-finance-mcp@1.6.2：行情/历史/财报，免 API Key 可直接冒烟"}
 ]"#;
 
@@ -15789,6 +15877,9 @@ async fn mcp_connect_server(config: &McpServerConfig) -> Result<McpRuntime, Stri
     }
     let mut command = Command::new(&config.command);
     command.args(&config.args);
+    // 相对路径配置（例如 Obsidian vault）统一以用户当前 workspace 解析，
+    // 避免继承安装目录或开发机启动目录。
+    command.current_dir(active_workspace_path());
     for (key, value) in &config.env {
         command.env(key, value);
     }
@@ -19918,10 +20009,10 @@ async fn execute_authorized_webui_runtime_dispatch(
     tool_outcome_to_dispatch_response(tool_name, &input, outcome)
 }
 
-fn append_tool_result_to_session(record: &PendingApprovalRecord, outcome: &ToolOutcome) {
-    let Some(session_id) = record.session_id.as_deref() else {
+fn append_tool_terminal_result_to_context(record: &PendingApprovalRecord, outcome: &ToolOutcome) {
+    if record.session_id.is_none() && record.chat_room_id.is_none() {
         return;
-    };
+    }
     let Ok(mut store) = session_store().lock() else {
         return;
     };
@@ -19935,10 +20026,16 @@ fn append_tool_result_to_session(record: &PendingApprovalRecord, outcome: &ToolO
     let message = ChatMessageDto {
         id: format!("approved-{}", unix_timestamp_millis()),
         author: "工具审批执行".to_string(),
-        role: "system".to_string(),
-        target: session_id.to_string(),
+        // 历史上下文只把 assistant 映射为 assistant；使用 system 会被旧兼容逻辑
+        // 映射成 user，导致模型误以为结果是用户声称的内容。
+        role: "assistant".to_string(),
+        target: record
+            .chat_room_id
+            .clone()
+            .or_else(|| record.session_id.clone())
+            .unwrap_or_else(|| "工具审批".to_string()),
         content: format!(
-            "已审批执行 {}: {}\n结果: {}{}",
+            "工具审批终态：{}: {}\n结果: {}{}",
             outcome.tool_name,
             status_text,
             outcome.summary_text,
@@ -19947,7 +20044,20 @@ fn append_tool_result_to_session(record: &PendingApprovalRecord, outcome: &ToolO
         kind: "tool-result".to_string(),
         attachments: Vec::new(),
     };
-    let _ = store.append_chat_messages(session_id, vec![message]);
+    let mut changed = false;
+    if let Some(room_id) = record.chat_room_id.as_deref() {
+        changed |=
+            store.append_chat_room_messages_in_memory(room_id, std::slice::from_ref(&message));
+    }
+    if let Some(session_id) = record.session_id.as_deref() {
+        if record.chat_room_id.as_deref() != Some(session_id) {
+            changed |=
+                store.append_chat_messages_in_memory(session_id, std::slice::from_ref(&message));
+        }
+    }
+    if changed {
+        let _ = store.save();
+    }
 }
 
 async fn api_tool_execute(
@@ -22588,7 +22698,6 @@ async fn call_agent_model_with_tool_loop(
     let base_history = assembly.messages.clone();
 
     let mut all_reasoning = String::new();
-    let mut all_tool_requests = Vec::new();
     let mut tool_write_executed = false;
     let mut model_tool_calls_executed = false;
     let mut last_diagnostic = None;
@@ -22710,7 +22819,6 @@ async fn call_agent_model_with_tool_loop(
             // These tool calls are executed immediately and fed back as ToolResult blocks.
             // Do not return them to the outer chat path, or non-stream chat will execute
             // the same write/shell tools a second time while rendering summary messages.
-            all_tool_requests.clear();
             let reasoning = reasoning_text(&response.content);
             if !reasoning.is_empty() {
                 if !all_reasoning.is_empty() {
@@ -22758,20 +22866,13 @@ async fn call_agent_model_with_tool_loop(
         // answer_text 可能整条为空（回复全是 tool_use）→ 用户看到"空回复"。给出非空截断提示，
         // 说明这是步数护栏而非模型出错，并支持跨回合续跑（回复"继续"）。对应自检"回合截断"项。
         let round_cap_truncated = !tool_requests.is_empty() && round >= max_tool_feedback_rounds;
-        if !tool_requests.is_empty() {
-            all_tool_requests.extend(tool_requests);
-        }
         let mut final_answer = answer_text(&response.content);
         if round_cap_truncated {
-            let hint = format!(
-                "本回合已用满 {max_tool_feedback_rounds} 轮工具调用，仍有后续工具操作未执行（这是 harness 的步数护栏，不是模型出错）。已完成的改动以上面的工具消息为准；如需继续，回复“继续”我接着往下做。"
-            );
-            if final_answer.trim().is_empty() {
-                final_answer = hint;
-            } else {
-                final_answer.push_str("\n\n");
-                final_answer.push_str(&hint);
-            }
+            // 硬上限之后的 ToolUse 只能用于审计，绝不能再放回外层可执行列表。
+            // 旧实现把它们写入 all_tool_requests，api_chat_send 随后又执行了一批，
+            // 导致“提示未执行”与真实副作用相反，并且结果无法再反馈给模型。
+            final_answer =
+                tool_feedback_watchdog_message(max_tool_feedback_rounds, tool_requests.len());
         }
         let policy = context_lifecycle_policy();
         let context_usage = context_usage_snapshot_for_assembly_with_usage(
@@ -22783,7 +22884,7 @@ async fn call_agent_model_with_tool_loop(
         return Ok(AgentModelResponse {
             answer_text: final_answer,
             reasoning_text: all_reasoning,
-            tool_requests: all_tool_requests,
+            tool_requests: Vec::new(),
             tool_write_executed,
             model_tool_calls_executed,
             turn_id: current_turn_trace()
@@ -22809,7 +22910,7 @@ async fn call_agent_model_with_tool_loop(
     Ok(AgentModelResponse {
         answer_text: terminal_supervisor_answer.unwrap_or_default(),
         reasoning_text: all_reasoning,
-        tool_requests: all_tool_requests,
+        tool_requests: Vec::new(),
         tool_write_executed,
         model_tool_calls_executed,
         turn_id: current_turn_trace()
@@ -23271,22 +23372,25 @@ fn build_context_assembly_with_roster(
         if is_goal_temporary_persisted_message(message) {
             continue;
         }
-        if message.content.trim().is_empty() {
+        let mut message_for_context = message.clone();
+        message_for_context.content = strip_context_usage_footer(&message.content);
+        if message_for_context.content.trim().is_empty() {
             continue;
         }
         // 跳过早期 bug 期 assistant 自述「工具只读/dry-run/无法执行」的污染回复：注入后会让模型
         // 沿袭错误认知、放弃调用工具（goal 卡死根因）。阈值 >=2 避免误删偶含单个词的正常消息。
-        if message.role == "assistant" && stale_tool_denial_hits(&message.content) >= 2 {
+        if message.role == "assistant" && stale_tool_denial_hits(&message_for_context.content) >= 2
+        {
             continue;
         }
-        let tokens = estimate_message_tokens(message);
+        let tokens = estimate_message_tokens(&message_for_context);
         if history_tokens.saturating_add(tokens) > effective_history_budget {
             truncated = true;
-            dropped_history.push(message.clone());
+            dropped_history.push(message_for_context);
             continue;
         }
         history_tokens = history_tokens.saturating_add(tokens);
-        selected_history.push(message.clone());
+        selected_history.push(message_for_context);
     }
     selected_history.reverse();
     // dropped_history 是新→旧顺序，摘要时转回时间正序并注入 system_prompt（计入 system_tokens）。
@@ -23591,7 +23695,10 @@ fn input_message_from_persisted(message: &PersistedChatMessage) -> InputMessage 
     InputMessage {
         role: context_message_role(&message.role).to_string(),
         content: vec![InputContentBlock::Text {
-            text: message.content.clone(),
+            // Context usage 是本地 UI 诊断信息，不属于模型回答。历史记录可以保留
+            // 供用户查看，但进入下一轮模型请求前必须剥离，避免统计文本污染语义、
+            // 消耗上下文并被模型复述。
+            text: strip_context_usage_footer(&message.content),
         }],
     }
 }
@@ -23666,7 +23773,7 @@ fn truncate_tool_result_for_context(text: String) -> String {
 }
 
 fn estimate_message_tokens(message: &PersistedChatMessage) -> u32 {
-    estimate_bead_tokens(&message.content).max(1)
+    estimate_bead_tokens(&strip_context_usage_footer(&message.content)).max(1)
 }
 
 fn truncate_text_to_estimated_token_budget(text: &str, budget: u32) -> String {
@@ -28517,7 +28624,9 @@ async fn run_model_tool_dispatch_for_session_with_identity(
             caller_session_id.unwrap_or("session-missing"),
             effective_turn_id,
         );
-        let result = computer_use_executor::execute_with_current_runtime(input, &identity).await;
+        let result =
+            computer_use_executor::execute_with_current_runtime(input, &identity, chat_room_id)
+                .await;
         return Ok(computer_use_dispatch_response(result));
     }
 
@@ -28604,6 +28713,12 @@ fn computer_use_recursive_call_blocked_feedback(last_summary: &str) -> String {
     format!(
         "Computer Use 已在本轮以错误终态结束；运行时已阻止模型改用其它 UI 工具继续调用。status=blocked, error_code=recursive_call_blocked, retry_owner=user, last_result={}",
         compact_message_snippet(last_summary, 320)
+    )
+}
+
+fn tool_feedback_watchdog_message(max_rounds: usize, pending_tool_calls: usize) -> String {
+    format!(
+        "工具反馈循环已由运行时看护终止。status=blocked, error_code=tool_feedback_round_limit, max_feedback_rounds={max_rounds}, pending_tool_calls={pending_tool_calls}。这些超限工具请求未执行；已完成的操作以此前工具结果为准。请缩小任务范围或在确认当前结果后继续。"
     )
 }
 
@@ -28911,7 +29026,12 @@ async fn invoke_through_runtime_for_session(
     if matches!(outcome.status, ToolOutcomeStatus::DryRunOnly)
         && outcome.permission_gate.decision.requires_ui()
     {
-        enqueue_pending_approval(&call_id, &invoke, &outcome.permission_gate);
+        enqueue_pending_approval_for_room(
+            &call_id,
+            &invoke,
+            &outcome.permission_gate,
+            chat_room_id,
+        );
         info!(
             "[TOOL-GATE] llm tool='{}' decision={} enqueued pending call_id={}",
             invoke.tool_name,
@@ -31337,9 +31457,7 @@ impl SessionStore {
         ) {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
-                &format!(
-                    "Goal is {goal_status_now}; resume it before dispatching phases."
-                ),
+                &format!("Goal is {goal_status_now}; resume it before dispatching phases."),
             ));
         }
         let review =
@@ -31545,10 +31663,7 @@ impl SessionStore {
                 // codex #3：evidence 存**有界摘要**而非整份 JSON——完整证据已在
                 // goal_phases.last_evidence_json，每次重试复制全文会撑爆 handoff 列表/save/响应。
                 // 需要全文时按 goal_id+phase_id 回查。
-                let evidence_digest = phase
-                    .last_evidence
-                    .as_ref()
-                    .map(goal_phase_evidence_digest);
+                let evidence_digest = phase.last_evidence.as_ref().map(goal_phase_evidence_digest);
                 json!({
                     "kind": "goal-phase-retry",
                     "goal_id": goal.id,
@@ -31776,10 +31891,13 @@ impl SessionStore {
             .collect::<String>();
         // GL-04：verdict 只由调用方显式给出——自动运行路径确认校验通过后传 Some("pass")；
         // 通用/手工完成传 None，不推断结论、绝不伪造 pass。归一在 record 里做。
-        let recorded_verdict = payload
-            .verdict
-            .as_deref()
-            .map(|value| if value.trim().eq_ignore_ascii_case("pass") { "pass" } else { "fail" });
+        let recorded_verdict = payload.verdict.as_deref().map(|value| {
+            if value.trim().eq_ignore_ascii_case("pass") {
+                "pass"
+            } else {
+                "fail"
+            }
+        });
         // codex 自检 P0：verdict=fail 却把阶段置 completed 是自相矛盾的。
         // 「失败」要走回退路由（apply_phase_fail_retry），不能从完成入口进来。
         if recorded_verdict == Some("fail") {
@@ -32135,7 +32253,12 @@ impl SessionStore {
             };
             messages.push(ChatMessageDto {
                 id: format!("msg-goal-{now}-{phase_id}-replan"),
-                author: if outcome.blocked { "Goal guardrail" } else { "Goal feedback" }.to_string(),
+                author: if outcome.blocked {
+                    "Goal guardrail"
+                } else {
+                    "Goal feedback"
+                }
+                .to_string(),
                 role: "assistant".to_string(),
                 target: "Goal phase".to_string(),
                 content: summary,
@@ -32226,7 +32349,12 @@ impl SessionStore {
             };
             messages.push(ChatMessageDto {
                 id: format!("msg-goal-{now}-{phase_id}-verification"),
-                author: if outcome.blocked { "Goal guardrail" } else { "Goal verification" }.to_string(),
+                author: if outcome.blocked {
+                    "Goal guardrail"
+                } else {
+                    "Goal verification"
+                }
+                .to_string(),
                 role: "assistant".to_string(),
                 target: "Goal phase".to_string(),
                 content: summary,
@@ -32309,7 +32437,12 @@ impl SessionStore {
             };
             messages.push(ChatMessageDto {
                 id: format!("msg-goal-{now}-{phase_id}-command"),
-                author: if outcome.blocked { "Goal guardrail" } else { "Goal verification" }.to_string(),
+                author: if outcome.blocked {
+                    "Goal guardrail"
+                } else {
+                    "Goal verification"
+                }
+                .to_string(),
                 role: "assistant".to_string(),
                 target: "Goal phase".to_string(),
                 content: summary,
@@ -33948,7 +34081,6 @@ fn apply_session_migration_v15(connection: &Connection) -> rusqlite::Result<()> 
     }
     Ok(())
 }
-
 fn chat_room_permission_profile_sqlite(path: &Path, room_id: &str) -> rusqlite::Result<String> {
     let connection = open_session_connection(path)?;
     initialize_session_schema(&connection)?;
@@ -35196,7 +35328,11 @@ fn ack_goal_phase_sqlite(
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let decision = if payload.approved { "approved" } else { "rejected" };
+        let decision = if payload.approved {
+            "approved"
+        } else {
+            "rejected"
+        };
         // codex 场景实测 #1/#2：确认必须是 `awaiting` → `approved`/`rejected` 的**单次**转移。
         // 用条件 UPDATE 把状态机写进 WHERE：只有 status='pending' 且 human_ack='awaiting' 的行
         // 才会被改。这同时解决两个问题——
@@ -35333,7 +35469,10 @@ fn resume_goal_from_phase_sqlite(
             .map_err(sqlite_api_error)?
             .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Goal does not exist."))?;
         if status == "cancelled" {
-            return Err(api_error(StatusCode::BAD_REQUEST, "Cannot resume a cancelled goal."));
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "Cannot resume a cancelled goal.",
+            ));
         }
         // codex 审查 #2：与普通 resume 一致——预算耗尽先抬高 max_iterations，否则续跑出来的
         // running goal 实际跑不动（commander 拦派发、原子占用也会拒）。不清零 current_iteration，
@@ -35367,7 +35506,10 @@ fn resume_goal_from_phase_sqlite(
             out
         };
         if !phases.iter().any(|(id, _)| id == phase_id) {
-            return Err(api_error(StatusCode::NOT_FOUND, "Goal phase does not exist."));
+            return Err(api_error(
+                StatusCode::NOT_FOUND,
+                "Goal phase does not exist.",
+            ));
         }
         // 传递闭包：从 phase_id 出发，凡 depends_on 命中已入集合的 phase 也纳入。
         // 反复扫描直到不再新增（phase 有限 + HashSet 单调增长 → 必终止，环也不会死循环）。
@@ -35890,8 +36032,7 @@ fn query_goal_phases_connection(
             max_retries: i64_to_u64(row.get::<_, i64>(12)?) as u32,
             last_verdict: row.get(13)?,
             last_reason: row.get(14)?,
-            last_evidence: last_evidence_json
-                .and_then(|value| serde_json::from_str(&value).ok()),
+            last_evidence: last_evidence_json.and_then(|value| serde_json::from_str(&value).ok()),
             route_hint: row.get(16)?,
             requires_human_ack: row.get::<_, i64>(17)? != 0,
             human_ack: row.get(18)?,
@@ -35989,7 +36130,8 @@ fn insert_goal_event_connection(
     message: &str,
     payload: JsonValue,
 ) -> rusqlite::Result<usize> {
-    let event = insert_goal_event_connection_deferred(connection, goal_id, event_type, message, payload)?;
+    let event =
+        insert_goal_event_connection_deferred(connection, goal_id, event_type, message, payload)?;
     broadcast_goal_event(event);
     Ok(1)
 }
@@ -36173,7 +36315,10 @@ fn goal_phase_evidence_digest(evidence: &JsonValue) -> String {
         format!("{head}…[truncated]")
     }
     let mut parts = Vec::new();
-    if let Some(items) = evidence.get("missing_artifacts").and_then(JsonValue::as_array) {
+    if let Some(items) = evidence
+        .get("missing_artifacts")
+        .and_then(JsonValue::as_array)
+    {
         let list = items
             .iter()
             .filter_map(JsonValue::as_str)
@@ -36184,7 +36329,10 @@ fn goal_phase_evidence_digest(evidence: &JsonValue) -> String {
             parts.push(format!("missing artifacts: {}", clip(&list, 300)));
         }
     }
-    if let Some(items) = evidence.get("command_failures").and_then(JsonValue::as_array) {
+    if let Some(items) = evidence
+        .get("command_failures")
+        .and_then(JsonValue::as_array)
+    {
         // 命令失败输出通常很长，只取前 2 条、每条限长。
         let list = items
             .iter()
@@ -37136,10 +37284,7 @@ fn set_goal_plan_sqlite(
             // " impl " 会被当成新 phase 把旧路由状态清零，还会把带空白的脏 id 存进库。
             let phase_id = phase.id.trim();
             // 旧 phase 保留其路由状态；计划新增的 phase 落默认值（retry=0/max=2）。
-            let routing = preserved_routing
-                .get(phase_id)
-                .cloned()
-                .unwrap_or_default();
+            let routing = preserved_routing.get(phase_id).cloned().unwrap_or_default();
             // GL-05/06（codex 二轮 #1）：re-plan 一个已 blocked 的 phase = 显式解阻，给它一次
             // 干净的重试预算（retry_count 归 0），而不是沿用已超限的计数——否则 blocked→pending
             // 后会额外获得一次执行绕过上限。非 blocked 的 phase 仍按 GL-03 保留 retry_count。
@@ -37854,9 +37999,7 @@ fn review_goal_commander_sqlite(
                 "Phase dependencies are not completed yet.".to_string(),
                 false,
             )
-        } else if phase.requires_human_ack
-            && phase.human_ack.as_deref() != Some("approved")
-        {
+        } else if phase.requires_human_ack && phase.human_ack.as_deref() != Some("approved") {
             // GL-13：依赖已满足、会话就绪，但标了 requires_human_ack 且尚未批准 →
             // 派发前暂停等人工确认（rejected 也走这里，永远不派发，直到重新规划）。
             (
@@ -45598,11 +45741,9 @@ async fn api_audio_tts_stream(
         .or(upstream_mime_type)
         .unwrap_or_else(|| "audio/wav".to_string());
 
-    let mut pending_chunk: Option<Vec<u8>> = None;
-    let mut audio_urls = Vec::new();
-    let mut chunk_count = 0_u64;
-    let mut total_bytes = 0_u64;
-    let mut next_index = 1_u64;
+    // reqwest::Response::chunk() 返回的是 HTTP 传输分块，并不保证落在音频帧或文件边界。
+    // 当前接口由上层按句调用，因此单次上游响应必须聚合为一个完整、可播放的音频单元。
+    let mut complete_audio = Vec::new();
 
     loop {
         let next = upstream_response.chunk().await.map_err(|error| {
@@ -45628,30 +45769,38 @@ async fn api_audio_tts_stream(
         if bytes.is_empty() {
             continue;
         }
-        if let Some(chunk) = pending_chunk.replace(bytes.to_vec()) {
-            let url = emit_realtime_tts_chunk_from_bytes(
+        let exceeds_size_limit = complete_audio
+            .len()
+            .checked_add(bytes.len())
+            .map(|total| total > MAX_TTS_STREAM_RESPONSE_BYTES)
+            .unwrap_or(true);
+        if exceeds_size_limit {
+            let received_bytes = (complete_audio.len() as u64).saturating_add(bytes.len() as u64);
+            update_realtime_session_states_for(&active_session_id, None, Some("error"));
+            emit_realtime_session_event_for(
+                "tts_stream_error",
                 &active_session_id,
-                request.turn_id.as_deref(),
-                request.generation_id,
-                request.segment_index,
-                &source,
-                &backend,
-                request.voice.as_deref(),
-                &mime_type,
-                now,
-                next_index,
-                None,
-                false,
-                &chunk,
-            )?;
-            total_bytes = total_bytes.saturating_add(chunk.len() as u64);
-            chunk_count = chunk_count.saturating_add(1);
-            next_index = next_index.saturating_add(1);
-            audio_urls.push(url);
+                json!({
+                    "source": source.clone(),
+                    "backend": backend.clone(),
+                    "upstream_url": upstream_url.clone(),
+                    "received_bytes": received_bytes,
+                    "max_bytes": MAX_TTS_STREAM_RESPONSE_BYTES,
+                    "error": "upstream audio response exceeded the size limit"
+                }),
+            );
+            return Err(api_error(
+                StatusCode::BAD_GATEWAY,
+                &format!(
+                    "Streaming TTS upstream audio exceeds {} bytes",
+                    MAX_TTS_STREAM_RESPONSE_BYTES
+                ),
+            ));
         }
+        complete_audio.extend_from_slice(&bytes);
     }
 
-    let Some(final_bytes) = pending_chunk else {
+    if complete_audio.is_empty() {
         update_realtime_session_states_for(&active_session_id, None, Some("error"));
         emit_realtime_session_event_for(
             "tts_stream_error",
@@ -45665,10 +45814,11 @@ async fn api_audio_tts_stream(
         );
         return Err(api_error(
             StatusCode::BAD_GATEWAY,
-            "Streaming TTS upstream returned no audio chunks",
+            "Streaming TTS upstream returned no audio bytes",
         ));
-    };
-    let final_chunk_count = chunk_count.saturating_add(1);
+    }
+
+    let total_bytes = complete_audio.len() as u64;
     let final_url = emit_realtime_tts_chunk_from_bytes(
         &active_session_id,
         request.turn_id.as_deref(),
@@ -45679,14 +45829,13 @@ async fn api_audio_tts_stream(
         request.voice.as_deref(),
         &mime_type,
         now,
-        next_index,
-        Some(final_chunk_count),
+        1,
+        Some(1),
         true,
-        &final_bytes,
+        &complete_audio,
     )?;
-    total_bytes = total_bytes.saturating_add(final_bytes.len() as u64);
-    audio_urls.push(final_url);
-    chunk_count = final_chunk_count;
+    let audio_urls = vec![final_url];
+    let chunk_count = 1_u64;
 
     emit_realtime_session_event_for(
         "tts_stream_ended",
@@ -46535,6 +46684,26 @@ mod tests {
     const WEB_STYLES_CSS: &str = include_str!("styles.css");
     const WEB_MAIN_RS: &str = include_str!("main.rs");
     const WEB_AVATAR_MANIFEST: &str = include_str!("../assets/avatars/manifest.json");
+
+    #[test]
+    fn default_mcp_config_is_portable_and_contains_no_developer_home_path() {
+        assert!(!super::DEFAULT_MCP_SERVERS_JSON.contains(r"C:\Users\"));
+        assert!(!super::DEFAULT_MCP_SERVERS_JSON.contains(r"C:\Python"));
+
+        let configs =
+            serde_json::from_str::<Vec<super::McpServerConfig>>(super::DEFAULT_MCP_SERVERS_JSON)
+                .expect("default MCP config should parse");
+        assert_eq!(configs.len(), 10);
+        let obsidian = configs
+            .iter()
+            .find(|config| config.id == "obsidian-mcp")
+            .expect("obsidian default config");
+        assert!(obsidian
+            .args
+            .iter()
+            .any(|arg| arg == r"knowledge\obsidian-vault"));
+        assert!(!obsidian.enabled);
+    }
 
     #[test]
     fn clawbot_repeat_failure_guard_only_applies_to_model_dispatch() {
@@ -48745,6 +48914,33 @@ mod tests {
     }
 
     #[test]
+    fn packaged_default_workspace_prefers_explicit_runtime_directory() {
+        let runtime_dir =
+            std::path::PathBuf::from(r"C:\Users\test\AppData\Local\CoolzhuAgent");
+        let workspace = super::default_workspace_path_from(
+            Some(runtime_dir.clone()),
+            Some(std::path::PathBuf::from(r"C:\Users\test")),
+            Some(std::path::PathBuf::from(
+                r"C:\Program Files\CoolzhuAgent",
+            )),
+        );
+        assert_eq!(workspace, runtime_dir);
+    }
+
+    #[test]
+    fn development_default_workspace_keeps_user_home_behavior() {
+        let workspace = super::default_workspace_path_from(
+            None,
+            Some(std::path::PathBuf::from(r"C:\Users\test")),
+            Some(std::path::PathBuf::from(r"C:\repo")),
+        );
+        assert_eq!(
+            workspace,
+            std::path::PathBuf::from(r"C:\Users\test\coolzhuagent")
+        );
+    }
+
+    #[test]
     fn workspace_tool_paths_are_scoped_to_selected_workspace() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let outside = tempfile::tempdir().expect("outside tempdir");
@@ -50161,7 +50357,7 @@ attach: last_assistant
         let command = super::validate_completion_condition(&serde_json::json!({
             "type": "Command",
             "commands": ["powershell -File tools/verify/verify_P0.ps1"],
-            "cwd": "C:\\Users\\zhupu\\Desktop\\coolzhuvr",
+            "cwd": "C:\\workspace\\coolzhu-project",
             "timeout_ms": 300000
         }));
         assert!(command.valid, "{:?}", command.issues);
@@ -50171,7 +50367,7 @@ attach: last_assistant
             normalized["commands"][0],
             "powershell -File tools/verify/verify_P0.ps1"
         );
-        assert_eq!(normalized["cwd"], "C:\\Users\\zhupu\\Desktop\\coolzhuvr");
+        assert_eq!(normalized["cwd"], "C:\\workspace\\coolzhu-project");
         assert_eq!(normalized["timeout_ms"], 300000);
     }
 
@@ -52396,7 +52592,10 @@ attach: last_assistant
         // GL-05/06：超重试上限后 phase 本身置 blocked（旧行为是留 running 仅暂停 goal）。
         assert_eq!(result.status.goal.phases[0].status, "blocked");
         assert_eq!(result.status.goal.phases[0].retry_count, 3);
-        assert_eq!(result.status.goal.phases[0].last_verdict.as_deref(), Some("fail"));
+        assert_eq!(
+            result.status.goal.phases[0].last_verdict.as_deref(),
+            Some("fail")
+        );
         assert!(
             !target.exists(),
             "goal flow must not create artifacts on behalf of the model"
@@ -52407,10 +52606,12 @@ attach: last_assistant
         let refreshed =
             super::get_goal_sqlite(&db_path, "workspace-html-recovery", &goal.id).expect("goal");
         assert_eq!(refreshed.status, "paused");
-        assert!(refreshed.recent_events.iter().any(|event| event.event_type
-            == "goal-phase-blocked"
-            && event.payload["phase_id"] == "implement"
-            && event.payload["retry_count"].as_u64() == Some(3)));
+        assert!(refreshed
+            .recent_events
+            .iter()
+            .any(|event| event.event_type == "goal-phase-blocked"
+                && event.payload["phase_id"] == "implement"
+                && event.payload["retry_count"].as_u64() == Some(3)));
     }
 
     #[test]
@@ -52689,7 +52890,10 @@ attach: last_assistant
         // 状态确实完成了……
         assert_eq!(phase.status, "completed");
         // ……但没有凭空写 verdict（保持 NULL），也没有 goal-phase-verdict 事件。
-        assert!(phase.last_verdict.is_none(), "手工完成不该伪造 pass verdict");
+        assert!(
+            phase.last_verdict.is_none(),
+            "手工完成不该伪造 pass verdict"
+        );
         assert!(!status
             .goal
             .recent_events
@@ -54672,7 +54876,10 @@ attach: last_assistant
         assert_eq!(json["retry_count"], serde_json::json!(1));
         assert_eq!(json["max_retries"], serde_json::json!(3));
         assert_eq!(json["last_verdict"], serde_json::json!("fail"));
-        assert_eq!(json["last_evidence"]["missing"][0], serde_json::json!("tests/foo.rs"));
+        assert_eq!(
+            json["last_evidence"]["missing"][0],
+            serde_json::json!("tests/foo.rs")
+        );
         // p1 的空结论序列化成 JSON null。
         let json1 = serde_json::to_value(p1).expect("serialize");
         assert!(json1["last_verdict"].is_null());
@@ -54745,7 +54952,16 @@ attach: last_assistant
                  last_evidence_json, route_hint FROM goal_phases \
                  WHERE goal_id='g1' AND id='impl'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .expect("impl row");
         assert_eq!(retry, 3, "retry_count 不该被 re-plan 清零");
@@ -54917,8 +55133,17 @@ attach: last_assistant
 
         let ev = serde_json::json!({ "text": "cargo test 失败" });
         // 第 1 次：retry 1/2，未超限。
-        let o1 = super::apply_phase_fail_retry_connection(&connection, "ws", "g1", "impl", "门失败", &ev, "running", false)
-            .expect("retry1");
+        let o1 = super::apply_phase_fail_retry_connection(
+            &connection,
+            "ws",
+            "g1",
+            "impl",
+            "门失败",
+            &ev,
+            "running",
+            false,
+        )
+        .expect("retry1");
         assert_eq!(o1.retry_count, 1);
         assert!(!o1.blocked);
         let (rc, st): (i64, String) = connection
@@ -54932,18 +55157,38 @@ attach: last_assistant
         assert_eq!(st, "running", "未超限应保持 running 重试");
 
         // 第 2 次：retry 2/2，仍未超限（2 <= 2）。
-        let o2 = super::apply_phase_fail_retry_connection(&connection, "ws", "g1", "impl", "门失败", &ev, "running", false)
-            .expect("retry2");
+        let o2 = super::apply_phase_fail_retry_connection(
+            &connection,
+            "ws",
+            "g1",
+            "impl",
+            "门失败",
+            &ev,
+            "running",
+            false,
+        )
+        .expect("retry2");
         assert_eq!(o2.retry_count, 2);
         assert!(!o2.blocked);
 
         // 第 3 次：retry 3 > max 2 → blocked。
-        let o3 = super::apply_phase_fail_retry_connection(&connection, "ws", "g1", "impl", "门失败", &ev, "running", false)
-            .expect("retry3");
+        let o3 = super::apply_phase_fail_retry_connection(
+            &connection,
+            "ws",
+            "g1",
+            "impl",
+            "门失败",
+            &ev,
+            "running",
+            false,
+        )
+        .expect("retry3");
         assert_eq!(o3.retry_count, 3);
         assert!(o3.blocked, "超 max_retries 应 blocked");
         let phase_status: String = connection
-            .query_row("SELECT status FROM goal_phases WHERE id='impl'", [], |r| r.get(0))
+            .query_row("SELECT status FROM goal_phases WHERE id='impl'", [], |r| {
+                r.get(0)
+            })
             .expect("phase");
         assert_eq!(phase_status, "blocked");
         let goal_status: String = connection
@@ -55115,13 +55360,18 @@ attach: last_assistant
         assert_eq!(impl_retry, 0, "blocked phase 重规划应重置 retry_count");
         // 非 blocked 的 verify：retry_count 按 GL-03 保留。
         let verify_retry: i64 = c
-            .query_row("SELECT retry_count FROM goal_phases WHERE id='verify'", [], |r| r.get(0))
+            .query_row(
+                "SELECT retry_count FROM goal_phases WHERE id='verify'",
+                [],
+                |r| r.get(0),
+            )
             .expect("verify");
         assert_eq!(verify_retry, 1, "非 blocked phase 的 retry_count 仍保留");
         // 记了解阻事件。
         let events = super::query_goal_events_connection(&c, "g1", 100).expect("events");
-        assert!(events.iter().any(|e| e.event_type == "goal-phase-unblocked"
-            && e.payload["phase_id"] == "impl"));
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == "goal-phase-unblocked" && e.payload["phase_id"] == "impl"));
     }
 
     /// GL-08 全局刹车：current_iteration 真实递增，达到 max_iterations 后 commander review
@@ -55147,7 +55397,10 @@ attach: last_assistant
         // 预算未耗尽时不因刹车阻断。
         let review = super::review_goal_commander_sqlite(&db, "ws", "g1", &[]).expect("review");
         assert!(
-            !review.blocking_reasons.iter().any(|r| r.contains("iteration budget")),
+            !review
+                .blocking_reasons
+                .iter()
+                .any(|r| r.contains("iteration budget")),
             "预算未耗尽不该出现刹车阻断"
         );
 
@@ -55169,7 +55422,11 @@ attach: last_assistant
         );
         // 且不会把计数顶过上限。
         let after: i64 = connection
-            .query_row("SELECT current_iteration FROM goals WHERE id='g1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT current_iteration FROM goals WHERE id='g1'",
+                [],
+                |r| r.get(0),
+            )
             .expect("count");
         assert_eq!(after, 2, "占用失败不该递增");
         drop(connection);
@@ -55177,7 +55434,10 @@ attach: last_assistant
         // 达到 max_iterations → commander review 阻断并建议暂停。
         let review = super::review_goal_commander_sqlite(&db, "ws", "g1", &[]).expect("review");
         assert!(
-            review.blocking_reasons.iter().any(|r| r.contains("iteration budget exhausted")),
+            review
+                .blocking_reasons
+                .iter()
+                .any(|r| r.contains("iteration budget exhausted")),
             "预算耗尽应给出刹车阻断理由"
         );
         assert!(review.pause_recommended);
@@ -55265,7 +55525,10 @@ attach: last_assistant
             "missing_artifacts": ["a.rs", "b.rs"],
             "text": "verifier 拒绝"
         }));
-        assert!(missing.contains("missing artifacts: a.rs, b.rs"), "{missing}");
+        assert!(
+            missing.contains("missing artifacts: a.rs, b.rs"),
+            "{missing}"
+        );
         assert!(missing.contains("report: verifier 拒绝"), "{missing}");
         // 不应是原始 JSON 串
         assert!(!missing.starts_with('{'), "不该直接吐 JSON: {missing}");
@@ -55275,8 +55538,16 @@ attach: last_assistant
         let cmd = super::goal_phase_evidence_digest(&serde_json::json!({
             "command_failures": [long]
         }));
-        assert!(cmd.contains("…[truncated]"), "截断需标注: {}", &cmd[..80.min(cmd.len())]);
-        assert!(cmd.starts_with("command failures:"), "{}", &cmd[..40.min(cmd.len())]);
+        assert!(
+            cmd.contains("…[truncated]"),
+            "截断需标注: {}",
+            &cmd[..80.min(cmd.len())]
+        );
+        assert!(
+            cmd.starts_with("command failures:"),
+            "{}",
+            &cmd[..40.min(cmd.len())]
+        );
 
         // 未知形态兜底也标注截断，不假装是完整 JSON。
         let unknown = super::goal_phase_evidence_digest(&serde_json::json!({ "weird": long }));
@@ -55337,7 +55608,11 @@ attach: last_assistant
         };
 
         // 未确认 → 不放行。
-        assert_eq!(action_of(), "awaiting_human_ack", "高风险阶段派发前须人工确认");
+        assert_eq!(
+            action_of(),
+            "awaiting_human_ack",
+            "高风险阶段派发前须人工确认"
+        );
 
         // 真实流程里是 dispatch 把阶段置成 awaiting 的（mark_goal_phases_awaiting_ack）。
         // ack 严格要求从 awaiting 转移，所以这里必须先走这一步。
@@ -55387,7 +55662,10 @@ attach: last_assistant
             "ws",
             &goal.id,
             "deploy",
-            super::GoalPhaseAckRequest { approved: true, reason: None },
+            super::GoalPhaseAckRequest {
+                approved: true,
+                reason: None
+            },
         )
         .is_err());
 
@@ -55419,7 +55697,10 @@ attach: last_assistant
             "ws",
             &goal.id,
             "deploy",
-            super::GoalPhaseAckRequest { approved: true, reason: None },
+            super::GoalPhaseAckRequest {
+                approved: true,
+                reason: None,
+            },
         )
         .expect("approve");
         assert_ne!(approved.goal.status, "paused", "批准后 goal 应恢复");
@@ -55436,7 +55717,10 @@ attach: last_assistant
             "ws",
             &goal.id,
             "nonexistent",
-            super::GoalPhaseAckRequest { approved: true, reason: None },
+            super::GoalPhaseAckRequest {
+                approved: true,
+                reason: None
+            },
         )
         .is_err());
     }
@@ -55495,7 +55779,10 @@ attach: last_assistant
             )
         };
 
-        assert!(complete("blocked", None).is_err(), "blocked 阶段不该能被完成");
+        assert!(
+            complete("blocked", None).is_err(),
+            "blocked 阶段不该能被完成"
+        );
         assert!(
             complete("rejected", None).is_err(),
             "被人工拒绝的阶段不该能被完成"
@@ -55595,7 +55882,10 @@ attach: last_assistant
                 "ws",
                 "g1",
                 "deploy",
-                super::GoalPhaseAckRequest { approved, reason: None },
+                super::GoalPhaseAckRequest {
+                    approved,
+                    reason: None,
+                },
             )
         };
 
@@ -55746,8 +56036,17 @@ attach: last_assistant
             .expect("seed");
         drop(connection);
 
-        let status = super::resume_goal_from_phase_sqlite(&db, "ws", "g1", "impl").expect("resume-from");
-        let phase = |id: &str| status.goal.phases.iter().find(|p| p.id == id).cloned().expect(id);
+        let status =
+            super::resume_goal_from_phase_sqlite(&db, "ws", "g1", "impl").expect("resume-from");
+        let phase = |id: &str| {
+            status
+                .goal
+                .phases
+                .iter()
+                .find(|p| p.id == id)
+                .cloned()
+                .expect(id)
+        };
 
         // 目标 impl + 下游 verify 重置为 pending、路由状态清空。
         let im = phase("impl");
@@ -55760,7 +56059,11 @@ attach: last_assistant
         assert!(ve.last_verdict.is_none());
         // 上游 plan 与独立分支 docs 保持 completed。
         assert_eq!(phase("plan").status, "completed", "上游不该被重置");
-        assert_eq!(phase("docs").status, "completed", "不依赖目标的分支不该被重置");
+        assert_eq!(
+            phase("docs").status,
+            "completed",
+            "不依赖目标的分支不该被重置"
+        );
         // goal 置回 running。
         assert_eq!(status.goal.status, "running");
         assert!(status
@@ -55772,8 +56075,11 @@ attach: last_assistant
 
         // codex #2：预算耗尽时 resume-from 与普通 resume 一致——拒绝，先抬高上限。
         let c = super::open_session_connection(&db).expect("open");
-        c.execute("UPDATE goals SET current_iteration=10, max_iterations=10 WHERE id='g1'", [])
-            .expect("exhaust");
+        c.execute(
+            "UPDATE goals SET current_iteration=10, max_iterations=10 WHERE id='g1'",
+            [],
+        )
+        .expect("exhaust");
         drop(c);
         assert!(
             super::resume_goal_from_phase_sqlite(&db, "ws", "g1", "impl").is_err(),
@@ -55910,8 +56216,14 @@ attach: last_assistant
         };
 
         // impl 未完成时，verify 应等待依赖（不抢跑）。
-        assert_eq!(action_of(&store.state.sessions, "verify"), "wait_dependency");
-        assert_eq!(action_of(&store.state.sessions, "impl"), "ready_to_dispatch");
+        assert_eq!(
+            action_of(&store.state.sessions, "verify"),
+            "wait_dependency"
+        );
+        assert_eq!(
+            action_of(&store.state.sessions, "impl"),
+            "ready_to_dispatch"
+        );
 
         // codex #1：走真实 pass 链路——impl 置 running，用无失败的模型答复经
         // record_goal_phase_model_result 完成（而不是直接改库造 completed），
@@ -55957,7 +56269,11 @@ attach: last_assistant
             .find(|p| p.id == "impl")
             .expect("impl");
         assert_eq!(impl_phase.status, "completed", "无失败的执行应完成 phase");
-        assert_eq!(impl_phase.last_verdict.as_deref(), Some("pass"), "完成即记 pass");
+        assert_eq!(
+            impl_phase.last_verdict.as_deref(),
+            Some("pass"),
+            "完成即记 pass"
+        );
         assert_eq!(
             action_of(&store.state.sessions, "verify"),
             "ready_to_dispatch",
@@ -56014,8 +56330,14 @@ attach: last_assistant
 
         let run_blocked = |store: &mut super::SessionStore| {
             let connection = super::open_session_connection(&db_path).expect("open");
-            super::update_goal_phase_status_connection(&connection, "ws", &goal.id, "impl", "running")
-                .expect("mark running");
+            super::update_goal_phase_status_connection(
+                &connection,
+                "ws",
+                &goal.id,
+                "impl",
+                "running",
+            )
+            .expect("mark running");
             drop(connection);
             store
                 .record_goal_phase_model_result(
@@ -56042,15 +56364,24 @@ attach: last_assistant
         };
 
         let impl_phase = |status: &super::GoalStatusResponse| {
-            status.goal.phases.iter().find(|p| p.id == "impl").cloned().expect("impl")
+            status
+                .goal
+                .phases
+                .iter()
+                .find(|p| p.id == "impl")
+                .cloned()
+                .expect("impl")
         };
         // codex #3：连续三次真实报阻（每次非终态后模拟 resume），逐次断言，
         // 让 off-by-one（>= vs >）无处遁形，并验证 retry_count 经 save/重读不丢。
         // max_retries 默认 2：retry 1、2 保持 pending 重规划，retry 3 才 blocked。
         let resume_running = || {
             let c = super::open_session_connection(&db_path).expect("open");
-            c.execute("UPDATE goals SET status='running' WHERE id=?1", super::params![&goal.id])
-                .expect("resume goal");
+            c.execute(
+                "UPDATE goals SET status='running' WHERE id=?1",
+                super::params![&goal.id],
+            )
+            .expect("resume goal");
         };
 
         let r1 = run_blocked(&mut store);
@@ -56068,7 +56399,10 @@ attach: last_assistant
         resume_running();
         let r2 = run_blocked(&mut store);
         let p2 = impl_phase(&r2.status);
-        assert_eq!(p2.status, "pending", "retry 2/2 仍未超限，应保持 pending 而非 blocked");
+        assert_eq!(
+            p2.status, "pending",
+            "retry 2/2 仍未超限，应保持 pending 而非 blocked"
+        );
         assert_eq!(p2.retry_count, 2);
 
         resume_running();
@@ -56080,10 +56414,15 @@ attach: last_assistant
         assert_eq!(r3.status.goal.status, "paused", "blocked 后 goal 应暂停");
         assert_eq!(p3.last_verdict.as_deref(), Some("fail"));
         assert!(p3.last_reason.is_some(), "应保留本次阻塞原因");
-        assert!(r3.status.goal.recent_events.iter().any(|e| e.event_type == "goal-phase-blocked"
-            && e.payload["phase_id"] == "impl"
-            && e.payload["retry_count"].as_u64() == Some(3)
-            && e.payload["max_retries"].as_u64() == Some(2)));
+        assert!(r3
+            .status
+            .goal
+            .recent_events
+            .iter()
+            .any(|e| e.event_type == "goal-phase-blocked"
+                && e.payload["phase_id"] == "impl"
+                && e.payload["retry_count"].as_u64() == Some(3)
+                && e.payload["max_retries"].as_u64() == Some(2)));
     }
 
     #[test]
@@ -56672,7 +57011,6 @@ attach: last_assistant
             "notes must explain the failure; got {:?}",
             resp.notes
         );
-
     }
 
     #[test]
@@ -56706,7 +57044,6 @@ attach: last_assistant
         // 至少有一条条目，caller=llm（`ToolCaller::Llm.as_str()`。
         assert!(raw.lines().any(|line| line.contains("\"caller\":\"llm\"")
             && line.contains("\"tool_name\":\"read_file\"")));
-
     }
 
     #[test]
@@ -56740,7 +57077,6 @@ attach: last_assistant
         assert!(raw.lines().any(|line| line.contains("\"caller\":\"llm\"")
             && line.contains("\"tool_name\":\"read_file\"")
             && line.contains("\"session_id\":\"agent-test6\"")));
-
     }
 
     #[test]
@@ -56828,7 +57164,6 @@ attach: last_assistant
         let raw = std::fs::read_to_string(&audit_path).expect("audit file exists");
         assert!(raw.lines().any(|line| line.contains("\"caller\":\"llm\"")
             && line.contains("\"tool_name\":\"chat_handoff\"")));
-
     }
 
     #[test]
@@ -57406,17 +57741,18 @@ attach: last_assistant
         let Json(list) = rt.block_on(super::api_tools_audit(axum::extract::Query(
             super::ToolAuditQuery { limit: Some(10) },
         )));
-        assert_eq!(
-            list.entries.len(),
-            1,
-            "audit 读回应正好一条（本测试 workspace 隔离）"
-        );
-        assert_eq!(list.entries[0].call_id, "audit-unique-1");
-        assert_eq!(list.entries[0].status, "ok");
-        assert!(!list.entries[0]
+        // 其它并行测试可能同时触发真实工具审计；只按本测试唯一 call_id
+        // 验证目标记录，避免把进程级审计活动误判为本用例失败。
+        let matching = list
+            .entries
+            .iter()
+            .filter(|entry| entry.call_id == "audit-unique-1")
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "本测试审计记录应恰好出现一次");
+        assert_eq!(matching[0].status, "ok");
+        assert!(!matching[0]
             .input_summary
             .contains("long-val-should-not-leak"));
-
     }
 
     #[test]
@@ -57467,7 +57803,6 @@ attach: last_assistant
         )));
         let ids: Vec<&str> = list.entries.iter().map(|e| e.call_id.as_str()).collect();
         assert_eq!(ids, vec!["limit-call-2", "limit-call-3", "limit-call-4"]);
-
     }
 
     #[test]
@@ -57528,7 +57863,6 @@ attach: last_assistant
         )));
         assert_eq!(list.entries.len(), 1, "坏行被跳过，只返回一条好");
         assert_eq!(list.entries[0].call_id, "clean-1");
-
     }
 
     #[test]
@@ -57935,6 +58269,7 @@ attach: last_assistant
                 caller: invoke.caller.as_str().to_string(),
                 workspace_id: invoke.workspace_id.clone(),
                 session_id: invoke.session_id.clone(),
+                chat_room_id: None,
                 input_summary: super::build_input_summary(&invoke.tool_name, &invoke.input),
                 permission: super::PendingApprovalPermission {
                     required: gate.required.as_str().to_string(),
@@ -58170,6 +58505,126 @@ attach: last_assistant
             !after.pending.iter().any(|r| r.call_id == call_id),
             "call_id 应被 approve 消费"
         );
+    }
+
+    #[test]
+    fn pending_confirm_requires_explicit_second_confirmation_and_remains_pending() {
+        let call_id = "call-confirm-required-retained".to_string();
+        let invoke = super::ToolInvoke {
+            call_id: call_id.clone(),
+            tool_name: "write_file".into(),
+            input: serde_json::json!({"path": "coolzhu.toml", "content": "x"}),
+            caller: super::ToolCaller::Llm,
+            workspace_id: "ws-confirm".into(),
+            session_id: Some("ses-confirm".into()),
+            user_authorized: false,
+            user_confirmed_twice: false,
+        };
+        let gate = runtime::PermissionGateReport {
+            required: super::PermissionMode::WorkspaceWrite,
+            decision: super::PermissionDecision::RequireConfirm,
+            reason: "protected file".into(),
+            protected_match: Some("coolzhu-config".into()),
+            workspace_relative: true,
+            affected_paths: vec!["coolzhu.toml".into()],
+        };
+        super::enqueue_pending_approval(&call_id, &invoke, &gate);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let error = rt
+            .block_on(super::api_tools_approve(Json(super::ApproveRequest {
+                call_id: call_id.clone(),
+                scope: Some("once".into()),
+                confirmed_twice: false,
+            })))
+            .expect_err("二次确认缺失时必须拒绝审批");
+        assert_eq!(error.0, super::StatusCode::BAD_REQUEST);
+        let Json(pending) = rt.block_on(super::api_tools_pending());
+        assert!(pending
+            .pending
+            .iter()
+            .any(|record| record.call_id == call_id));
+
+        let _ = rt
+            .block_on(super::api_tools_reject(Json(super::RejectRequest {
+                call_id,
+                reason: Some("cleanup".into()),
+            })))
+            .expect("cleanup reject");
+    }
+
+    #[test]
+    fn rejected_model_tool_writes_terminal_result_to_original_room_and_session() {
+        let _guard = config_test_guard();
+        super::clear_pending_approvals_for_test();
+        let mut session = super::seed_session();
+        session.id = "ses-tool-terminal".into();
+        session.messages.clear();
+        let room_id = "room-tool-terminal";
+        let _store_guard = SessionStoreTestGuard::install(super::PersistedSessionState {
+            sessions: vec![session],
+            active_session_id: Some("ses-tool-terminal".into()),
+            active_vision_session_id: None,
+            chat_rooms: vec![super::PersistedChatRoom {
+                id: room_id.into(),
+                name: "Tool Terminal Room".into(),
+                created_at: 1,
+                updated_at: 1,
+                messages: Vec::new(),
+            }],
+            active_chat_room_id: Some(room_id.into()),
+        });
+        let call_id = "call-room-terminal-reject".to_string();
+        let invoke = super::ToolInvoke {
+            call_id: call_id.clone(),
+            tool_name: "write_file".into(),
+            input: serde_json::json!({"path": "a.txt", "content": "x"}),
+            caller: super::ToolCaller::Llm,
+            workspace_id: "ws-room-terminal".into(),
+            session_id: Some("ses-tool-terminal".into()),
+            user_authorized: false,
+            user_confirmed_twice: false,
+        };
+        let gate = runtime::PermissionGateReport {
+            required: super::PermissionMode::WorkspaceWrite,
+            decision: super::PermissionDecision::RequireApproval,
+            reason: "approval needed".into(),
+            protected_match: None,
+            workspace_relative: true,
+            affected_paths: vec!["a.txt".into()],
+        };
+        super::enqueue_pending_approval_for_room(&call_id, &invoke, &gate, Some(room_id));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = rt
+            .block_on(super::api_tools_reject(Json(super::RejectRequest {
+                call_id,
+                reason: Some("用户拒绝测试".into()),
+            })))
+            .expect("reject");
+
+        let store = super::session_store().lock().expect("session store");
+        let room_message = store
+            .state
+            .chat_rooms
+            .iter()
+            .find(|room| room.id == room_id)
+            .and_then(|room| room.messages.last())
+            .expect("room terminal message");
+        assert_eq!(room_message.role, "assistant");
+        assert_eq!(room_message.kind, "tool-result");
+        assert!(room_message.content.contains("权限拒绝"));
+        assert!(room_message.content.contains("用户拒绝测试"));
+        let session_message = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("session terminal message");
+        assert_eq!(session_message.id, room_message.id);
     }
 
     #[test]
@@ -58484,7 +58939,7 @@ attach: last_assistant
     }
 
     #[test]
-    fn runtime_execute_write_file_inside_workspace_executes_real_write() {
+    fn runtime_execute_relative_write_file_is_scoped_to_active_workspace() {
         let _guard = config_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let patched = super::WorkspaceConfig {
@@ -58516,7 +58971,7 @@ attach: last_assistant
                     call_id: Some("rt-write-file-real".to_string()),
                     tool_name: "write_file".to_string(),
                     input: serde_json::json!({
-                        "path": target.to_string_lossy(),
+                        "path": "tool-regression-write.txt",
                         "content": "write-tool-ok"
                     }),
                     session_id: None,
@@ -59923,9 +60378,8 @@ attach: last_assistant
         assert!(WEB_STYLES_CSS.contains("ui-feedback-round3-authorization-three-column-design"));
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .task-permission-layout"));
         // 授权列迁出后任务窗口由三列改为两列布局。
-        assert!(WEB_STYLES_CSS.contains(
-            "grid-template-columns: minmax(320px, 1fr) minmax(300px, 1fr);"
-        ));
+        assert!(WEB_STYLES_CSS
+            .contains("grid-template-columns: minmax(320px, 1fr) minmax(300px, 1fr);"));
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .goal-role-assignment-grid label::before"));
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .module-selfcheck .logs-window-checks"));
     }
@@ -59977,9 +60431,9 @@ attach: last_assistant
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .module-selfcheck-row"));
         assert!(WEB_STYLES_CSS
             .contains("grid-template-columns: 42px minmax(0, 1fr) auto auto auto auto;"));
-        assert!(WEB_STYLES_CSS.contains(
-            "body.ui-3d .task-permission-layout .module-selfcheck-list"
-        ));
+        assert!(
+            WEB_STYLES_CSS.contains("body.ui-3d .task-permission-layout .module-selfcheck-list")
+        );
         assert!(WEB_STYLES_CSS.contains("min-height: 320px;"));
         assert!(WEB_STYLES_CSS.contains(
             "body.ui-3d .task-permission-layout .module-selfcheck-suggestions,\nbody.ui-3d .task-permission-layout .module-selfcheck-plan {\n  display: none;"
@@ -60742,8 +61196,9 @@ attach: last_assistant
     }
 
     #[test]
-    fn web_frontend_task_window_keeps_protected_paths_in_policy_not_ui() {
-        assert!(!WEB_INDEX_HTML.contains("data-role=\"task-protected-rules\""));
+    fn web_frontend_task_window_keeps_protected_paths_in_policy_and_supervision_ui() {
+        assert!(WEB_INDEX_HTML.contains("data-role=\"task-protected-rules\""));
+        assert!(WEB_INDEX_HTML.contains("运行监督"));
         assert!(WEB_INDEX_HTML.contains("workspace 内文件读写与命令执行按默认策略放行"));
         assert!(WEB_INDEX_HTML.contains("data-role=\"allowed-root-list\""));
         assert!(WEB_APP_JS.contains("/api/tools/protected-paths"));
@@ -60781,8 +61236,8 @@ attach: last_assistant
         // 任务授权窗口定时任务区的计划徽标（tasks.scheduleDue）与任务卡片无关，仍在此窗口保留。
         // 注：Phase 7 T2 仅迁移「任务卡片」内的计划数至任务链弹层，不影响本窗口的 scheduleDue。
         assert!(WEB_INDEX_HTML.contains("tasks.scheduleDue"));
-        assert!(!WEB_INDEX_HTML.contains("data-role=\"task-handoff-list\""));
-        assert!(!WEB_INDEX_HTML.contains("data-role=\"task-audit-summary\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"task-handoff-list\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"task-audit-summary\""));
         assert!(!WEB_INDEX_HTML.contains("data-role=\"task-goal-placeholder\""));
         assert!(WEB_APP_JS.contains("/api/task-schedules"));
         assert!(WEB_APP_JS.contains("/api/task-schedules/run-due"));
@@ -60856,8 +61311,8 @@ attach: last_assistant
     fn web_frontend_task_card_connects_goal_progress_api() {
         assert!(WEB_INDEX_HTML.contains("data-bind=\"task.currentTitle\""));
         assert!(WEB_INDEX_HTML.contains("data-bind=\"task.currentProgress\""));
-        // Phase 7 T2：摘要（task.currentSummary）从任务卡片迁入「任务链」弹层顶部摘要头，卡片不再直接展示
-        assert!(!WEB_INDEX_HTML.contains("data-bind=\"task.currentSummary\""));
+        // 摘要不回填顶部紧凑任务卡，但在任务中心默认折叠的「运行监督」中恢复可见宿主。
+        assert!(WEB_INDEX_HTML.contains("data-bind=\"task.currentSummary\""));
         assert!(WEB_INDEX_HTML.contains("data-action=\"task-card-chain\""));
         assert!(!WEB_INDEX_HTML.contains("data-role=\"goal-create-title\""));
         assert!(WEB_APP_JS.contains("/api/goals?limit=30"));
@@ -61040,9 +61495,9 @@ attach: last_assistant
         assert!(WEB_INDEX_HTML.contains("data-bind=\"approval.decisionLabel\""));
         assert!(WEB_APP_JS.contains("function renderTaskCardApprovalBadge"));
         assert!(WEB_STYLES_CSS.contains(".task-summary-approval-badge[hidden]"));
-        // Success Rate 从任务卡片迁入「任务链」弹层顶部（app.js 动态渲染），不再出现在任务卡片 HTML 中
-        assert!(!WEB_INDEX_HTML.contains("data-bind=\"task.successRate\""));
-        assert!(!WEB_INDEX_HTML.contains("data-role=\"task-success-rate-bar\""));
+        // Success Rate 不回填顶部紧凑任务卡，在任务中心「运行监督」中集中显示。
+        assert!(WEB_INDEX_HTML.contains("data-bind=\"task.successRate\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"task-success-rate-bar\""));
         assert!(WEB_APP_JS.contains("function taskChainSummaryHeadHtml"));
         assert!(WEB_APP_JS.contains("data-role=\"task-chain-summary-rate-bar\""));
         assert!(WEB_APP_JS.contains("${snapshot.successRate}%"));
@@ -61118,7 +61573,7 @@ attach: last_assistant
         let hint = detection_launcher_hint(&detection).expect("uidetr launcher hint");
         assert!(hint.contains("modules/vision/resources/uidetr/uidetr_service.py"));
         assert!(hint.contains(r"C:\models\ui-detr.pth"));
-        assert!(!hint.contains("zhupu"));
+        assert!(!hint.contains(r"C:\Users\"));
     }
 
     #[test]
@@ -61145,15 +61600,13 @@ attach: last_assistant
     }
 
     #[test]
-    fn web_frontend_settings_keeps_goal_config_but_not_goal_creation() {
+    fn web_frontend_task_center_exposes_goal_creation_and_role_config() {
         assert!(WEB_INDEX_HTML.contains("data-role=\"goal-role-consult\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"goal-role-assignment-grid\""));
-        assert!(!WEB_INDEX_HTML.contains("data-role=\"goal-consult-title\""));
-        assert!(!WEB_INDEX_HTML.contains("data-action=\"goal-create\""));
-        assert!(!WEB_INDEX_HTML.contains("data-role=\"goal-consult-list\""));
-        assert!(
-            !WEB_INDEX_HTML.contains("暂无 Goal。创建后可 seed plan、Review、Dispatch、Complete。")
-        );
+        assert!(WEB_INDEX_HTML.contains("data-role=\"goal-consult-title\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"goal-create\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"goal-consult-list\""));
+        assert!(WEB_INDEX_HTML.contains("data-bind=\"tasks.goalCount\""));
     }
 
     #[test]
@@ -61242,8 +61695,8 @@ attach: last_assistant
         assert!(WEB_INDEX_HTML.contains("data-goal-role-assignment=\"planner\""));
         assert!(WEB_INDEX_HTML.contains("data-goal-role-assignment=\"implementer\""));
         assert!(WEB_INDEX_HTML.contains("data-goal-role-assignment=\"verifier\""));
-        assert!(!WEB_INDEX_HTML.contains("data-role=\"goal-consult-title\""));
-        assert!(!WEB_INDEX_HTML.contains("data-role=\"goal-consult-list\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"goal-consult-title\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"goal-consult-list\""));
         assert!(WEB_APP_JS.contains("function renderGoalRoleAssignmentMatrix"));
         assert!(WEB_APP_JS.contains("function applyGoalRoleAssignments"));
         assert!(WEB_APP_JS.contains("function goalConsultCandidateSessions"));
@@ -61293,7 +61746,7 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("risk_level"));
         assert!(WEB_STYLES_CSS.contains(".overview-active-roles"));
         assert!(WEB_STYLES_CSS.contains(".overview-role-chip"));
-        assert!(!WEB_INDEX_HTML.contains("data-role=\"task-role-risk-list\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"task-role-risk-list\""));
     }
 
     #[test]
@@ -61517,11 +61970,26 @@ attach: last_assistant
 
     #[test]
     fn non_stream_model_tool_loop_allows_multiple_feedback_rounds() {
+        let normalized_source = WEB_MAIN_RS.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(WEB_MAIN_RS.contains(
             "let max_tool_feedback_rounds = tool_execution_policy().max_feedback_rounds;"
         ));
         assert!(WEB_MAIN_RS.contains("round < max_tool_feedback_rounds"));
         assert!(WEB_MAIN_RS.contains("history.clone().unwrap_or_else(|| base_history.clone())"));
+        assert!(normalized_source.contains(
+            "tool_feedback_watchdog_message( max_tool_feedback_rounds, tool_requests.len(), );"
+        ));
+    }
+
+    #[test]
+    fn stream_model_tool_loop_reuses_full_context_assembly() {
+        assert!(WEB_MAIN_RS.contains("(assembly.messages.clone(), assembly.system_prompt.clone())"));
+        assert!(WEB_MAIN_RS.contains(
+            "agent_message_request_with_context_messages(\n                        agent,\n                        false,\n                        &loop_system_prompt,"
+        ));
+        assert!(!WEB_MAIN_RS.contains(
+            "let round_messages = vec![\n                    InputMessage::user_text(result.user_content.clone())"
+        ));
     }
 
     #[test]
@@ -62043,6 +62511,36 @@ attach: last_assistant
     }
 
     #[test]
+    fn web_frontend_exposes_real_management_and_diagnostic_controls() {
+        assert!(WEB_INDEX_HTML.contains("data-action=\"project-symbol-index\""));
+        assert!(WEB_APP_JS.contains("/api/project/symbol-index"));
+        assert!(WEB_APP_JS.contains("JSON.stringify({ full: false })"));
+        assert!(WEB_APP_JS.contains("response.symbol_count"));
+        assert!(WEB_APP_JS.contains("renderToolItem(selected)"));
+        assert!(WEB_APP_JS.contains("确认已加载"));
+        assert!(!WEB_APP_JS.contains("Will install"));
+        assert!(!WEB_APP_JS.contains("installCatalogItem"));
+
+        assert!(WEB_INDEX_HTML.contains("data-tool-detail=\"mcp\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"mcp-call\""));
+        assert!(WEB_APP_JS.contains("/api/mcp/servers"));
+        assert!(WEB_APP_JS.contains("/api/mcp/call"));
+        assert!(WEB_APP_JS.contains("window.confirm(confirmation)"));
+
+        assert!(WEB_INDEX_HTML.contains("data-action=\"browser-bridge-health\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"browser-bridge-probe\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"browser-bridge-self-test\""));
+        assert!(WEB_APP_JS.contains("/api/computer-use/browser/self-test"));
+        assert!(WEB_APP_JS.contains("browserWindowUpdateNavigationControls"));
+        assert!(WEB_APP_JS.contains("系统默认浏览器由外部进程管理"));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"safe-context-menu-test\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"safe-drag-select-test\""));
+        assert!(WEB_APP_JS.contains("/api/computer-use/safe-context-menu"));
+        assert!(WEB_APP_JS.contains("/api/computer-use/safe-drag-select"));
+        assert!(WEB_APP_JS.contains("execute: true"));
+    }
+
+    #[test]
     fn web_frontend_audio_realtime_and_indextts_are_wired() {
         assert!(WEB_INDEX_HTML.contains("data-bind=\"audio.indexTts\""));
         assert!(WEB_INDEX_HTML.contains("data-bind=\"audio.realtime\""));
@@ -62488,7 +62986,11 @@ attach: last_assistant
         assert!(WEB_MAIN_RS.contains("struct TtsChunkRequest"));
         assert!(WEB_APP_JS.contains("function ttsStreamText"));
         assert!(WEB_APP_JS.contains("/api/audio/tts/stream"));
-        assert!(WEB_APP_JS.contains("preferStreaming: realtimeStreamingTtsEnabled()"));
+        // full-stream 模式由 assistant delta 直接调用 ttsStreamText；最终消息只在
+        // 增量播放未完成时走普通 TTS 回退，不能再次触发流式请求造成重复朗读。
+        assert!(WEB_APP_JS
+            .contains("if (!realtimeFullStreamOperational() || !realtimeStreamingTtsEnabled()"));
+        assert!(WEB_APP_JS.contains("preferStreaming: false"));
         assert!(WEB_APP_JS.contains("function enqueueRealtimeTtsChunk"));
         assert!(WEB_APP_JS.contains("realtimeTtsChunkQueue"));
         assert!(WEB_APP_JS.contains("payload.audio_url"));
@@ -62499,7 +63001,9 @@ attach: last_assistant
     fn manual_tts_reads_the_current_assistant_message_markup() {
         assert!(WEB_APP_JS.contains("function lastAssistantMessageTextForTts"));
         assert!(WEB_APP_JS.contains("function sanitizeAssistantMessageTextForTts"));
-        assert!(WEB_APP_JS.contains("Remote context usage:"));
+        assert!(WEB_APP_JS.contains("function splitAssistantSpeechTextForTts"));
+        assert!(WEB_APP_JS.contains(r"Remote\s+"));
+        assert!(WEB_APP_JS.contains("Context usage"));
         assert!(WEB_APP_JS.contains(r#".message.bot [data-role="message-content"]"#));
     }
 
@@ -63126,7 +63630,7 @@ attach: last_assistant
     }
 
     #[tokio::test]
-    async fn audio_tts_stream_adapter_forwards_upstream_chunks_to_tts_chunk_events() {
+    async fn audio_tts_stream_adapter_aggregates_transport_chunks_into_one_audio_unit() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let _guard = realtime_audio_test_guard().await;
@@ -63208,12 +63712,17 @@ attach: last_assistant
             response.session_id.as_deref(),
             Some("rt-tts-stream-adapter")
         );
-        assert_eq!(response.chunk_count, 2);
+        let expected_audio = [
+            b"RIFFstreaming-tts-part-1".as_slice(),
+            b"streaming-tts-part-2",
+        ]
+        .concat();
+        assert_eq!(response.chunk_count, 1);
         assert_eq!(response.turn_id.as_deref(), Some("turn-correlation-test"));
         assert_eq!(response.generation_id, Some(7));
         assert_eq!(response.segment_index, Some(3));
-        assert!(response.bytes > 0);
-        assert_eq!(response.audio_urls.len(), 2);
+        assert_eq!(response.bytes, expected_audio.len() as u64);
+        assert_eq!(response.audio_urls.len(), 1);
         assert!(response
             .audio_urls
             .iter()
@@ -63221,7 +63730,7 @@ attach: last_assistant
 
         let mut chunk_events = Vec::new();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-        while chunk_events.len() < 2 {
+        while chunk_events.is_empty() {
             let event = tokio::time::timeout_at(deadline, receiver.recv())
                 .await
                 .expect("tts stream chunk event")
@@ -63232,16 +63741,36 @@ attach: last_assistant
                 chunk_events.push(event);
             }
         }
-        let first = &chunk_events[0];
-        let second = &chunk_events[1];
-        assert_eq!(first.kind, "tts_chunk");
-        assert_eq!(second.kind, "tts_chunk");
-        assert_eq!(first.payload["final_chunk"], json!(false));
-        assert_eq!(second.payload["final_chunk"], json!(true));
-        assert_eq!(second.payload["chunk_count"], json!(2));
-        assert_eq!(first.payload["turn_id"], json!("turn-correlation-test"));
-        assert_eq!(first.payload["generation_id"], json!(7));
-        assert_eq!(first.payload["segment_index"], json!(3));
+        let only_chunk = &chunk_events[0];
+        assert_eq!(only_chunk.kind, "tts_chunk");
+        assert_eq!(only_chunk.payload["final_chunk"], json!(true));
+        assert_eq!(only_chunk.payload["chunk_count"], json!(1));
+        assert_eq!(only_chunk.payload["total"], json!(1));
+        assert_eq!(
+            only_chunk.payload["turn_id"],
+            json!("turn-correlation-test")
+        );
+        assert_eq!(only_chunk.payload["generation_id"], json!(7));
+        assert_eq!(only_chunk.payload["segment_index"], json!(3));
+        assert_eq!(
+            only_chunk.payload["chunk_bytes"],
+            json!(expected_audio.len() as u64)
+        );
+        let audio_path = only_chunk.payload["audio_path"]
+            .as_str()
+            .expect("aggregated tts event audio path");
+        assert_eq!(
+            std::fs::read(audio_path).expect("read aggregated tts audio"),
+            expected_audio
+        );
+        let _ = std::fs::remove_file(audio_path);
+
+        while let Ok(event) = receiver.try_recv() {
+            assert_ne!(
+                event.kind, "tts_chunk",
+                "one upstream response must emit exactly one tts_chunk event"
+            );
+        }
 
         let raw_realtime = super::realtime_session_state()
             .lock()
@@ -64420,6 +64949,46 @@ attach: last_assistant
     }
 
     #[test]
+    fn persisted_context_usage_footer_is_removed_before_the_next_model_turn() {
+        let message = super::PersistedChatMessage {
+            id: "context-footer-history".into(),
+            author: "Agent".into(),
+            role: "assistant".into(),
+            target: "聊天".into(),
+            content: "真正的模型回答\n\n---\nContext usage: 31.0% (310/1000 input tokens; source=remote)."
+                .into(),
+            kind: "assistant-reply".into(),
+            attachments: Vec::new(),
+            created_at: 1,
+        };
+        let input = super::input_message_from_persisted(&message);
+        assert_eq!(input.role, "assistant");
+        match input.content.as_slice() {
+            [api::InputContentBlock::Text { text }] => {
+                assert_eq!(text, "真正的模型回答");
+                assert!(!text.contains("Context usage:"));
+            }
+            other => panic!("unexpected persisted context blocks: {other:?}"),
+        }
+        assert_eq!(
+            super::strip_context_usage_footer(
+                "answer\n\n---\nRemote context usage: 7.0% (70/1000 input tokens)"
+            ),
+            "answer"
+        );
+    }
+
+    #[test]
+    fn tool_feedback_watchdog_is_an_explicit_non_execution_terminal() {
+        let message = super::tool_feedback_watchdog_message(6, 2);
+        assert!(message.contains("status=blocked"));
+        assert!(message.contains("error_code=tool_feedback_round_limit"));
+        assert!(message.contains("pending_tool_calls=2"));
+        assert!(message.contains("未执行"));
+        assert!(!message.contains("完成本轮任务"));
+    }
+
+    #[test]
     fn persisted_session_to_agent_session_preserves_configured_model_type() {
         let mut session = super::seed_session();
         session.model = "gpt-4.1".to_string();
@@ -65101,6 +65670,7 @@ attach: last_assistant
 
     #[test]
     fn scheduled_task_system_room_is_excluded_from_eight_user_room_limit() {
+        let _serial = config_test_guard();
         let _guard = SessionStoreTestGuard::install(scheduled_room_test_state());
         // 先幂等注入系统室。
         {
@@ -65135,6 +65705,7 @@ attach: last_assistant
 
     #[test]
     fn scheduled_task_system_room_rejects_rename_and_delete() {
+        let _serial = config_test_guard();
         let _guard = SessionStoreTestGuard::install(scheduled_room_test_state());
         {
             let mut store = super::session_store().lock().expect("session store");
@@ -65178,6 +65749,7 @@ attach: last_assistant
 
     #[test]
     fn scheduled_task_system_room_mirrors_goal_messages_preserving_ids_without_duplicates() {
+        let _serial = config_test_guard();
         let _guard = SessionStoreTestGuard::install(scheduled_room_test_state());
         let message = super::ChatMessageDto {
             id: "goal-msg-1".to_string(),
@@ -65215,6 +65787,7 @@ attach: last_assistant
 
     #[test]
     fn scheduled_task_system_room_writes_concise_status_messages() {
+        let _serial = config_test_guard();
         let _guard = SessionStoreTestGuard::install(scheduled_room_test_state());
         let cases = [
             ("failed", "执行失败：构建未通过"),
@@ -65427,7 +66000,10 @@ attach: last_assistant
             "clawbot-task-continue",
             "clawbot-task-stop",
         ] {
-            assert!(WEB_INDEX_HTML.contains(required_marker), "页面缺少 {required_marker}");
+            assert!(
+                WEB_INDEX_HTML.contains(required_marker),
+                "页面缺少 {required_marker}"
+            );
         }
         assert!(
             WEB_APP_JS.contains("function runClawbotPrivateCommand")
@@ -65446,15 +66022,19 @@ attach: last_assistant
         assert!(WEB_INDEX_HTML.contains("data-clawbot-segment-tab=\"private\""));
         assert!(WEB_INDEX_HTML.contains("data-clawbot-segment-tab=\"admin\""));
         assert!(WEB_INDEX_HTML.contains("data-clawbot-segment=\"binding\""));
-        assert!(WEB_INDEX_HTML.contains("data-clawbot-segment=\"private\" aria-label=\"私聊文件与任务管理\" hidden"));
-        assert!(WEB_INDEX_HTML.contains("data-clawbot-segment=\"admin\" aria-label=\"微信连接操作管理员\" hidden"));
+        assert!(WEB_INDEX_HTML
+            .contains("data-clawbot-segment=\"private\" aria-label=\"私聊文件与任务管理\" hidden"));
+        assert!(WEB_INDEX_HTML
+            .contains("data-clawbot-segment=\"admin\" aria-label=\"微信连接操作管理员\" hidden"));
         assert!(WEB_STYLES_CSS.contains(".clawbot-segment-panel[hidden]"));
         assert!(WEB_APP_JS.contains("function initClawbotSegments"));
         assert!(!WEB_INDEX_HTML.contains("clawbot-security-card"));
         assert!(!WEB_INDEX_HTML.contains("clawbot-status-orb"));
         assert!(WEB_INDEX_HTML.contains("clawbot-sidecar-summary"));
         assert_eq!(
-            WEB_INDEX_HTML.matches("data-action=\"clawbot-save-binding\"").count(),
+            WEB_INDEX_HTML
+                .matches("data-action=\"clawbot-save-binding\"")
+                .count(),
             1,
             "保存绑定只应出现在绑定分段"
         );
@@ -65881,8 +66461,11 @@ attach: last_assistant
     async fn file_get_runtime_returns_artifact_and_file_outbox_payload() {
         let _config_guard = config_test_guard();
         let temp = tempfile::tempdir().expect("temp workspace");
-        std::fs::write(temp.path().join("Cargo.toml"), "[package]\nname = \"wx-file-test\"\n")
-            .expect("test Cargo.toml");
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"wx-file-test\"\n",
+        )
+        .expect("test Cargo.toml");
         let _workspace_guard = WorkspaceScopeTestGuard::install(temp.path());
 
         let result = super::execute_clawbot_command_runtime(
@@ -65939,7 +66522,10 @@ attach: last_assistant
             .expect("unique configured names should normalize");
 
         assert_eq!(normalized.chat_room_id.as_deref(), Some("room-test"));
-        assert_eq!(normalized.default_session_id.as_deref(), Some("session-glm"));
+        assert_eq!(
+            normalized.default_session_id.as_deref(),
+            Some("session-glm")
+        );
     }
 
     #[test]
@@ -66261,7 +66847,10 @@ attach: last_assistant
         let (status, channel_status) =
             json_request(Method::GET, "/api/channels/clawbot/status", "{}").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(channel_status.get("status").and_then(JsonValue::as_str).is_some());
+        assert!(channel_status
+            .get("status")
+            .and_then(JsonValue::as_str)
+            .is_some());
 
         let (status, commands) =
             json_request(Method::GET, "/api/channels/clawbot/commands", "{}").await;
@@ -66281,7 +66870,10 @@ attach: last_assistant
         let (status, metrics) =
             json_request(Method::GET, "/api/channels/clawbot/gateway/metrics", "{}").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(metrics.get("inbox_completed").and_then(JsonValue::as_u64).is_some());
+        assert!(metrics
+            .get("inbox_completed")
+            .and_then(JsonValue::as_u64)
+            .is_some());
 
         let execute_body = json!({
             "account_id": "",

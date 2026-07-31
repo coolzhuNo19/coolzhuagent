@@ -424,8 +424,7 @@ mod tests {
     #[test]
     fn stored_capability_blob_cannot_escalate_an_ordinary_member() {
         let mut member = grant(WechatMemberPreset::ChatMember);
-        member.capabilities =
-            WechatCapabilitySet::for_preset(WechatMemberPreset::Administrator);
+        member.capabilities = WechatCapabilitySet::for_preset(WechatMemberPreset::Administrator);
         let mut input = context(WechatCapability::TasksControl);
         input.grant = Some(&member);
 

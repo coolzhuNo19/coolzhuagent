@@ -12,10 +12,18 @@ if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
 
 $resolvedRoot = (Resolve-Path -LiteralPath $Root).Path.TrimEnd('\', '/')
 $rootPrefix = $resolvedRoot + [System.IO.Path]::DirectorySeparatorChar
-$blockedPathPattern = '(?i)(^|[/\\])(\.coolzhu|backup|backups|tmp|logs?|sessions?)([/\\]|$)|web-sessions|coolzhu\.toml$|(^|[/\\])\.env($|\.)|\.(sqlite3?|db)$'
-$textExtensions = @('.txt', '.json', '.toml', '.yaml', '.yml', '.ini', '.conf', '.config', '.md', '.ps1', '.cmd', '.bat', '.js', '.mjs', '.ts', '.tsx', '.html', '.css', '.rs')
-$credentialPattern = '(?im)^\s*["'']?(api[_-]?key|access[_-]?token|token|secret|password)["'']?\s*[:=]\s*["''](?!(test|dummy|example|sample|access-token|saved-access-token|expired-access-token)\b)([A-Za-z0-9_\-\./+=]{16,})["'']'
-$bearerPattern = '(?im)^\s*(authorization\s*:\s*bearer\s+)[A-Za-z0-9_\-\./+=]{8,}'
+$blockedPathPattern = '(?i)(^|[/\\])(\.coolzhu|\.git|\.claude|\.superpowers|__pycache__|backups?(?:-[^/\\]+)?|tmp|logs?|sessions?)([/\\]|$)|web-sessions|coolzhu\.toml$|package-report\.json$|(^|[/\\])\.env($|\.)|\.(sqlite3?|db)(-(wal|shm|journal))?$|\.(pyc|pyo|bak|old|orig|rej|pem|key|pfx|p12)$|(^|[/\\])(credentials?|secrets?|token-cache|credential-cache|access-token|refresh-token|session-token|auth-token)(\.[^/\\]+)?$'
+$textExtensions = @(
+    '.txt', '.json', '.toml', '.yaml', '.yml', '.ini', '.conf', '.config',
+    '.md', '.ps1', '.cmd', '.bat', '.sh', '.js', '.mjs', '.cjs', '.ts',
+    '.tsx', '.jsx', '.html', '.css', '.scss', '.rs', '.py', '.c', '.h',
+    '.cpp', '.hpp', '.java', '.kt', '.dart', '.sql', '.wxs', '.xml',
+    '.svg', '.lock'
+)
+$credentialPattern = '(?im)^\s*["'']?(api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?token|client[_-]?secret|private[_-]?key|cookie|credential|token|secret|password)["'']?\s*[:=]\s*["''](?!(test|dummy|example|sample|access-token|saved-access-token|expired-access-token)\b)([A-Za-z0-9_\-\./+=]{16,})["'']'
+$bearerPattern = '(?im)\bauthorization\s*[:=]\s*["'']?bearer\s+(?!(test|dummy|example|sample)\b)[A-Za-z0-9_\-\./+=]{8,}'
+$urlCredentialPattern = '(?i)[?&](api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?token|token|secret|key)=(?!(test|dummy|example|sample)\b)[A-Za-z0-9_\-\./+=]{12,}'
+$privateKeyPattern = '(?i)-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----'
 $findings = [System.Collections.Generic.List[object]]::new()
 
 foreach ($file in Get-ChildItem -LiteralPath $resolvedRoot -File -Recurse -Force) {
@@ -24,12 +32,27 @@ foreach ($file in Get-ChildItem -LiteralPath $resolvedRoot -File -Recurse -Force
         $findings.Add([pscustomobject]@{ path = $relativePath; reason = 'blocked-path' })
         continue
     }
-    if ($file.Length -gt 2MB -or $textExtensions -notcontains $file.Extension.ToLowerInvariant()) {
+    if ($textExtensions -notcontains $file.Extension.ToLowerInvariant()) {
         continue
     }
-    $content = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop
-    if ($content -match $credentialPattern -or $content -match $bearerPattern) {
-        $findings.Add([pscustomobject]@{ path = $relativePath; reason = 'credential-assignment' })
+
+    # 逐行扫描而不是跳过大文件，避免模型配置、内联前端资源等超过 2 MB 后
+    # 成为凭据泄漏盲区；同时不把整份巨型文本一次性载入内存。
+    $reader = [System.IO.StreamReader]::new($file.FullName, $true)
+    try {
+        while (($line = $reader.ReadLine()) -ne $null) {
+            if (
+                $line -match $credentialPattern -or
+                $line -match $bearerPattern -or
+                $line -match $urlCredentialPattern -or
+                $line -match $privateKeyPattern
+            ) {
+                $findings.Add([pscustomobject]@{ path = $relativePath; reason = 'credential-assignment' })
+                break
+            }
+        }
+    } finally {
+        $reader.Dispose()
     }
 }
 

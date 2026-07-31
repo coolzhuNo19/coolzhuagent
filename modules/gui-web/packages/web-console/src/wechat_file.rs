@@ -484,7 +484,10 @@ mod tests {
         assert_eq!(attachment.size_bytes, bytes.len() as u64);
         assert_eq!(
             PathBuf::from(&attachment.local_path),
-            temp.path().join("sample.bin").canonicalize().expect("canonical")
+            temp.path()
+                .join("sample.bin")
+                .canonicalize()
+                .expect("canonical")
         );
         assert!(attachment.checksum.starts_with("fnv64:"));
     }

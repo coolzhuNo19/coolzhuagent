@@ -39,13 +39,52 @@
     <Feature Id="Main" Title="COOLZHU CODE Agent" Level="1">
       <ComponentRef Id="LauncherComponent" />
       <Files Directory="INSTALLDIR" Include="$(PackageRoot)\**">
-        <Exclude Files="$(PackageRoot)\**\web-sessions*" />
-        <Exclude Files="$(PackageRoot)\**\coolzhu.toml" />
-        <Exclude Files="$(PackageRoot)\**\.env*" />
-        <Exclude Files="$(PackageRoot)\**\*.sqlite" />
-        <Exclude Files="$(PackageRoot)\**\*.sqlite3" />
-        <Exclude Files="$(PackageRoot)\**\*.db" />
-        <Exclude Files="$(PackageRoot)\.claw-todos.json" />
+        <!--
+          Keep recursive globs in the final file-selection segment so these
+          patterns compile with the bundled WiX 5 harvester. Directory
+          exclusions (including backup/tmp/session trees) are enforced by
+          the mandatory package safety scan before WiX runs; these patterns
+          are defense-in-depth for blocked file names and extensions.
+        -->
+        <Exclude Files="$(PackageRoot)\**web-sessions*" />
+        <Exclude Files="$(PackageRoot)\**coolzhu.toml" />
+        <Exclude Files="$(PackageRoot)\**.env*" />
+        <Exclude Files="$(PackageRoot)\**.sqlite" />
+        <Exclude Files="$(PackageRoot)\**.sqlite-*" />
+        <Exclude Files="$(PackageRoot)\**.sqlite3" />
+        <Exclude Files="$(PackageRoot)\**.sqlite3-*" />
+        <Exclude Files="$(PackageRoot)\**.db" />
+        <Exclude Files="$(PackageRoot)\**.db-*" />
+        <Exclude Files="$(PackageRoot)\**.bak" />
+        <Exclude Files="$(PackageRoot)\**.old" />
+        <Exclude Files="$(PackageRoot)\**.orig" />
+        <Exclude Files="$(PackageRoot)\**.rej" />
+        <Exclude Files="$(PackageRoot)\**.pem" />
+        <Exclude Files="$(PackageRoot)\**.key" />
+        <Exclude Files="$(PackageRoot)\**.pfx" />
+        <Exclude Files="$(PackageRoot)\**.p12" />
+        <Exclude Files="$(PackageRoot)\**.claw-todos.json" />
+        <Exclude Files="$(PackageRoot)\**credential" />
+        <Exclude Files="$(PackageRoot)\**credential.*" />
+        <Exclude Files="$(PackageRoot)\**credentials" />
+        <Exclude Files="$(PackageRoot)\**credentials.*" />
+        <Exclude Files="$(PackageRoot)\**secret" />
+        <Exclude Files="$(PackageRoot)\**secret.*" />
+        <Exclude Files="$(PackageRoot)\**secrets" />
+        <Exclude Files="$(PackageRoot)\**secrets.*" />
+        <Exclude Files="$(PackageRoot)\**token-cache" />
+        <Exclude Files="$(PackageRoot)\**token-cache.*" />
+        <Exclude Files="$(PackageRoot)\**credential-cache" />
+        <Exclude Files="$(PackageRoot)\**credential-cache.*" />
+        <Exclude Files="$(PackageRoot)\**access-token" />
+        <Exclude Files="$(PackageRoot)\**access-token.*" />
+        <Exclude Files="$(PackageRoot)\**refresh-token" />
+        <Exclude Files="$(PackageRoot)\**refresh-token.*" />
+        <Exclude Files="$(PackageRoot)\**session-token" />
+        <Exclude Files="$(PackageRoot)\**session-token.*" />
+        <Exclude Files="$(PackageRoot)\**auth-token" />
+        <Exclude Files="$(PackageRoot)\**auth-token.*" />
+        <Exclude Files="$(PackageRoot)\**package-report.json" />
         <Exclude Files="$(PackageRoot)\COOLZHU-AGENT.exe" />
       </Files>
     </Feature>

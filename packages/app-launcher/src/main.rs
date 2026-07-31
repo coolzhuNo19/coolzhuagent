@@ -7,18 +7,19 @@
 //! (`CREATE_NO_WINDOW` on Windows) with stdout/stderr redirected to the log
 //! file; the Tauri shell is spawned with `--web-console-pid=<pid>`.
 
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_launcher::{
     self, classify_listener_recovery, health_endpoint_port, http_probe, launch,
-    web_console_environment, ExecutableSpec, LaunchError, LaunchSpawner, LauncherConfig,
-    ListenerOwner, ListenerRecoveryAction,
+    web_console_environment, web_console_runtime_environment, ExecutableSpec, LaunchError,
+    LaunchSpawner, LauncherConfig, ListenerOwner, ListenerRecoveryAction,
 };
 
 const DEFAULT_CONFIG_PATH: &str = "config/package-launcher.json";
@@ -83,7 +84,7 @@ fn run(config_path: &Path) -> Result<app_launcher::LaunchOutcome, LaunchError> {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let mut spawner = RealSpawner;
+    let mut spawner = RealSpawner::default();
     let health_url = config.health_url.clone();
     let mut probe = || http_probe(&health_url);
     launch(
@@ -240,12 +241,16 @@ fn hidden_powershell(script: &str) -> Result<std::process::Output, LaunchError> 
 }
 
 /// Real process spawner backed by `std::process::Command`.
-struct RealSpawner;
+#[derive(Default)]
+struct RealSpawner {
+    children: HashMap<u32, Child>,
+}
 
 impl LaunchSpawner for RealSpawner {
     fn spawn_web_console(
         &mut self,
         spec: &ExecutableSpec,
+        runtime_dir: &Path,
         log_file: &Path,
     ) -> Result<u32, LaunchError> {
         let log = fs::File::create(log_file).map_err(LaunchError::WebConsoleSpawn)?;
@@ -256,6 +261,8 @@ impl LaunchSpawner for RealSpawner {
         let mut cmd = Command::new(&spec.path);
         cmd.args(&spec.args)
             .envs(web_console_environment())
+            .envs(web_console_runtime_environment(runtime_dir))
+            .current_dir(runtime_dir)
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(Stdio::from(stderr));
@@ -263,13 +270,16 @@ impl LaunchSpawner for RealSpawner {
         apply_hidden_window(&mut cmd);
 
         let child = cmd.spawn().map_err(LaunchError::WebConsoleSpawn)?;
-        Ok(child.id())
+        let pid = child.id();
+        self.children.insert(pid, child);
+        Ok(pid)
     }
 
     fn spawn_tauri(
         &mut self,
         spec: &ExecutableSpec,
         args: &[String],
+        runtime_dir: &Path,
         log_file: &Path,
     ) -> Result<u32, LaunchError> {
         let stdout = fs::File::create(log_file).map_err(LaunchError::TauriSpawn)?;
@@ -277,11 +287,26 @@ impl LaunchSpawner for RealSpawner {
         let stderr = fs::File::create(stderr_path).map_err(LaunchError::TauriSpawn)?;
         let mut cmd = Command::new(&spec.path);
         cmd.args(args)
+            .env("COOLZHU_RUNTIME_DIR", runtime_dir)
+            .current_dir(runtime_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         let child = cmd.spawn().map_err(LaunchError::TauriSpawn)?;
-        Ok(child.id())
+        let pid = child.id();
+        self.children.insert(pid, child);
+        Ok(pid)
+    }
+
+    fn terminate_process(&mut self, pid: u32) -> io::Result<()> {
+        let Some(mut child) = self.children.remove(&pid) else {
+            return Ok(());
+        };
+        if child.try_wait()?.is_none() {
+            child.kill()?;
+        }
+        let _ = child.wait()?;
+        Ok(())
     }
 }
 

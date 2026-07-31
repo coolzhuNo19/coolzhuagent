@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-agent-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-agent-workspace"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "coolzhu-agent-server",
  "coolzhu-computer-use-core",
@@ -771,14 +771,14 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-app-launcher"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "coolzhu-clawbot-sidecar"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "reqwest",
@@ -792,11 +792,11 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-code-review"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "coolzhu-command-line"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "coolzhu-command-router",
  "coolzhu-compatibility-harness",
@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-command-router"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "coolzhu-core-runtime",
  "coolzhu-plugin-system",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-compatibility-harness"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "coolzhu-command-router",
  "coolzhu-core-runtime",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-computer-use-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-core-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "coolzhu-language-service",
  "coolzhu-plugin-system",
@@ -857,15 +857,15 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-db-tools"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "coolzhu-debug-diag"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "coolzhu-desktop-console"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "coolzhu-computer-use-core",
  "coolzhu-core-runtime",
@@ -881,15 +881,15 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-diagnostics"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "coolzhu-docgen"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "coolzhu-git-workflow"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "coolzhu-core-runtime",
  "getrandom 0.3.4",
@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-language-service"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lsp-types",
  "serde",
@@ -908,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-llm-adapter"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "coolzhu-core-runtime",
  "coolzhu-diagnostics",
@@ -920,19 +920,19 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-marketplace"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "coolzhu-monitor"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "coolzhu-orchestrator"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "coolzhu-plugin-system"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -940,11 +940,11 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-tdd-runner"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "coolzhu-tool-registry"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "coolzhu-core-runtime",
  "coolzhu-llm-adapter",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-uia-resolver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "coolzhu-vision-service",
  "serde",
@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-vision-service"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "coolzhu-llm-adapter",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-web-console"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "coolzhu-windows-process-guard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "windows-sys 0.61.2",
 ]

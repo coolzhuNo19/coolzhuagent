@@ -23,6 +23,7 @@ use crate::browser_bridge_protocol::{
 use crate::computer_use_adapters::{BrowserBridge, BrowserSnapshot};
 
 const BRIDGE_TIMEOUT: Duration = Duration::from_secs(10);
+const SNAPSHOT_RETRY_BACKOFF_MS: [u64; 5] = [100, 200, 400, 800, 1_000];
 
 struct ActiveConnection {
     id: u64,
@@ -1150,28 +1151,44 @@ fn browser_self_test_target_url<'a>(
     })
 }
 
+fn optional_original_snapshot(
+    result: Result<BrowserSnapshot, ComputerUseError>,
+) -> Result<Option<BrowserSnapshot>, ComputerUseError> {
+    match result {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(error) if error.code == "restricted_page" => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn owned_page_action_self_test(
     kind: &str,
     value: u8,
     requested_url: &str,
 ) -> BrowserBridgeSelfTestResponse {
     let bridge = BrowserNativeBridge::default();
-    let original = match bridge.snapshot() {
+    let original = match optional_original_snapshot(bridge.snapshot()) {
         Ok(snapshot) => snapshot,
         Err(error) => return BrowserBridgeSelfTestResponse::failed(kind, "observe", error, None),
     };
-    let Some(original_tab_id) = snapshot_tab_id(&original) else {
-        return BrowserBridgeSelfTestResponse::failed(
-            kind,
-            "observe",
-            backend_error("invalid_browser_snapshot", "original tab id is missing"),
-            Some(&original),
-        );
+    let original_tab_id = match original.as_ref() {
+        Some(original) => {
+            let Some(tab_id) = snapshot_tab_id(original) else {
+                return BrowserBridgeSelfTestResponse::failed(
+                    kind,
+                    "observe",
+                    backend_error("invalid_browser_snapshot", "original tab id is missing"),
+                    Some(original),
+                );
+            };
+            Some(tab_id)
+        }
+        None => None,
     };
-    let open_execution = match bridge.execute(&tab_open_action(requested_url), &original) {
+    let open_execution = match bridge.execute_tab_action(&tab_open_action(requested_url)) {
         Ok(execution) => execution,
         Err(error) => {
-            return BrowserBridgeSelfTestResponse::failed(kind, "open", error, Some(&original))
+            return BrowserBridgeSelfTestResponse::failed(kind, "open", error, original.as_ref())
         }
     };
     let Some(opened_tab_id) = bridge.tab_id.lock().ok().and_then(|tab_id| tab_id.clone()) else {
@@ -1179,11 +1196,14 @@ fn owned_page_action_self_test(
             kind,
             "open",
             backend_error("invalid_tab_response", "opened tab id is missing"),
-            Some(&original),
+            original.as_ref(),
         );
     };
     let mut action_evidence = open_execution.evidence;
     action_evidence.push(format!("opened_tab_id={opened_tab_id}"));
+    if original.is_none() {
+        action_evidence.push("original_page=restricted".to_string());
+    }
     let mut action_before = None;
 
     let result = (|| -> Result<(BrowserSnapshot, Verification), (String, ComputerUseError)> {
@@ -1209,36 +1229,41 @@ fn owned_page_action_self_test(
             )
             .map_err(|error| ("verify".to_string(), error))?;
 
-        action_evidence.extend(
-            bridge
-                .execute(
-                    &tab_id_action(ComputerUseActionKind::ActivateTab, &original_tab_id),
-                    &after,
-                )
-                .map_err(|error| ("restore_original".to_string(), error))?
-                .evidence,
-        );
-        let restored = bridge
-            .snapshot()
-            .map_err(|error| ("observe_restored".to_string(), error))?;
-        if snapshot_tab_id(&restored).as_deref() != Some(original_tab_id.as_str()) {
-            return Err((
-                "observe_restored".to_string(),
-                ComputerUseError::recoverable(
-                    "tab_lease_changed",
-                    "restoring the original tab returned a different tab",
-                ),
-            ));
+        if let Some(original_tab_id) = original_tab_id.as_deref() {
+            action_evidence.extend(
+                bridge
+                    .execute_tab_action(&tab_id_action(
+                        ComputerUseActionKind::ActivateTab,
+                        original_tab_id,
+                    ))
+                    .map_err(|error| ("restore_original".to_string(), error))?
+                    .evidence,
+            );
+            let restored = bridge
+                .snapshot()
+                .map_err(|error| ("observe_restored".to_string(), error))?;
+            if snapshot_tab_id(&restored).as_deref() != Some(original_tab_id) {
+                return Err((
+                    "observe_restored".to_string(),
+                    ComputerUseError::recoverable(
+                        "tab_lease_changed",
+                        "restoring the original tab returned a different tab",
+                    ),
+                ));
+            }
         }
         action_evidence.extend(
             bridge
-                .execute(
-                    &tab_id_action(ComputerUseActionKind::CloseTab, &opened_tab_id),
-                    &restored,
-                )
+                .execute_tab_action(&tab_id_action(
+                    ComputerUseActionKind::CloseTab,
+                    &opened_tab_id,
+                ))
                 .map_err(|error| ("close_owned".to_string(), error))?
                 .evidence,
         );
+        if original.is_none() {
+            action_evidence.push("original_page_return=browser_natural".to_string());
+        }
         Ok((after, verification))
     })();
 
@@ -1264,10 +1289,14 @@ fn owned_page_action_self_test(
             error_message: None,
         },
         Err((stage, error)) => {
-            best_effort_restore_and_close(&bridge, &original, &original_tab_id, &opened_tab_id);
-            let failure_before = action_before.as_ref().unwrap_or(&original);
+            best_effort_restore_and_close_owned_tabs(
+                &bridge,
+                original_tab_id.as_deref(),
+                std::slice::from_ref(&opened_tab_id),
+            );
+            let failure_before = action_before.as_ref().or(original.as_ref());
             let mut response =
-                BrowserBridgeSelfTestResponse::failed(kind, stage, error, Some(failure_before));
+                BrowserBridgeSelfTestResponse::failed(kind, stage, error, failure_before);
             response.action_evidence = action_evidence;
             response
         }
@@ -1294,8 +1323,9 @@ fn tab_lifecycle_self_test(
         );
     };
     let bridge = BrowserNativeBridge::default();
-    let before = match bridge.snapshot() {
-        Ok(snapshot) => snapshot,
+    let before = match optional_original_snapshot(bridge.snapshot()) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return restricted_tab_lifecycle_self_test(kind, requested_url, &bridge),
         Err(error) => return BrowserBridgeSelfTestResponse::failed(kind, "observe", error, None),
     };
     let Some(original_tab_id) = snapshot_tab_id(&before) else {
@@ -1307,7 +1337,7 @@ fn tab_lifecycle_self_test(
         );
     };
     let open = tab_open_action(requested_url);
-    let open_execution = match bridge.execute(&open, &before) {
+    let open_execution = match bridge.execute_tab_action(&open) {
         Ok(execution) => execution,
         Err(error) => {
             return BrowserBridgeSelfTestResponse::failed(kind, "open", error, Some(&before))
@@ -1340,7 +1370,7 @@ fn tab_lifecycle_self_test(
         let activate_original = tab_id_action(ComputerUseActionKind::ActivateTab, &original_tab_id);
         action_evidence.extend(
             bridge
-                .execute(&activate_original, &opened)
+                .execute_tab_action(&activate_original)
                 .map_err(|error| ("activate_original".to_string(), error))?
                 .evidence,
         );
@@ -1360,26 +1390,26 @@ fn tab_lifecycle_self_test(
         let activate_opened = tab_id_action(ComputerUseActionKind::ActivateTab, &opened_tab_id);
         action_evidence.extend(
             bridge
-                .execute(&activate_opened, &original_again)
+                .execute_tab_action(&activate_opened)
                 .map_err(|error| ("activate_opened".to_string(), error))?
                 .evidence,
         );
-        let opened_again = snapshot_for_url(&bridge, requested_url)
+        let _opened_again = snapshot_for_url(&bridge, requested_url)
             .map_err(|error| ("observe_reactivated".to_string(), error))?;
 
         action_evidence.extend(
             bridge
-                .execute(&activate_original, &opened_again)
+                .execute_tab_action(&activate_original)
                 .map_err(|error| ("restore_original".to_string(), error))?
                 .evidence,
         );
-        let restored = bridge
+        let _restored = bridge
             .snapshot()
             .map_err(|error| ("observe_restored".to_string(), error))?;
         let close_opened = tab_id_action(ComputerUseActionKind::CloseTab, &opened_tab_id);
         action_evidence.extend(
             bridge
-                .execute(&close_opened, &restored)
+                .execute_tab_action(&close_opened)
                 .map_err(|error| ("close_owned".to_string(), error))?
                 .evidence,
         );
@@ -1415,9 +1445,207 @@ fn tab_lifecycle_self_test(
             error_message: None,
         },
         Err((stage, error)) => {
-            best_effort_restore_and_close(&bridge, &before, &original_tab_id, &opened_tab_id);
+            best_effort_restore_and_close_owned_tabs(
+                &bridge,
+                Some(&original_tab_id),
+                std::slice::from_ref(&opened_tab_id),
+            );
             let mut response =
                 BrowserBridgeSelfTestResponse::failed(kind, stage, error, Some(&before));
+            response.action_evidence = action_evidence;
+            response
+        }
+    }
+}
+
+fn restricted_tab_lifecycle_self_test(
+    kind: &str,
+    requested_url: &str,
+    bridge: &BrowserNativeBridge,
+) -> BrowserBridgeSelfTestResponse {
+    let first_open = match bridge.execute_tab_action(&tab_open_action(requested_url)) {
+        Ok(execution) => execution,
+        Err(error) => return BrowserBridgeSelfTestResponse::failed(kind, "open", error, None),
+    };
+    let Some(first_tab_id) = bridge.tab_id.lock().ok().and_then(|tab_id| tab_id.clone()) else {
+        return BrowserBridgeSelfTestResponse::failed(
+            kind,
+            "open",
+            backend_error("invalid_tab_response", "first opened tab id is missing"),
+            None,
+        );
+    };
+    let mut opened_tab_ids = vec![first_tab_id.clone()];
+    let mut action_evidence = first_open.evidence;
+    action_evidence.push("original_page=restricted".to_string());
+    action_evidence.push(format!("opened_tab_id={first_tab_id}"));
+    let mut first_observation = None;
+
+    let result = (|| -> Result<(BrowserSnapshot, BrowserSnapshot), (String, ComputerUseError)> {
+        let first = snapshot_for_url(bridge, requested_url)
+            .map_err(|error| ("observe_first_owned".to_string(), error))?;
+        if snapshot_tab_id(&first).as_deref() != Some(first_tab_id.as_str()) {
+            return Err((
+                "observe_first_owned".to_string(),
+                ComputerUseError::recoverable(
+                    "tab_lease_changed",
+                    "first owned tab snapshot did not preserve the task lease",
+                ),
+            ));
+        }
+        first_observation = Some(first.clone());
+
+        action_evidence.extend(
+            bridge
+                .execute_tab_action(&tab_open_action(requested_url))
+                .map_err(|error| ("open_second_owned".to_string(), error))?
+                .evidence,
+        );
+        let second_tab_id = bridge
+            .tab_id
+            .lock()
+            .ok()
+            .and_then(|tab_id| tab_id.clone())
+            .ok_or_else(|| {
+                (
+                    "open_second_owned".to_string(),
+                    backend_error("invalid_tab_response", "second opened tab id is missing"),
+                )
+            })?;
+        if second_tab_id == first_tab_id {
+            return Err((
+                "open_second_owned".to_string(),
+                backend_error(
+                    "invalid_tab_response",
+                    "second owned tab reused the first tab id",
+                ),
+            ));
+        }
+        opened_tab_ids.push(second_tab_id.clone());
+        action_evidence.push(format!("opened_tab_id={second_tab_id}"));
+
+        let second = snapshot_for_url(bridge, requested_url)
+            .map_err(|error| ("observe_second_owned".to_string(), error))?;
+        if snapshot_tab_id(&second).as_deref() != Some(second_tab_id.as_str()) {
+            return Err((
+                "observe_second_owned".to_string(),
+                ComputerUseError::recoverable(
+                    "tab_lease_changed",
+                    "second owned tab snapshot did not preserve the task lease",
+                ),
+            ));
+        }
+
+        action_evidence.extend(
+            bridge
+                .execute_tab_action(&tab_id_action(
+                    ComputerUseActionKind::ActivateTab,
+                    &first_tab_id,
+                ))
+                .map_err(|error| ("activate_first_owned".to_string(), error))?
+                .evidence,
+        );
+        let first_again = snapshot_for_url(bridge, requested_url)
+            .map_err(|error| ("observe_first_reactivated".to_string(), error))?;
+        if snapshot_tab_id(&first_again).as_deref() != Some(first_tab_id.as_str()) {
+            return Err((
+                "observe_first_reactivated".to_string(),
+                ComputerUseError::recoverable(
+                    "tab_lease_changed",
+                    "reactivating the first owned tab returned a different tab",
+                ),
+            ));
+        }
+
+        action_evidence.extend(
+            bridge
+                .execute_tab_action(&tab_id_action(
+                    ComputerUseActionKind::ActivateTab,
+                    &second_tab_id,
+                ))
+                .map_err(|error| ("activate_second_owned".to_string(), error))?
+                .evidence,
+        );
+        let second_again = snapshot_for_url(bridge, requested_url)
+            .map_err(|error| ("observe_second_reactivated".to_string(), error))?;
+        if snapshot_tab_id(&second_again).as_deref() != Some(second_tab_id.as_str()) {
+            return Err((
+                "observe_second_reactivated".to_string(),
+                ComputerUseError::recoverable(
+                    "tab_lease_changed",
+                    "reactivating the second owned tab returned a different tab",
+                ),
+            ));
+        }
+
+        action_evidence.extend(
+            bridge
+                .execute_tab_action(&tab_id_action(
+                    ComputerUseActionKind::ActivateTab,
+                    &first_tab_id,
+                ))
+                .map_err(|error| ("activate_first_for_close".to_string(), error))?
+                .evidence,
+        );
+        action_evidence.extend(
+            bridge
+                .execute_tab_action(&tab_id_action(
+                    ComputerUseActionKind::CloseTab,
+                    &second_tab_id,
+                ))
+                .map_err(|error| ("close_second_owned".to_string(), error))?
+                .evidence,
+        );
+        let first_after_close = snapshot_for_url(bridge, requested_url)
+            .map_err(|error| ("verify_second_closed".to_string(), error))?;
+        if snapshot_tab_id(&first_after_close).as_deref() != Some(first_tab_id.as_str()) {
+            return Err((
+                "verify_second_closed".to_string(),
+                ComputerUseError::recoverable(
+                    "tab_lease_changed",
+                    "closing the second owned tab did not reveal the first owned tab",
+                ),
+            ));
+        }
+
+        action_evidence.extend(
+            bridge
+                .execute_tab_action(&tab_id_action(
+                    ComputerUseActionKind::CloseTab,
+                    &first_tab_id,
+                ))
+                .map_err(|error| ("close_first_owned".to_string(), error))?
+                .evidence,
+        );
+        action_evidence.push("original_page_return=browser_natural".to_string());
+        Ok((first, first_after_close))
+    })();
+
+    match result {
+        Ok((before, after)) => BrowserBridgeSelfTestResponse {
+            ok: true,
+            kind: kind.to_string(),
+            stage: "terminal".to_string(),
+            summary: "opened, activated, and closed two task-owned browser tabs; the restricted \
+                      original page resumed naturally"
+                .to_string(),
+            url: Some(after.url.clone()),
+            before_revision: Some(before.dom_revision),
+            after_revision: Some(after.dom_revision),
+            before_evidence: before.evidence,
+            action_evidence,
+            after_evidence: after.evidence,
+            error_code: None,
+            error_message: None,
+        },
+        Err((stage, error)) => {
+            best_effort_restore_and_close_owned_tabs(bridge, None, &opened_tab_ids);
+            let mut response = BrowserBridgeSelfTestResponse::failed(
+                kind,
+                stage,
+                error,
+                first_observation.as_ref(),
+            );
             response.action_evidence = action_evidence;
             response
         }
@@ -1436,9 +1664,25 @@ fn snapshot_for_url(
     bridge: &BrowserNativeBridge,
     expected_url: &str,
 ) -> Result<BrowserSnapshot, ComputerUseError> {
+    retry_snapshot_for_url(
+        expected_url,
+        || bridge.snapshot(),
+        |delay| std::thread::sleep(delay),
+    )
+}
+
+fn retry_snapshot_for_url<SnapshotFn, SleepFn>(
+    expected_url: &str,
+    mut snapshot: SnapshotFn,
+    mut sleep: SleepFn,
+) -> Result<BrowserSnapshot, ComputerUseError>
+where
+    SnapshotFn: FnMut() -> Result<BrowserSnapshot, ComputerUseError>,
+    SleepFn: FnMut(Duration),
+{
     let mut last_error = None;
-    for attempt in 0..3 {
-        match bridge.snapshot() {
+    for attempt in 0..=SNAPSHOT_RETRY_BACKOFF_MS.len() {
+        match snapshot() {
             Ok(snapshot) if snapshot.url == expected_url => return Ok(snapshot),
             Ok(snapshot) => {
                 last_error = Some(ComputerUseError::recoverable(
@@ -1451,16 +1695,21 @@ fn snapshot_for_url(
             }
             Err(error) => last_error = Some(error),
         }
-        if attempt < 2 {
-            std::thread::sleep(Duration::from_millis(100));
+        if let Some(delay_ms) = SNAPSHOT_RETRY_BACKOFF_MS.get(attempt) {
+            sleep(Duration::from_millis(*delay_ms));
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        backend_error(
-            "browser_bridge_failed",
-            "opened tab snapshot was unavailable",
-        )
-    }))
+    let last_error = last_error
+        .map(|error| format!("{}: {}", error.code, error.message))
+        .unwrap_or_else(|| "no snapshot response".to_string());
+    Err(ComputerUseError::recoverable(
+        "browser_snapshot_timeout",
+        format!(
+            "opened tab did not reach expected URL {expected_url} after {} attempts; \
+             last_error={last_error}",
+            SNAPSHOT_RETRY_BACKOFF_MS.len() + 1
+        ),
+    ))
 }
 
 fn tab_open_action(url: &str) -> ComputerUseAction {
@@ -1485,20 +1734,35 @@ fn tab_id_action(kind: ComputerUseActionKind, tab_id: &str) -> ComputerUseAction
     }
 }
 
-fn best_effort_restore_and_close(
+fn self_test_cleanup_actions(
+    original_tab_id: Option<&str>,
+    opened_tab_ids: &[String],
+) -> Vec<ComputerUseAction> {
+    let mut actions =
+        Vec::with_capacity(opened_tab_ids.len() + usize::from(original_tab_id.is_some()));
+    if let Some(original_tab_id) = original_tab_id {
+        actions.push(tab_id_action(
+            ComputerUseActionKind::ActivateTab,
+            original_tab_id,
+        ));
+    }
+    actions.extend(
+        opened_tab_ids
+            .iter()
+            .rev()
+            .map(|tab_id| tab_id_action(ComputerUseActionKind::CloseTab, tab_id)),
+    );
+    actions
+}
+
+fn best_effort_restore_and_close_owned_tabs(
     bridge: &BrowserNativeBridge,
-    snapshot: &BrowserSnapshot,
-    original_tab_id: &str,
-    opened_tab_id: &str,
+    original_tab_id: Option<&str>,
+    opened_tab_ids: &[String],
 ) {
-    let _ = bridge.execute(
-        &tab_id_action(ComputerUseActionKind::ActivateTab, original_tab_id),
-        snapshot,
-    );
-    let _ = bridge.execute(
-        &tab_id_action(ComputerUseActionKind::CloseTab, opened_tab_id),
-        snapshot,
-    );
+    for action in self_test_cleanup_actions(original_tab_id, opened_tab_ids) {
+        let _ = bridge.execute_tab_action(&action);
+    }
 }
 
 fn browser_snapshot_observation(snapshot: &BrowserSnapshot) -> Observation {
@@ -1785,6 +2049,55 @@ mod tests {
     }
 
     #[test]
+    fn restricted_original_page_is_optional_but_other_snapshot_errors_propagate() {
+        let restricted = optional_original_snapshot(Err(blocked(
+            "restricted_page",
+            "the active page cannot be inspected",
+        )))
+        .unwrap();
+        assert!(restricted.is_none());
+
+        let error = optional_original_snapshot(Err(blocked(
+            "extension_unavailable",
+            "the browser bridge is disconnected",
+        )))
+        .unwrap_err();
+        assert_eq!(error.code, "extension_unavailable");
+    }
+
+    #[test]
+    fn restricted_lifecycle_cleanup_closes_two_owned_tabs_without_touching_original() {
+        let opened_tab_ids = vec!["101".to_string(), "102".to_string()];
+
+        let actions = self_test_cleanup_actions(None, &opened_tab_ids);
+
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].kind, ComputerUseActionKind::CloseTab);
+        assert_eq!(actions[0].arguments["tab_id"], "102");
+        assert_eq!(actions[1].kind, ComputerUseActionKind::CloseTab);
+        assert_eq!(actions[1].arguments["tab_id"], "101");
+        assert!(actions
+            .iter()
+            .all(|action| action.kind != ComputerUseActionKind::ActivateTab));
+    }
+
+    #[test]
+    fn normal_lifecycle_cleanup_restores_original_and_only_closes_owned_tab() {
+        let opened_tab_ids = vec!["101".to_string()];
+
+        let actions = self_test_cleanup_actions(Some("7"), &opened_tab_ids);
+
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].kind, ComputerUseActionKind::ActivateTab);
+        assert_eq!(actions[0].arguments["tab_id"], "7");
+        assert_eq!(actions[1].kind, ComputerUseActionKind::CloseTab);
+        assert_eq!(actions[1].arguments["tab_id"], "101");
+        assert!(!actions.iter().any(|action| {
+            action.kind == ComputerUseActionKind::CloseTab && action.arguments["tab_id"] == "7"
+        }));
+    }
+
+    #[test]
     fn disconnected_browser_bridge_is_terminal_and_user_owned() {
         let error = BrowserNativeBridge::preflight().unwrap_err();
         assert_eq!(error.code, "extension_unavailable");
@@ -1902,6 +2215,65 @@ mod tests {
             "the DOM snapshot shows drop-complete.",
             &corpus
         ));
+    }
+
+    #[test]
+    fn snapshot_url_retry_uses_bounded_exponential_backoff_until_ready() {
+        let mut urls = std::collections::VecDeque::from([
+            "about:blank",
+            "https://example.test/loading",
+            "https://example.test/ready",
+        ]);
+        let mut delays = Vec::new();
+
+        let snapshot = retry_snapshot_for_url(
+            "https://example.test/ready",
+            || {
+                let url = urls.pop_front().expect("bounded snapshot attempt");
+                Ok(BrowserSnapshot {
+                    page_id: "page-1".into(),
+                    url: url.into(),
+                    dom_revision: 1,
+                    state: json!({}),
+                    evidence: vec![],
+                })
+            },
+            |delay| delays.push(delay.as_millis() as u64),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.url, "https://example.test/ready");
+        assert_eq!(delays, vec![100, 200]);
+        assert_eq!(SNAPSHOT_RETRY_BACKOFF_MS, [100, 200, 400, 800, 1_000]);
+    }
+
+    #[test]
+    fn snapshot_url_retry_returns_explicit_timeout_after_bounded_attempts() {
+        let mut attempts = 0usize;
+        let mut delays = Vec::new();
+
+        let error = retry_snapshot_for_url(
+            "https://example.test/ready",
+            || {
+                attempts += 1;
+                Ok(BrowserSnapshot {
+                    page_id: "page-1".into(),
+                    url: "about:blank".into(),
+                    dom_revision: attempts as u64,
+                    state: json!({}),
+                    evidence: vec![],
+                })
+            },
+            |delay| delays.push(delay.as_millis() as u64),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "browser_snapshot_timeout");
+        assert!(error.retryable);
+        assert_eq!(attempts, SNAPSHOT_RETRY_BACKOFF_MS.len() + 1);
+        assert_eq!(delays, SNAPSHOT_RETRY_BACKOFF_MS);
+        assert!(error.message.contains("after 6 attempts"));
+        assert!(error.message.contains("tab_navigation_pending"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

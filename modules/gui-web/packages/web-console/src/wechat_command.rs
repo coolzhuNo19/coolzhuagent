@@ -524,10 +524,8 @@ mod tests {
 
     #[test]
     fn file_write_command_preserves_multiline_body() {
-        let (_, arguments) = match_command_spec(
-            "/file write notes/todo.md\n第一行\n第二行",
-        )
-        .expect("应识别 file write 命令");
+        let (_, arguments) = match_command_spec("/file write notes/todo.md\n第一行\n第二行")
+            .expect("应识别 file write 命令");
 
         assert_eq!(arguments, "notes/todo.md\n第一行\n第二行");
     }

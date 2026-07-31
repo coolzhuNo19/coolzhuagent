@@ -4,12 +4,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::clawbot_channel::ClawbotConversationBinding;
-use crate::wechat_authorization::{
-    WechatCapabilitySet, WechatMemberGrant, WechatMemberPreset,
-};
+use crate::wechat_authorization::{WechatCapabilitySet, WechatMemberGrant, WechatMemberPreset};
 use crate::wechat_group::{
-    WechatGroupDetachAudit, WechatGroupLifecycleState, WechatGroupRecord,
-    WechatObservedContact, WechatOperationAdministrator,
+    WechatGroupDetachAudit, WechatGroupLifecycleState, WechatGroupRecord, WechatObservedContact,
+    WechatOperationAdministrator,
 };
 
 const OUTBOX_CLAIM_LEASE_MS: u64 = 30_000;
@@ -1035,8 +1033,9 @@ impl ClawbotGatewayStore {
             grant.preset,
             WechatMemberPreset::Collaborator | WechatMemberPreset::Administrator
         ) {
-            return Err("群成员角色只允许 none、chat_member、operator；操作管理员必须单独认领"
-                .to_string());
+            return Err(
+                "群成员角色只允许 none、chat_member、operator；操作管理员必须单独认领".to_string(),
+            );
         }
         let mut grant = grant.clone();
         grant.capabilities = WechatCapabilitySet::for_group_member_role(grant.preset);
@@ -1076,7 +1075,10 @@ impl ClawbotGatewayStore {
         if actor.trim().is_empty() {
             return Err("设置群成员角色必须记录操作主体".to_string());
         }
-        if matches!(preset, WechatMemberPreset::Collaborator | WechatMemberPreset::Administrator) {
+        if matches!(
+            preset,
+            WechatMemberPreset::Collaborator | WechatMemberPreset::Administrator
+        ) {
             return Err("群成员角色只允许 none、chat_member、operator".to_string());
         }
         let administrator = self
@@ -1228,8 +1230,7 @@ impl ClawbotGatewayStore {
             .map_err(|error| format!("查询微信联系人失败：{error}"))?
             .map(|row| {
                 let value = row.map_err(|error| format!("读取微信联系人行失败：{error}"))?;
-                serde_json::from_str(&value)
-                    .map_err(|error| format!("解析微信联系人失败：{error}"))
+                serde_json::from_str(&value).map_err(|error| format!("解析微信联系人失败：{error}"))
             })
             .collect();
         contacts
@@ -1360,8 +1361,9 @@ impl ClawbotGatewayStore {
                 recognized_member_count: 0,
             });
         if group.lifecycle_state == WechatGroupLifecycleState::Removed {
-            return Err("微信群已标记移出；只有新的 bot_added 生命周期事件可以重新激活"
-                .to_string());
+            return Err(
+                "微信群已标记移出；只有新的 bot_added 生命周期事件可以重新激活".to_string(),
+            );
         }
         if let Some(name) = non_empty(group_name) {
             group.group_name = Some(name.to_string());
@@ -1451,19 +1453,19 @@ impl ClawbotGatewayStore {
         now_ms: u64,
     ) -> Result<WechatGroupRecord, String> {
         validate_identity_parts(account_id, group_id, "微信群")?;
-        let mut group = self
-            .group_record(account_id, group_id)?
-            .unwrap_or_else(|| WechatGroupRecord {
-                account_id: account_id.to_string(),
-                group_id: group_id.to_string(),
-                group_name: None,
-                first_seen_at_ms: now_ms,
-                last_seen_at_ms: now_ms,
-                lifecycle_state: state,
-                sync_evidence: evidence.to_string(),
-                binding: None,
-                recognized_member_count: 0,
-            });
+        let mut group =
+            self.group_record(account_id, group_id)?
+                .unwrap_or_else(|| WechatGroupRecord {
+                    account_id: account_id.to_string(),
+                    group_id: group_id.to_string(),
+                    group_name: None,
+                    first_seen_at_ms: now_ms,
+                    last_seen_at_ms: now_ms,
+                    lifecycle_state: state,
+                    sync_evidence: evidence.to_string(),
+                    binding: None,
+                    recognized_member_count: 0,
+                });
         if let Some(name) = non_empty(group_name) {
             group.group_name = Some(name.to_string());
         }
@@ -1648,8 +1650,7 @@ impl ClawbotGatewayStore {
             .map_err(|error| format!("查询微信群审计失败：{error}"))?
             .map(|row| {
                 let value = row.map_err(|error| format!("读取微信群审计行失败：{error}"))?;
-                serde_json::from_str(&value)
-                    .map_err(|error| format!("解析微信群审计失败：{error}"))
+                serde_json::from_str(&value).map_err(|error| format!("解析微信群审计失败：{error}"))
             })
             .collect();
         audits
@@ -1991,8 +1992,8 @@ fn write_group_record(
     group: &WechatGroupRecord,
     now_ms: u64,
 ) -> Result<(), String> {
-    let group_json = serde_json::to_string(group)
-        .map_err(|error| format!("序列化微信群记录失败：{error}"))?;
+    let group_json =
+        serde_json::to_string(group).map_err(|error| format!("序列化微信群记录失败：{error}"))?;
     connection
         .execute(
             "INSERT INTO clawbot_groups(account_id, group_id, group_json, lifecycle_state, updated_at_ms) \
@@ -2487,11 +2488,7 @@ mod tests {
             .set_inbox_operation_fingerprint(guarded.id, "chat:same-request", 201)
             .expect("set guarded fingerprint");
         store
-            .mark_inbox_failed(
-                guarded.id,
-                "[repeated_failure_guard] 已阻止重复调度",
-                210,
-            )
+            .mark_inbox_failed(guarded.id, "[repeated_failure_guard] 已阻止重复调度", 210)
             .expect("mark guard feedback");
 
         let retry = match store

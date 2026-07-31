@@ -16,8 +16,13 @@ New-Item -ItemType Directory -Force -Path `
     (Join-Path $source 'backup'), `
     (Join-Path $source '.coolzhu'), `
     (Join-Path $source '.coolzhu\plugins\example-plugin\src'), `
+    (Join-Path $source '.claude'), `
+    (Join-Path $source '.superpowers'), `
     (Join-Path $source 'modules\tooling\.claw-agents'), `
     (Join-Path $source 'modules\gui-web\src'), `
+    (Join-Path $source 'modules\gui-web\src\__pycache__'), `
+    (Join-Path $source 'modules\gui-web\session-attachments'), `
+    (Join-Path $source 'modules\gui-web\audio-realtime'), `
     (Join-Path $source 'modules\gui-web\.coolzhu\audio-realtime\chunks'), `
     (Join-Path $source 'modules\gui-web\docs'), `
     (Join-Path $source 'modules\gui-desktop\packages\tauri-shell\src-tauri\gen\schemas'), `
@@ -30,8 +35,19 @@ Set-Content -LiteralPath (Join-Path $source 'backup\main.rs') -Value 'backup'
 Set-Content -LiteralPath (Join-Path $source '.coolzhu\web-sessions.json') -Value '{}'
 Set-Content -LiteralPath (Join-Path $source '.coolzhu\plugins\example-plugin\Cargo.toml') -Value '[package]'
 Set-Content -LiteralPath (Join-Path $source '.coolzhu\plugins\example-plugin\src\lib.rs') -Value 'pub fn plugin() {}'
+Set-Content -LiteralPath (Join-Path $source '.claude\launch.json') -Value '{"program":"C:\\Users\\private\\app.exe"}'
+Set-Content -LiteralPath (Join-Path $source '.superpowers\draft.md') -Value '# Private draft'
 Set-Content -LiteralPath (Join-Path $source 'modules\tooling\.claw-agents\agent.json') -Value '{"workspace":"private"}'
 Set-Content -LiteralPath (Join-Path $source 'modules\gui-web\src\main.rs') -Value 'pub fn serve() {}'
+Set-Content -LiteralPath (Join-Path $source 'modules\gui-web\src\__pycache__\cached.pyc') -Value 'compiled private path'
+Set-Content -LiteralPath (Join-Path $source 'modules\gui-web\session-attachments\private.bin') -Value 'private attachment'
+Set-Content -LiteralPath (Join-Path $source 'modules\gui-web\audio-realtime\private.webm') -Value 'private audio'
+Set-Content -LiteralPath (Join-Path $source 'modules\gui-web\src\private-model.pt') -Value 'private model'
+Set-Content -LiteralPath (Join-Path $source 'modules\gui-web\src\login-qrcode.png') -Value 'private qrcode'
+Set-Content -LiteralPath (Join-Path $source 'modules\gui-web\src\provider-secret.pem') -Value 'private key'
+Set-Content -LiteralPath (Join-Path $source 'modules\gui-web\src\app.log') -Value 'private log'
+Set-Content -LiteralPath (Join-Path $source 'modules\gui-web\src\chat.db-wal') -Value 'private database sidecar'
+Set-Content -LiteralPath (Join-Path $source 'modules\gui-web\src\.claw-todos.json') -Value '{}'
 Set-Content -LiteralPath (Join-Path $source 'modules\gui-web\.coolzhu\audio-realtime\chunks\private.webm') -Value 'private audio'
 Set-Content -LiteralPath (Join-Path $source 'modules\gui-web\docs\private.md') -Value '# Private acceptance log'
 Set-Content -LiteralPath (Join-Path $source 'modules\gui-desktop\packages\tauri-shell\src-tauri\gen\schemas\windows-schema.json') -Value '{}'
@@ -78,7 +94,7 @@ foreach ($entry in $zipManifest.files) {
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $expanded $entry.relative_path)).Hash
     if ($actual -ne $entry.sha256) { throw "zip hash mismatch: $($entry.relative_path)" }
 }
-if (Get-ChildItem -LiteralPath $expanded -Recurse -Force | Where-Object FullName -Match '(?i)(backup|web-sessions|coolzhu\.toml|private-model|private\.webm|windows-schema\.json)') {
+if (Get-ChildItem -LiteralPath $expanded -Recurse -Force | Where-Object FullName -Match '(?i)(backup|web-sessions|coolzhu\.toml|private-model|private\.webm|private\.bin|login-qrcode|provider-secret|app\.log|chat\.db-wal|\.claw-todos|windows-schema\.json)') {
     throw 'excluded content found in source zip'
 }
 if (-not (Test-Path -LiteralPath $deliveryResult.github_tree -PathType Container)) { throw 'GitHub-ready source tree missing' }
@@ -96,5 +112,41 @@ if ($LASTEXITCODE -eq 0) { throw 'GitHub-ready .gitignore hides workspace plugin
 if ($LASTEXITCODE -eq 0) { throw 'GitHub-ready .gitignore hides module source' }
 & git -C $deliveryResult.github_tree check-ignore --no-index 'target/debug/app.exe' 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'GitHub-ready .gitignore does not block build outputs' }
+foreach ($privatePath in @(
+    '.claude/launch.json',
+    '.superpowers/draft.md',
+    'modules/gui-web/src/__pycache__/cached.pyc',
+    'modules/gui-web/src/cached.pyc',
+    'modules/vision/resources/private-model.pt',
+    'runtime/web-sessions.backup',
+    'runtime/session-attachments/private.bin',
+    'runtime/login-qrcode.png',
+    'runtime/provider-secret.pem',
+    'runtime/app.log'
+)) {
+    & git -C $deliveryResult.github_tree check-ignore --no-index $privatePath 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "GitHub-ready .gitignore does not block private/generated path: $privatePath" }
+}
+
+# 回归：隐私扫描不得再跳过大于 2 MB 的源码。将当前用户名路径放到
+# 2 MB 之后，旧实现会漏过，新实现必须拒绝整个交付。
+$largePrivatePath = Join-Path $source 'src\large-private.rs'
+$largePrefix = 'x' * (2MB + 1024)
+$privateSuffix = "`n// C:\Users\$env:USERNAME\private-project"
+[System.IO.File]::WriteAllText(
+    $largePrivatePath,
+    $largePrefix + $privateSuffix,
+    [System.Text.UTF8Encoding]::new($false)
+)
+$unsafeDestination = Join-Path $sandbox 'unsafe-delivery'
+$unsafeRejected = $false
+try {
+    & $script -WorkspaceRoot $source -DestinationRoot $unsafeDestination -CurationMap $mapPath -PublicDocsManifest $publicDocsPath -DateStamp '20260628' | Out-Null
+} catch {
+    $unsafeRejected = $_.Exception.Message -match 'private-user-path'
+}
+if (-not $unsafeRejected) {
+    throw 'large text privacy fixture was not rejected'
+}
 
 Write-Output 'PASS project-delivery'

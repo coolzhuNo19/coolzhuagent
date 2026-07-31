@@ -13,7 +13,9 @@ coolzhu agent 是一个面向 Windows 桌面环境的 Rust Agent 工作区，提
 - `modules/gui-desktop`：桌面控制台、桌宠和 Tauri shell。
 - `modules/cli`、`modules/diagnostics`：命令行与诊断工具。
 
-完整结构见 [仓库结构](docs/repository-structure.md)，公开设计文档入口见 [GitHub 文档索引](docs/github-public-index.md)。
+完整结构见 [仓库结构](docs/repository-structure.md)，安装与交互方法见
+[0.2.0 离线使用说明和验收表](docs/user-guide/index.html)，公开设计文档入口见
+[GitHub 文档索引](docs/github-public-index.md)。
 
 ## 开发与运行
 
@@ -46,7 +48,7 @@ cargo test --test module_linkage_smoke --offline
 ## 打包
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/build-msi.ps1 -Version 0.1.0 -Configuration release
+powershell -ExecutionPolicy Bypass -File scripts/build-msi.ps1 -Version 0.2.0 -Configuration release
 ```
 
 GitHub-ready 源码和精选 Obsidian 文档可用以下命令生成：

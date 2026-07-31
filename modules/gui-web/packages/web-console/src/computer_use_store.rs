@@ -91,6 +91,7 @@ pub(crate) struct StoredComputerUseRun {
     pub provider_tool_call_id: Option<String>,
     pub session_id: String,
     pub turn_id: String,
+    pub chat_room_id: Option<String>,
     pub state: ComputerUseRunState,
     pub state_version: u64,
     pub surface: ComputerUseSurface,
@@ -246,27 +247,28 @@ impl ComputerUseRunStore {
         connection
             .query_row(
                 r#"
-                SELECT call_id, provider_tool_call_id, session_id, turn_id, state,
+                SELECT call_id, provider_tool_call_id, session_id, turn_id, chat_room_id, state,
                        state_version, surface, terminal_result_json, updated_at_ms
                 FROM computer_use_runs WHERE call_id = ?1
                 "#,
                 [call_id],
                 |row| {
-                    let state: String = row.get(4)?;
-                    let surface: String = row.get(6)?;
-                    let terminal_json: Option<String> = row.get(7)?;
+                    let state: String = row.get(5)?;
+                    let surface: String = row.get(7)?;
+                    let terminal_json: Option<String> = row.get(8)?;
                     Ok(StoredComputerUseRun {
                         call_id: row.get(0)?,
                         provider_tool_call_id: row.get(1)?,
                         session_id: row.get(2)?,
                         turn_id: row.get(3)?,
+                        chat_room_id: row.get(4)?,
                         state: parse_run_state(&state)?,
-                        state_version: row.get(5)?,
+                        state_version: row.get(6)?,
                         surface: parse_surface(&surface)?,
                         terminal_result: terminal_json
                             .map(|json| parse_json_column(&json))
                             .transpose()?,
-                        updated_at_ms: row.get(8)?,
+                        updated_at_ms: row.get(9)?,
                     })
                 },
             )
@@ -283,7 +285,7 @@ impl ComputerUseRunStore {
         connection
             .query_row(
                 r#"
-                SELECT call_id, provider_tool_call_id, session_id, turn_id, state,
+                SELECT call_id, provider_tool_call_id, session_id, turn_id, chat_room_id, state,
                        state_version, surface, terminal_result_json, updated_at_ms
                 FROM computer_use_runs
                 WHERE session_id = ?1 AND turn_id = ?2 AND idempotency_key = ?3
@@ -292,21 +294,22 @@ impl ComputerUseRunStore {
                 "#,
                 params![session_id, turn_id, idempotency_key],
                 |row| {
-                    let state: String = row.get(4)?;
-                    let surface: String = row.get(6)?;
-                    let terminal_json: Option<String> = row.get(7)?;
+                    let state: String = row.get(5)?;
+                    let surface: String = row.get(7)?;
+                    let terminal_json: Option<String> = row.get(8)?;
                     Ok(StoredComputerUseRun {
                         call_id: row.get(0)?,
                         provider_tool_call_id: row.get(1)?,
                         session_id: row.get(2)?,
                         turn_id: row.get(3)?,
+                        chat_room_id: row.get(4)?,
                         state: parse_run_state(&state)?,
-                        state_version: row.get(5)?,
+                        state_version: row.get(6)?,
                         surface: parse_surface(&surface)?,
                         terminal_result: terminal_json
                             .map(|json| parse_json_column(&json))
                             .transpose()?,
-                        updated_at_ms: row.get(8)?,
+                        updated_at_ms: row.get(9)?,
                     })
                 },
             )
@@ -592,6 +595,7 @@ mod tests {
         let stored = store.load("cu-1").unwrap().unwrap();
         assert_eq!(stored.state, computer_use::ComputerUseRunState::Observing);
         assert_eq!(stored.state_version, 1);
+        assert_eq!(stored.chat_room_id.as_deref(), Some("room-1"));
     }
 
     #[test]

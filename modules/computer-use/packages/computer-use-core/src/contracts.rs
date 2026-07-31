@@ -277,6 +277,19 @@ pub enum ComputerUseRiskClass {
     ForbiddenOrAmbiguous,
 }
 
+impl ComputerUseRiskClass {
+    /// 返回该风险等级是否必须由宿主明确批准后才能执行输入动作。
+    ///
+    /// 模型给出的风险等级只能触发更严格的保护，不能替代宿主审批。
+    #[must_use]
+    pub const fn requires_explicit_approval(self) -> bool {
+        matches!(
+            self,
+            Self::Stateful | Self::Sensitive | Self::ForbiddenOrAmbiguous
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComputerUseAction {
@@ -429,6 +442,15 @@ mod tests {
         assert!(ComputerUseRunState::Blocked.is_terminal());
         assert!(ComputerUseRunState::Cancelled.is_terminal());
         assert!(ComputerUseRunState::TimedOut.is_terminal());
+    }
+
+    #[test]
+    fn risky_actions_require_explicit_host_approval() {
+        assert!(!ComputerUseRiskClass::Observe.requires_explicit_approval());
+        assert!(!ComputerUseRiskClass::ReversibleLocal.requires_explicit_approval());
+        assert!(ComputerUseRiskClass::Stateful.requires_explicit_approval());
+        assert!(ComputerUseRiskClass::Sensitive.requires_explicit_approval());
+        assert!(ComputerUseRiskClass::ForbiddenOrAmbiguous.requires_explicit_approval());
     }
 
     #[test]
