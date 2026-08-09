@@ -13,12 +13,22 @@
       }
     },
     {
-      "id": "gui-desktop.desktop-console",
-      "source": "modules/gui-desktop/target/{profile}/coolzhu-desktop-console.exe",
-      "target": "bin/coolzhu-desktop-console.exe",
+      "id": "gui-web.browser-native-host",
+      "source": "modules/gui-web/target/{profile}/coolzhu-browser-native-host.exe",
+      "target": "bin/coolzhu-browser-native-host.exe",
       "build": {
         "command": "cargo",
-        "args": ["build", "-p", "coolzhu-desktop-console", "--bin", "coolzhu-desktop-console", "--offline", "--target-dir", "modules/gui-desktop/target"],
+        "args": ["build", "-p", "coolzhu-web-console", "--bin", "coolzhu-browser-native-host", "--offline", "--target-dir", "modules/gui-web/target"],
+        "working_dir": "."
+      }
+    },
+    {
+      "id": "gui-web.clawbot-sidecar",
+      "source": "modules/gui-web/target/{profile}/coolzhu-clawbot-sidecar.exe",
+      "target": "bin/coolzhu-clawbot-sidecar.exe",
+      "build": {
+        "command": "cargo",
+        "args": ["build", "-p", "coolzhu-clawbot-sidecar", "--bin", "coolzhu-clawbot-sidecar", "--offline", "--target-dir", "modules/gui-web/target"],
         "working_dir": "."
       }
     },
@@ -86,8 +96,13 @@
   "resources": [
     {
       "id": "package.launcher-config",
-      "source": "config",
-      "target": "config"
+      "source": "config/package-launcher.json",
+      "target": "config/package-launcher.json"
+    },
+    {
+      "id": "package.manifest",
+      "source": "config/package-manifest.json",
+      "target": "config/package-manifest.json"
     },
     {
       "id": "gui-web.tools",
@@ -102,9 +117,50 @@
       "optional": true
     },
     {
+      "id": "gui-web.stt-models",
+      "source": "modules/gui-web/packages/web-console/models",
+      "target": "bin/models",
+      "optional": true
+    },
+    {
+      "id": "gui-web.frontend-index",
+      "source": "modules/gui-web/packages/web-console/index.html",
+      "target": "modules/gui-web/packages/web-console/index.html"
+    },
+    {
+      "id": "gui-web.frontend-app",
+      "source": "modules/gui-web/packages/web-console/src/app.js",
+      "target": "modules/gui-web/packages/web-console/src/app.js"
+    },
+    {
+      "id": "gui-web.frontend-styles",
+      "source": "modules/gui-web/packages/web-console/src/styles.css",
+      "target": "modules/gui-web/packages/web-console/src/styles.css"
+    },
+    {
+      "id": "gui-web.frontend-realtime-capture",
+      "source": "modules/gui-web/packages/web-console/src/realtime_voice_capture.js",
+      "target": "modules/gui-web/packages/web-console/src/realtime_voice_capture.js"
+    },
+    {
+      "id": "gui-web.frontend-realtime-output",
+      "source": "modules/gui-web/packages/web-console/src/realtime_audio_output.js",
+      "target": "modules/gui-web/packages/web-console/src/realtime_audio_output.js"
+    },
+    {
+      "id": "gui-web.frontend-stt-tail",
+      "source": "modules/gui-web/packages/web-console/src/stt_tail_capture.js",
+      "target": "modules/gui-web/packages/web-console/src/stt_tail_capture.js"
+    },
+    {
       "id": "gui-web.assets",
       "source": "modules/gui-web/packages/web-console/assets",
-      "target": "modules/gui-web/packages/web-console/assets",
+      "target": "modules/gui-web/packages/web-console/assets"
+    },
+    {
+      "id": "browser.extension",
+      "source": "modules/browser-extension",
+      "target": "modules/browser-extension",
       "optional": true
     },
     {
@@ -124,6 +180,11 @@
       "source": "modules/gui-desktop/packages/tauri-shell/ui",
       "target": "modules/gui-desktop/packages/tauri-shell/ui",
       "optional": true
+    },
+    {
+      "id": "documentation.user-guide",
+      "source": "docs/user-guide",
+      "target": "docs/user-guide"
     }
   ]
 }

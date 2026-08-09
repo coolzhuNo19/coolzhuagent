@@ -3,24 +3,31 @@ param(
   [ValidateSet('debug', 'release')]
   [string]$Configuration = 'debug',
   [switch]$SkipBuild,
-  [string]$PackageRoot
+  [string]$PackageRoot,
+  [string]$ReportPath
 )
 
 $ErrorActionPreference = 'Stop'
 
 $repo = (Resolve-Path '.').Path
+$repoPath = [System.IO.Path]::GetFullPath($repo).TrimEnd('\', '/')
+$repoPrefix = $repoPath + [System.IO.Path]::DirectorySeparatorChar
 $manifestPath = if ([System.IO.Path]::IsPathRooted($Manifest)) {
-  $Manifest
+  [System.IO.Path]::GetFullPath($Manifest)
 } else {
-  Join-Path $repo $Manifest
+  [System.IO.Path]::GetFullPath((Join-Path $repo $Manifest))
 }
 
+if (-not $manifestPath.StartsWith($repoPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+  throw "package manifest must stay inside the workspace: $manifestPath"
+}
 if (-not (Test-Path -LiteralPath $manifestPath)) {
   throw "package manifest not found: $manifestPath"
 }
 
 $manifestData = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
-$resolvedPackageRoot = if ($PackageRoot) {
+$packageResourceExcludedPathPattern = '(?i)(^|[/\\])(\.coolzhu|\.git|\.claude|\.superpowers|__pycache__|backups?(?:-[^/\\]+)?|tmp|logs?|sessions?)([/\\]|$)|web-sessions|coolzhu\.toml$|package-report\.json$|(^|[/\\])\.env($|\.)|\.(sqlite3?|db)(-(wal|shm|journal))?$|\.(pyc|pyo|bak|old|orig|rej|pem|key|pfx|p12)$|(^|[/\\])(credentials?|secrets?|token-cache|credential-cache|access-token|refresh-token|session-token|auth-token)(\.[^/\\]+)?$'
+$packageRootCandidate = if ($PackageRoot) {
   if ([System.IO.Path]::IsPathRooted($PackageRoot)) { $PackageRoot } else { Join-Path $repo $PackageRoot }
 } elseif ($manifestData.package_root) {
   if ([System.IO.Path]::IsPathRooted($manifestData.package_root)) { $manifestData.package_root } else { Join-Path $repo $manifestData.package_root }
@@ -28,11 +35,79 @@ $resolvedPackageRoot = if ($PackageRoot) {
   Join-Path $repo 'package'
 }
 
+$resolvedPackagePath = [System.IO.Path]::GetFullPath($packageRootCandidate).TrimEnd('\', '/')
+if (
+  $resolvedPackagePath.Equals($repoPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+  -not $resolvedPackagePath.StartsWith($repoPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+) {
+  throw "package root must be a child of the workspace: $resolvedPackagePath"
+}
+
+# 递归删除只允许命中专用 package/ 或 tmp/ staging，避免参数错误清空源码目录。
+$defaultPackageRoot = Join-Path $repoPath 'package'
+$tmpRoot = Join-Path $repoPath 'tmp'
+$tmpPrefix = $tmpRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+$isDefaultPackageRoot = $resolvedPackagePath.Equals(
+  [System.IO.Path]::GetFullPath($defaultPackageRoot).TrimEnd('\', '/'),
+  [System.StringComparison]::OrdinalIgnoreCase
+)
+$isTmpStagingRoot = $resolvedPackagePath.StartsWith(
+  [System.IO.Path]::GetFullPath($tmpPrefix),
+  [System.StringComparison]::OrdinalIgnoreCase
+)
+if (-not $isDefaultPackageRoot -and -not $isTmpStagingRoot) {
+  throw "package root must be workspace\package or a child of workspace\tmp: $resolvedPackagePath"
+}
+
+# 删除 staging 前先完成 manifest 路径预检，避免越界输入或 `..\` 输出在复制后才失败。
+$packageChildPrefix = $resolvedPackagePath + [System.IO.Path]::DirectorySeparatorChar
+$releaseInputs = [System.Collections.Generic.List[string]]::new()
+$releaseInputs.Add($manifestPath)
+foreach ($artifact in @($manifestData.artifacts)) {
+  if ($artifact.source) {
+    $releaseInputs.Add(([string]$artifact.source).Replace('{profile}', $Configuration).Replace('{configuration}', $Configuration))
+  }
+  if ($artifact.build -and $artifact.build.working_dir) {
+    $releaseInputs.Add(([string]$artifact.build.working_dir).Replace('{profile}', $Configuration).Replace('{configuration}', $Configuration))
+  }
+}
+foreach ($resource in @($manifestData.resources)) {
+  if ($resource.source) {
+    $releaseInputs.Add(([string]$resource.source).Replace('{profile}', $Configuration).Replace('{configuration}', $Configuration))
+  }
+}
+foreach ($inputPath in $releaseInputs) {
+  $candidate = if ([System.IO.Path]::IsPathRooted($inputPath)) { $inputPath } else { Join-Path $repoPath $inputPath }
+  $fullInput = [System.IO.Path]::GetFullPath($candidate).TrimEnd('\', '/')
+  if (
+    -not $fullInput.Equals($repoPath, [System.StringComparison]::OrdinalIgnoreCase) -and
+    -not $fullInput.StartsWith($repoPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+  ) {
+    throw "release input must stay inside the workspace: $fullInput"
+  }
+}
+foreach ($releaseItem in @($manifestData.artifacts) + @($manifestData.resources)) {
+  if (-not $releaseItem.target) { continue }
+  $targetText = ([string]$releaseItem.target).Replace('{profile}', $Configuration).Replace('{configuration}', $Configuration)
+  $targetCandidate = if ([System.IO.Path]::IsPathRooted($targetText)) { $targetText } else { Join-Path $resolvedPackagePath $targetText }
+  $fullTarget = [System.IO.Path]::GetFullPath($targetCandidate).TrimEnd('\', '/')
+  if (-not $fullTarget.StartsWith($packageChildPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "release output must stay inside PackageRoot: $fullTarget"
+  }
+}
+
+# 每次从空 staging 开始，杜绝 manifest 已删除 artifact、旧脚本和旧资源继续被 WiX 收集。
+if (Test-Path -LiteralPath $resolvedPackagePath) {
+  Remove-Item -LiteralPath $resolvedPackagePath -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path $resolvedPackagePath | Out-Null
+$resolvedPackageRoot = (Resolve-Path -LiteralPath $resolvedPackagePath).Path
+
 $backupKeep = if ($manifestData.backup_keep) { [int]$manifestData.backup_keep } else { 10 }
 $binRoot = Join-Path $resolvedPackageRoot 'bin'
-$backupRoot = Join-Path $resolvedPackageRoot 'backup'
+$backupRoot = Join-Path $repo 'tmp\package-backups'
 $logRoot = Join-Path $repo 'tmp/logs'
-New-Item -ItemType Directory -Force -Path $resolvedPackageRoot, $binRoot, $backupRoot, $logRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $binRoot, $backupRoot, $logRoot | Out-Null
 
 function Expand-PackageToken {
   param([string]$Value)
@@ -64,6 +139,29 @@ function Get-OptionalHash {
     return $null
   }
   return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+}
+
+function ConvertTo-RepoRelativePath {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+  if ($fullPath.Equals($repoPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+    return '.'
+  }
+  if (-not $fullPath.StartsWith($repoPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "release input must stay inside the workspace: $fullPath"
+  }
+  return $fullPath.Substring($repoPrefix.Length).Replace('\', '/')
+}
+
+function ConvertTo-PackageRelativePath {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+  $packagePath = $resolvedPackageRoot.TrimEnd('\', '/')
+  $packageChildPrefix = $packagePath + [System.IO.Path]::DirectorySeparatorChar
+  if (-not $fullPath.StartsWith($packageChildPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "release output must stay inside PackageRoot: $fullPath"
+  }
+  return $fullPath.Substring($packageChildPrefix.Length).Replace('\', '/')
 }
 
 function Invoke-ArtifactBuild {
@@ -140,6 +238,8 @@ function Publish-Artifact {
   param([object]$Artifact)
   $source = Resolve-RepoPath ([string]$Artifact.source)
   $target = Resolve-PackagePath ([string]$Artifact.target)
+  $sourceRelative = ConvertTo-RepoRelativePath $source
+  $targetRelative = ConvertTo-PackageRelativePath $target
   if (-not (Test-Path -LiteralPath $source)) {
     throw "artifact source missing for $($Artifact.id): $source"
   }
@@ -159,8 +259,8 @@ function Publish-Artifact {
     Write-Host "unchanged $($Artifact.id): $target"
     return [pscustomobject]@{
       id = $Artifact.id
-      source = $source
-      target = $target
+      source = $sourceRelative
+      target = $targetRelative
       copied = $false
       sha256 = $sourceHash
     }
@@ -173,8 +273,8 @@ function Publish-Artifact {
   Write-Host "publish $($Artifact.id): $source -> $target"
   return [pscustomobject]@{
     id = $Artifact.id
-    source = $source
-    target = $target
+    source = $sourceRelative
+    target = $targetRelative
     copied = $true
     sha256 = $sourceHash
   }
@@ -200,6 +300,8 @@ function Copy-PackageResource {
   param([object]$Resource)
   $source = Resolve-RepoPath ([string]$Resource.source)
   $target = Resolve-PackagePath ([string]$Resource.target)
+  [void](ConvertTo-RepoRelativePath $source)
+  [void](ConvertTo-PackageRelativePath $target)
   if (-not (Test-Path -LiteralPath $source)) {
     if ($Resource.optional -eq $true) {
       Write-Host "skip optional resource $($Resource.id): $source"
@@ -209,15 +311,25 @@ function Copy-PackageResource {
   }
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
   Assert-PackageChildPath -Path $target
-  if (Test-Path -LiteralPath $target) {
-    Remove-Item -LiteralPath $target -Recurse -Force
-  }
-  New-Item -ItemType Directory -Force -Path $target | Out-Null
   if ((Get-Item -LiteralPath $source).PSIsContainer) {
-    Get-ChildItem -LiteralPath $source -Force | ForEach-Object {
-      Copy-Item -LiteralPath $_.FullName -Destination $target -Recurse -Force
+    if (Test-Path -LiteralPath $target) {
+      Remove-Item -LiteralPath $target -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    $resolvedSourceRoot = (Resolve-Path -LiteralPath $source).Path.TrimEnd('\', '/')
+    $resolvedSourcePrefix = $resolvedSourceRoot + [System.IO.Path]::DirectorySeparatorChar
+    Get-ChildItem -LiteralPath $resolvedSourceRoot -File -Recurse -Force | ForEach-Object {
+      $relativePath = $_.FullName.Substring($resolvedSourcePrefix.Length)
+      if ($relativePath -notmatch $packageResourceExcludedPathPattern) {
+        $destination = Join-Path $target $relativePath
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+        Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
+      }
     }
   } else {
+    if (Test-Path -LiteralPath $target -PathType Container) {
+      Remove-Item -LiteralPath $target -Recurse -Force
+    }
     Copy-Item -LiteralPath $source -Destination $target -Force
   }
   Write-Host "resource $($Resource.id): $source -> $target"
@@ -233,15 +345,57 @@ foreach ($resource in @($manifestData.resources)) {
   Copy-PackageResource -Resource $resource
 }
 
+# 控制台 API 健康并不代表 UI 可用。打包阶段强制核对首页启动链和至少一个视觉资源，
+# 防止生成“后端能启动、Tauri 只显示 static file not found”的安装包。
+$requiredWebConsoleFiles = @(
+  'modules/gui-web/packages/web-console/index.html',
+  'modules/gui-web/packages/web-console/src/app.js',
+  'modules/gui-web/packages/web-console/src/styles.css',
+  'modules/gui-web/packages/web-console/src/realtime_voice_capture.js',
+  'modules/gui-web/packages/web-console/src/realtime_audio_output.js',
+  'modules/gui-web/packages/web-console/src/stt_tail_capture.js',
+  'modules/gui-web/packages/web-console/assets/icons/code.png'
+)
+foreach ($relativePath in $requiredWebConsoleFiles) {
+  $packagedPath = Join-Path $resolvedPackageRoot $relativePath
+  if (-not (Test-Path -LiteralPath $packagedPath -PathType Leaf)) {
+    throw "required packaged web-console file missing: $relativePath"
+  }
+}
+
+& (Join-Path $repo 'scripts/package-safety.ps1') -Root $resolvedPackageRoot | Out-Null
+
 $report = [ordered]@{
   generated_at = (Get-Date).ToUniversalTime().ToString('o')
   configuration = $Configuration
-  manifest = $manifestPath
-  package_root = $resolvedPackageRoot
+  manifest = ConvertTo-RepoRelativePath $manifestPath
+  package_root = ConvertTo-RepoRelativePath $resolvedPackageRoot
   backup_keep = $backupKeep
   artifacts = $results
 }
 
-$reportPath = Join-Path $resolvedPackageRoot 'package-report.json'
-$report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportPath -Encoding UTF8
-Write-Host "package report: $reportPath"
+$resolvedReportPath = if ($ReportPath) {
+  if ([System.IO.Path]::IsPathRooted($ReportPath)) {
+    [System.IO.Path]::GetFullPath($ReportPath)
+  } else {
+    [System.IO.Path]::GetFullPath((Join-Path $repoPath $ReportPath))
+  }
+} else {
+  $reportStamp = Get-Date -Format 'yyyyMMdd-HHmmssfff'
+  Join-Path $repoPath "tmp\package-reports\package-report-$Configuration-$reportStamp.json"
+}
+$resolvedReportPath = [System.IO.Path]::GetFullPath($resolvedReportPath)
+if (-not $resolvedReportPath.StartsWith($repoPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+  throw "package report must stay inside the workspace: $resolvedReportPath"
+}
+$packagePrefix = $resolvedPackageRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+if (
+  $resolvedReportPath.Equals($resolvedPackageRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+  $resolvedReportPath.StartsWith($packagePrefix, [System.StringComparison]::OrdinalIgnoreCase)
+) {
+  throw "package report must not be written inside PackageRoot: $resolvedReportPath"
+}
+$reportParent = Split-Path -Parent $resolvedReportPath
+New-Item -ItemType Directory -Force -Path $reportParent | Out-Null
+$report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $resolvedReportPath -Encoding UTF8
+Write-Host "package report: $resolvedReportPath"
