@@ -38,8 +38,10 @@ const WUXIA_ICON_ALIASES = new Map([
   ["wheel", "tasks"],
   ["skill", "memory"],
   ["inner-vision", "vision"],
+  ["vision", "vision"],
   ["warn-log", "logs"],
   ["info-log", "logs"],
+  ["ok-log", "logs"],
   ["bot vision", "vision"],
   ["refresh", "refresh"],
   ["search", "search"],
@@ -53,10 +55,28 @@ const WUXIA_ICON_ALIASES = new Map([
   ["unlock", "unlock"],
   ["camera", "camera"],
   ["code", "diff"],
+  ["diff", "diff"],
   ["folder", "folder"],
   ["file", "file"],
   ["collapse", "chevron"],
 ]);
+// 仅保留源码资源目录中真实存在、且当前界面仍会使用的旧 PNG。
+// 未登记的动态名称统一回退到已打包 SVG，避免拼出不存在的 /assets/icons/*.png。
+const PACKAGED_LEGACY_PNG_ICON_NAMES = new Set([
+  "error-log",
+  "fail",
+  "file-type",
+  "loading",
+  "media-audio-wave",
+  "media-video-film",
+  "monitor-on",
+  "result",
+  "session-new",
+  "success",
+  "system-message",
+  "thinking",
+]);
+const DEFAULT_PACKAGED_ICON_URL = "./assets/icons-wuxia/file.svg";
 let chatRoomRegistry = { rooms: [], active_room_id: null, max_rooms: 8 };
 let chatRoster = { room_id: null, members: [] };
 let chatHandoffs = [];
@@ -87,6 +107,7 @@ let visionRealtimeSelectedElementKey = "";
 let goalRoleRegistry = { roles: [], commander_session_id: null, generated_at: null };
 let activeSessionId = null;
 let activeChatRoomId = null;
+let activeChatRoomDiagnostics = { enabled: true, auto_refresh: false, show_stream_interrupts: true, show_details: true };
 let activeChatAbortController = null;
 let showUiServiceStatus = { enabled: false, running: false, pid: null, disabled: false };
 let activeOverviewVisionAgent = null;
@@ -113,6 +134,7 @@ let clawbotLoginPollTimer = null;
 let clawbotLoginPollInFlight = false;
 let handoffDrawerOpen = false;
 let selectedProjectPath = "";
+let selectedProjectKind = "";
 let projectTreeRoot = null;
 const expandedProjectPaths = new Set();
 // IDE 工程窗口 · 阶段D：View/Diff 合并按钮状态机（plan §4.6）
@@ -212,6 +234,7 @@ document.addEventListener("DOMContentLoaded", () => {
   actionButtons.get("realtime-model-probe")?.addEventListener("click", realtimeModelStreamProbe);
   actionButtons.get("realtime-tts-probe")?.addEventListener("click", realtimeTtsProbe);
   actionButtons.get("open-dispatch-diagnostics")?.addEventListener("click", openDispatchDiagnostics);
+  actionButtons.get("diagnostics-functional")?.addEventListener("click", runFunctionalDiagnostics);
   actionButtons.get("session-new")?.addEventListener("click", createSession);
   actionButtons.get("session-save")?.addEventListener("click", saveSelectedSession);
   actionButtons.get("session-reset")?.addEventListener("click", resetSelectedSession);
@@ -225,9 +248,15 @@ document.addEventListener("DOMContentLoaded", () => {
   actionButtons.get("chat-room-new")?.addEventListener("click", createChatRoom);
   actionButtons.get("chat-room-rename")?.addEventListener("click", renameSelectedChatRoom);
   actionButtons.get("chat-room-delete")?.addEventListener("click", deleteSelectedChatRoom);
+  actionButtons.get("chat-room-diagnostics")?.addEventListener("click", openChatRoomDiagnosticsSettings);
   actionButtons.get("chat-handoff-toggle")?.addEventListener("click", toggleHandoffDrawer);
   actionButtons.get("chat-handoff-manual")?.addEventListener("click", manualHandoffSelectedMessages);
   actionButtons.get("project-refresh")?.addEventListener("click", () => loadProjectTree());
+  actionButtons.get("project-save")?.addEventListener("click", () => saveActiveIdeFile());
+  actionButtons.get("project-new-file")?.addEventListener("click", () => createProjectEntry("file"));
+  actionButtons.get("project-new-dir")?.addEventListener("click", () => createProjectEntry("dir"));
+  actionButtons.get("project-rename")?.addEventListener("click", renameSelectedProjectEntry);
+  actionButtons.get("project-delete")?.addEventListener("click", deleteSelectedProjectEntry);
   actionButtons.get("project-symbol-index")?.addEventListener("click", buildProjectSymbolIndex);
   actionButtons.get("project-mode-toggle")?.addEventListener("click", () => toggleIdeViewDiffMode());
   document.querySelector('[data-role="ide-diff-right"]')?.addEventListener("keydown", (event) => {
@@ -372,10 +401,26 @@ document.addEventListener("DOMContentLoaded", () => {
   actionButtons.get("self-update-plan-refresh")?.addEventListener("click", refreshSelfUpdatePlan);
   document.querySelector('[data-role="project-tree"]')?.addEventListener("click", onProjectTreeClick);
   document.querySelector('[data-role="project-tree"]')?.addEventListener("dblclick", onProjectTreeDblClick);
+  document.querySelector('[data-role="project-tree"]')?.addEventListener("contextmenu", onProjectTreeContextMenu);
   document.querySelector('[data-bind="project.path"]')?.addEventListener("dblclick", beginWorkspaceEdit);
   document.querySelector('[data-role="overview-workspace-name"]')?.addEventListener("click", copyOverviewWorkspacePath);
 
   window.addEventListener("resize", positionAvatarPicker);
+  window.addEventListener("beforeunload", (event) => {
+    if (ideState.tabs.some((tab) => tab.dirty)) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+      const active = ideState.tabs.find((tab) => tab.id === ideState.activeTabId);
+      if (active?.kind === "view" && active.payload?.editable) {
+        event.preventDefault();
+        void saveActiveIdeFile();
+      }
+    }
+  });
   document.addEventListener("scroll", positionAvatarPicker, true);
 
   const providerSelect = document.querySelector('[data-role="session-provider"]');
@@ -1535,6 +1580,32 @@ async function diagnosticsWindowRefresh(options = {}) {
     if (!options.silent) {
       addMessage({ author: "模块自检", text: `健康检查失败：${error.message}`, kind: "thought", icon: "error-log" });
     }
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function runFunctionalDiagnostics(event) {
+  const button = event?.currentTarget || actionButtons.get("diagnostics-functional");
+  const output = document.querySelector('[data-role="functional-selfcheck-output"]');
+  const status = document.querySelector('[data-role="functional-selfcheck-status"]');
+  setBusy(button, true, "检查中");
+  if (status) status.textContent = "运行中";
+  try {
+    const data = await requestJson("/api/diagnostics/functional");
+    const summary = data?.summary || {};
+    if (status) status.textContent = `${String(summary.status || "unknown").toUpperCase()} · ${summary.ok || 0}/${(data?.checks || []).length}`;
+    if (output) {
+      output.textContent = [
+        data?.note || "",
+        `状态：${summary.status || "unknown"}  ok=${summary.ok || 0} warn=${summary.warn || 0} error=${summary.error || 0}`,
+        "",
+        ...(data?.checks || []).map((check) => `[${String(check.status || "unknown").toUpperCase()}] ${check.label || check.id}: ${check.detail || ""}`),
+      ].join("\n");
+    }
+  } catch (error) {
+    if (status) status.textContent = "ERROR";
+    if (output) output.textContent = `常用功能自检失败：${error.message}`;
   } finally {
     setBusy(button, false);
   }
@@ -4348,6 +4419,106 @@ function taskRenderFullAccessStatus(status = {}) {
   }
 }
 
+async function refreshChatRoomDiagnosticsPreferences() {
+  if (!activeChatRoomId) {
+    activeChatRoomDiagnostics = { enabled: true, auto_refresh: false, show_stream_interrupts: true, show_details: true };
+    return activeChatRoomDiagnostics;
+  }
+  try {
+    activeChatRoomDiagnostics = await requestJson(`/api/chat/rooms/${encodeURIComponent(activeChatRoomId)}/diagnostics`);
+    if (activeChatRoomDiagnostics.enabled && activeChatRoomDiagnostics.auto_refresh) {
+      void diagnosticsWindowRefresh({ silent: true });
+    }
+  } catch (error) {
+    console.warn("聊天室诊断偏好读取失败", error);
+  }
+  return activeChatRoomDiagnostics;
+}
+
+async function openChatRoomDiagnosticsSettings(event) {
+  const button = event?.currentTarget || actionButtons.get("chat-room-diagnostics");
+  if (!activeChatRoomId) {
+    addMessage({ author: "聊天室诊断", text: "请先选择聊天室。", kind: "thought", icon: "error-log" });
+    return;
+  }
+  setBusy(button, true, "读取中");
+  try {
+    const [data, permission] = await Promise.all([
+      requestJson(`/api/chat/rooms/${encodeURIComponent(activeChatRoomId)}/diagnostics`),
+      requestJson(`/api/chat/rooms/${encodeURIComponent(activeChatRoomId)}/permissions`),
+    ]);
+    document.querySelector(".chat-room-diagnostics-modal")?.remove();
+    const modal = document.createElement("div");
+    modal.className = "task-chain-modal chat-room-diagnostics-modal";
+    modal.innerHTML = `
+      <div class="task-chain-dialog" role="dialog" aria-modal="true" aria-label="聊天室诊断设置">
+        <header><strong>聊天室诊断设置</strong><button type="button" class="mini-button" data-diagnostics-close>关闭</button></header>
+        <p>设置仅保存到当前聊天室，不会开启 full-access 或改变工具审批。</p>
+        <label><input type="checkbox" data-diagnostics-field="enabled" ${data.enabled ? "checked" : ""}> 启用聊天室诊断</label>
+        <label><input type="checkbox" data-diagnostics-field="auto_refresh" ${data.auto_refresh ? "checked" : ""}> 切换聊天室时自动刷新</label>
+        <label><input type="checkbox" data-diagnostics-field="show_stream_interrupts" ${data.show_stream_interrupts ? "checked" : ""}> 显示流式中断原因</label>
+        <label><input type="checkbox" data-diagnostics-field="show_details" ${data.show_details ? "checked" : ""}> 显示详细检查项</label>
+        <hr>
+        <strong>聊天室有效能力（只会收紧全局配置）</strong>
+        <label><input type="checkbox" data-diagnostics-field="real_llm_enabled" ${data.real_llm_enabled ? "checked" : ""}> 允许真实模型调用</label>
+        <label><input type="checkbox" data-diagnostics-field="llm_tools_enabled" ${data.llm_tools_enabled ? "checked" : ""}> 允许模型工具调用</label>
+        <label><input type="checkbox" data-diagnostics-field="computer_use_enabled" ${data.computer_use_enabled ? "checked" : ""}> 允许 computer-use（仍需审批）</label>
+        <label>文件读写/命令权限档位<select data-diagnostics-permission>
+          <option value="workspace-write" ${(permission.permission_profile || "workspace-write") === "workspace-write" ? "selected" : ""}>workspace-write（默认）</option>
+          <option value="full-access" ${permission.permission_profile === "full-access" ? "selected" : ""}>full-access（双重确认 + 审批）</option>
+        </select></label>
+        <small>full-access 不会由此弹窗静默开启，必须再次确认风险并通过权限闸门。</small>
+        <footer><span data-role="diagnostics-save-status">未保存</span><button type="button" class="mini-button is-primary-control" data-diagnostics-save>保存</button></footer>
+      </div>`;
+    const close = () => modal.remove();
+    modal.addEventListener("click", (click) => {
+      if (click.target === modal || click.target.closest("[data-diagnostics-close]")) close();
+    });
+    modal.querySelector("[data-diagnostics-save]")?.addEventListener("click", async (saveEvent) => {
+      const saveButton = saveEvent.currentTarget;
+      const status = modal.querySelector('[data-role="diagnostics-save-status"]');
+      const payload = {};
+      modal.querySelectorAll("[data-diagnostics-field]").forEach((input) => {
+        payload[input.dataset.diagnosticsField] = Boolean(input.checked);
+      });
+      setBusy(saveButton, true, "保存中");
+      try {
+        const saved = await requestJson(`/api/chat/rooms/${encodeURIComponent(activeChatRoomId)}/diagnostics`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const permissionSelect = modal.querySelector("[data-diagnostics-permission]");
+        if (permissionSelect && permissionSelect.value !== (permission.permission_profile || "workspace-write")) {
+          const selectedProfile = permissionSelect.value;
+          const riskAck = selectedProfile === "full-access" && window.confirm("确认将当前聊天室权限提升为 full-access？这会允许更广泛的文件/命令操作。");
+          const confirmedTwice = selectedProfile === "full-access" && riskAck && window.confirm("再次确认：full-access 仍受工具审批和安全策略约束，是否继续？");
+          if (selectedProfile === "full-access" && (!riskAck || !confirmedTwice)) {
+            throw new Error("full-access 未完成双重确认，已保持原权限");
+          }
+          await requestJson(`/api/chat/rooms/${encodeURIComponent(activeChatRoomId)}/permissions`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ permission_profile: selectedProfile, risk_acknowledged: riskAck, confirmed_twice: confirmedTwice }),
+          });
+        }
+        activeChatRoomDiagnostics = saved;
+        if (status) status.textContent = `已保存 · ${new Date((saved.updated_at || Date.now())).toLocaleTimeString()}`;
+        refreshAuthorizationSelectedRoom();
+      } catch (error) {
+        if (status) status.textContent = `保存失败：${error.message}`;
+      } finally {
+        setBusy(saveButton, false);
+      }
+    });
+    document.body.append(modal);
+  } catch (error) {
+    addMessage({ author: "聊天室诊断", text: `读取诊断设置失败：${error.message}`, kind: "thought", icon: "error-log" });
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 async function enableFullAccessGrant(event) {
   const button = event?.currentTarget || actionButtons.get("full-access-enable");
   if (!activeChatRoomId) {
@@ -6540,7 +6711,13 @@ function avatarUrl(path) {
 function iconUrl(icon) {
   const normalized = String(icon || "").trim().replace(/\.png$/i, "");
   const wuxiaIcon = WUXIA_ICON_ALIASES.get(normalized);
-  return wuxiaIcon ? `./assets/icons-wuxia/${wuxiaIcon}.svg` : `./assets/icons/${normalized}.png`;
+  if (wuxiaIcon) {
+    return `./assets/icons-wuxia/${wuxiaIcon}.svg`;
+  }
+  if (PACKAGED_LEGACY_PNG_ICON_NAMES.has(normalized)) {
+    return `./assets/icons/${normalized}.png`;
+  }
+  return DEFAULT_PACKAGED_ICON_URL;
 }
 
 function sessionByAuthor(author) {
@@ -6828,6 +7005,7 @@ async function loadChatRooms() {
     await loadChatRoomMessages(active.id);
     await refreshChatCollaboration(active.id);
     await refreshFullAccessStatus();
+    await refreshChatRoomDiagnosticsPreferences();
     restoreComposerDraft(active.id);
   } else {
     updateChatRoomTrigger("暂无聊天室");
@@ -9013,7 +9191,9 @@ function setSessionForm(session) {
   }
   if (reasoningEffort) reasoningEffort.value = session.reasoning_effort || "medium";
   if (apiSecret) {
-    if (session.api_key_status && !session.api_key_status.includes("待配置")) {
+    if (session.api_key_status
+      && !session.api_key_status.includes("待配")
+      && !session.api_key_status.includes("未配置")) {
       apiSecret.value = ""; apiSecret.placeholder = "已配置"; apiSecret.dataset.saved = "1";
     } else {
       apiSecret.value = ""; apiSecret.placeholder = "sk-..."; apiSecret.dataset.saved = "0";
@@ -10049,7 +10229,7 @@ let lastUserIntent = "";
 
 async function sendMessage({ replaceActive = false } = {}) {
   if (activeChatAbortController) {
-    activeChatAbortController.abort();
+    activeChatAbortController.abort("user");
     if (!replaceActive) {
       return;
     }
@@ -10085,11 +10265,21 @@ async function sendMessage({ replaceActive = false } = {}) {
     await streamChat(payload, { t0, signal: abortController.signal });
   } catch (error) {
     if (error?.name === "AbortError") {
+      const reason = abortController.signal.reason === "user" ? "用户主动停止" : "请求被取消（页面/网络中断）";
       addMessage({
         author: "消息分发",
-        text: "已停止模型思考和回复。",
+        text: `已停止模型思考和回复。原因：${reason}`,
         kind: "thought",
         icon: "warn-log",
+      });
+      return;
+    }
+    if (error?.streamInterrupted) {
+      addMessage({
+        author: "流式诊断",
+        text: `流式响应中断，未自动递归重试。原因：${error.message || "通道提前关闭"}`,
+        kind: "thought",
+        icon: "error-log",
       });
       return;
     }
@@ -10151,23 +10341,30 @@ async function streamChat(payload, { t0, signal } = {}) {
   const reader = response.body.getReader();
   let buffer = "";
   let donePayload = null;
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
-    }
-    buffer += decoder.decode(value, { stream: true });
-    const frames = buffer.split(/\r?\n\r?\n/);
-    buffer = frames.pop() ?? "";
-    for (const frame of frames) {
-      const event = parseSseFrame(frame);
-      if (event) {
-        const result = handleChatStreamEvent(event);
-        if (event.event === "done") {
-          donePayload = result;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split(/\r?\n\r?\n/);
+      buffer = frames.pop() ?? "";
+      for (const frame of frames) {
+        const event = parseSseFrame(frame);
+        if (event) {
+          const result = handleChatStreamEvent(event);
+          if (event.event === "done") {
+            donePayload = result;
+          }
         }
       }
     }
+  } catch (error) {
+    if (error?.name === "AbortError") throw error;
+    const interrupted = new Error(error?.message || "SSE reader closed unexpectedly");
+    interrupted.streamInterrupted = true;
+    throw interrupted;
   }
   buffer += decoder.decode();
   if (buffer.trim()) {
@@ -10178,6 +10375,11 @@ async function streamChat(payload, { t0, signal } = {}) {
         donePayload = result;
       }
     }
+  }
+  if (!donePayload) {
+    const interrupted = new Error("服务端未发送 done 事件，流式通道提前结束");
+    interrupted.streamInterrupted = true;
+    throw interrupted;
   }
   console.debug(`chat stream ${Math.round(performance.now() - (t0 ?? performance.now()))}ms`);
   if (donePayload?.tasks) {
@@ -10624,6 +10826,7 @@ async function openSelectedChatRoom() {
   );
   await loadChatRoomMessages(activeChatRoomId);
   await refreshFullAccessStatus();
+  await refreshChatRoomDiagnosticsPreferences();
   restoreComposerDraft(activeChatRoomId);
 }
 
@@ -11808,7 +12011,7 @@ function highlightLineFragment(lineText, keywords) {
 // IDE 编辑器状态：当前载入段（行窗口）+ 截断标记，供 :n 跳转判定是否需远程加载。
 const IDE_EDITOR_MAX_BYTES = 200 * 1024;
 const IDE_EDITOR_LINE_WINDOW = 400;
-let ideEditorState = { path: "", startLine: 1, lineCount: 0, truncated: false };
+let ideEditorState = { path: "", startLine: 1, lineCount: 0, truncated: false, editable: false };
 
 // 文件内容渲染：委托 renderIdeEditor（行号双栏 + :n 跳转）。保留原函数名兼容旧调用点。
 function renderProjectContent(content, lang, meta = "") {
@@ -11866,6 +12069,7 @@ function renderIdeEditor(content, opts = {}) {
     startLine: effectiveStart,
     lineCount: displayLines.length,
     truncated,
+    editable: false,
   };
 
   const editor = document.createElement("div");
@@ -11937,6 +12141,85 @@ function renderIdeEditor(content, opts = {}) {
     jumpToIdeLine(highlightLine, { smooth: true });
   }
   refreshIdeOutline(path);
+}
+
+function ideSetOperationStatus(message, kind = "") {
+  const node = document.querySelector('[data-role="ide-operation-status"]');
+  if (!node) return;
+  node.textContent = message || "";
+  node.classList.toggle("is-error", kind === "error");
+  node.classList.toggle("is-success", kind === "success");
+}
+
+function activeIdeViewTab() {
+  const tab = ideState.tabs.find((item) => item.id === ideState.activeTabId);
+  return tab?.kind === "view" ? tab : null;
+}
+
+function updateIdeSaveButton() {
+  const tab = activeIdeViewTab();
+  const button = actionButtons.get("project-save");
+  if (button) {
+    button.disabled = !(tab?.payload?.editable && tab.dirty);
+    button.title = tab?.payload?.editable
+      ? (tab.dirty ? "保存当前文件 (Ctrl+S)" : "当前文件已保存")
+      : "当前内容只读";
+  }
+}
+
+function renderIdeEditableEditor(content, opts = {}) {
+  const { path = "", meta = "", lineEnding = "lf", encoding = "utf-8" } = opts;
+  const preview = projectPreviewText();
+  if (!preview) return;
+  preview.classList.remove("is-diff");
+  preview.classList.add("is-code", "is-editable");
+  const editor = document.createElement("div");
+  editor.className = "ide-editor is-editable";
+  editor.dataset.role = "ide-editor";
+  const gutter = document.createElement("pre");
+  gutter.className = "ide-gutter";
+  const textarea = document.createElement("textarea");
+  textarea.className = "ide-edit-surface";
+  textarea.dataset.role = "ide-edit-surface";
+  textarea.value = content || "";
+  textarea.spellcheck = false;
+  textarea.wrap = "off";
+  textarea.setAttribute("aria-label", `编辑 ${path}`);
+  const refreshGutter = () => {
+    const count = Math.max(1, textarea.value.split("\n").length);
+    gutter.textContent = Array.from({ length: count }, (_, index) => String(index + 1)).join("\n");
+    gutter.style.minWidth = `${String(count).length}ch`;
+    ideEditorState.lineCount = count;
+  };
+  textarea.addEventListener("input", () => {
+    const tab = activeIdeViewTab();
+    if (!tab || tab.path !== path || !tab.payload) return;
+    tab.payload.content = textarea.value;
+    tab.dirty = textarea.value !== tab.payload.savedContent;
+    refreshGutter();
+    renderIdeTabbar();
+    updateIdeSaveButton();
+    ideSetOperationStatus(tab.dirty ? `未保存：${path}` : `已保存：${path}`);
+  });
+  textarea.addEventListener("scroll", () => {
+    gutter.scrollTop = textarea.scrollTop;
+  });
+  editor.append(gutter, textarea);
+  preview.replaceChildren(editor);
+  ideEditorState = {
+    path,
+    startLine: 1,
+    lineCount: 1,
+    truncated: false,
+    editable: true,
+  };
+  refreshGutter();
+  const metaNode = projectPreviewMeta();
+  if (metaNode) {
+    metaNode.textContent = `${meta} · 可编辑 · ${encoding.toUpperCase()} · ${lineEnding.toUpperCase()}`;
+  }
+  refreshIdeOutline(path);
+  window.setTimeout(() => textarea.focus(), 0);
 }
 
 // Phase 5 P4.1：符号大纲侧条——拉取当前文件全部符号（api_project_symbols?path=），点击跳行。
@@ -12690,7 +12973,15 @@ async function loadProjectTree(path = "") {
     const response = await requestJson(url);
     projectTreeRoot = response.root;
     setText("project.path", response.workspace);
-    renderProjectApiTree([response.root]);
+    renderProjectApiTree([response.root], response.warnings || []);
+    if (Array.isArray(response.warnings) && response.warnings.length) {
+      ideSetOperationStatus(
+        `目录已加载，${response.warnings.length} 个异常条目已跳过；其余文件仍完整显示。`,
+        "error",
+      );
+    } else {
+      ideSetOperationStatus("目录已刷新。", "success");
+    }
     if (!selectedProjectPath) {
       updateProjectPreview(
         "从左侧目录树选择文件预览；快捷键：Ctrl+P 搜文件 · @ 搜符号 · :行号 跳转。",
@@ -12707,7 +12998,7 @@ async function loadProjectTree(path = "") {
   }
 }
 
-function renderProjectApiTree(entries) {
+function renderProjectApiTree(entries, warnings = []) {
   const list = projectTreeList();
   if (!list) {
     return;
@@ -12728,6 +13019,13 @@ function renderProjectApiTree(entries) {
   nodes.forEach((entry) => {
     list.append(renderProjectTreeNode(entry, 0));
   });
+  if (warnings.length) {
+    const warning = document.createElement("li");
+    warning.className = "project-tree-warning";
+    warning.textContent = `⚠ 跳过 ${warnings.length} 个不可读取/重解析条目`;
+    warning.title = warnings.join("\n");
+    list.append(warning);
+  }
 }
 
 function projectParentPath(path = "") {
@@ -12902,15 +13200,20 @@ function onProjectTreeClick(event) {
   const path = node.dataset.projectPath || "";
   const kind = node.dataset.projectKind || "file";
   if (kind !== "dir") {
+    selectedProjectKind = "file";
     void openProjectFile(path);
     return;
   }
   // “返回上一级”：单击直接进入上级目录
   if (node.dataset.projectParent) {
     selectedProjectPath = "";
+    selectedProjectKind = "dir";
     void loadProjectTree(path);
     return;
   }
+  selectedProjectPath = path;
+  selectedProjectKind = "dir";
+  syncProjectTreeSelection();
   // 目录：单击展开/折叠；延迟触发以便与双击（进入子目录）区分
   if (projectTreeClickTimer) {
     clearTimeout(projectTreeClickTimer);
@@ -12919,6 +13222,16 @@ function onProjectTreeClick(event) {
     projectTreeClickTimer = null;
     toggleProjectTreeNode(node);
   }, 220);
+}
+
+function onProjectTreeContextMenu(event) {
+  const node = event.target.closest("[data-project-path]");
+  if (!node) return;
+  event.preventDefault();
+  selectedProjectPath = node.dataset.projectPath || "";
+  selectedProjectKind = node.dataset.projectKind || "file";
+  syncProjectTreeSelection();
+  ideSetOperationStatus(`已选择：${selectedProjectPath || "workspace root"}`);
 }
 
 async function onProjectTreeDblClick(event) {
@@ -12935,16 +13248,25 @@ async function onProjectTreeDblClick(event) {
     projectTreeClickTimer = null;
   }
   selectedProjectPath = "";
+  selectedProjectKind = "dir";
   await loadProjectTree(node.dataset.projectPath || "");
 }
 
-async function openProjectFile(path = selectedProjectPath) {
+async function openProjectFile(path = selectedProjectPath, { forceReload = false } = {}) {
   if (!path) {
     updateProjectPreview("Select a file from the project tree first.", "No file selected.");
     return;
   }
+  const cached = findIdeTabByKind("view", path, "");
+  if (!forceReload && cached?.dirty && cached.payload?.editable) {
+    activateIdeTab(cached.id);
+    ideSetOperationStatus(`保留未保存编辑：${path}`);
+    return;
+  }
   const previousPath = selectedProjectPath;
+  const previousKind = selectedProjectKind;
   selectedProjectPath = path;
+  selectedProjectKind = "file";
   syncProjectTreeSelection();
   try {
     const meta = await requestJson(`/api/project/file/meta?path=${encodeURIComponent(path)}`);
@@ -12953,17 +13275,199 @@ async function openProjectFile(path = selectedProjectPath) {
       updateProjectPreview("This file is binary or too large for inline preview.", metaText);
       return;
     }
-    const response = await requestJson(`/api/project/file?path=${encodeURIComponent(path)}&offset=0&limit=65536`);
-    const suffix = response.next_offset ? `\n\n[Preview truncated. Next offset: ${response.next_offset}]` : "";
+    const readLimit = meta.editable
+      ? Math.max(1, Math.min(Number(meta.file_size) + 3, Number(meta.max_edit_bytes) || 262144))
+      : 65536;
+    const response = await requestJson(`/api/project/file?path=${encodeURIComponent(path)}&offset=0&limit=${readLimit}`);
+    const suffix = !meta.editable && response.next_offset
+      ? `\n\n[Preview truncated. Next offset: ${response.next_offset}]`
+      : "";
     const content = `${response.content}${suffix}`;
     const lang = syntaxLangForPath(path);
-    renderProjectContent(content, lang, metaText);
-    // 阶段E：打开/激活对应 view tab 并缓存内容，切换回来时免重新拉取。
-    openIdeViewTab(path, { payload: { content, lang, meta: metaText } });
+    const payload = {
+      content,
+      savedContent: content,
+      lang,
+      meta: metaText,
+      editable: Boolean(meta.editable),
+      revision: meta.revision || "",
+      encoding: meta.encoding || "utf-8",
+      lineEnding: meta.line_ending || "lf",
+    };
+    const tab = openIdeViewTab(path, { payload });
+    tab.dirty = false;
+    if (meta.editable) {
+      renderIdeEditableEditor(content, {
+        path,
+        meta: metaText,
+        encoding: payload.encoding,
+        lineEnding: payload.lineEnding,
+      });
+      ideSetOperationStatus(`可编辑：${path}`);
+    } else {
+      renderProjectContent(content, lang, `${metaText} · 只读`);
+      ideSetOperationStatus(`只读：${path}${meta.binary ? "（二进制）" : "（文件过大或权限受限）"}`);
+    }
+    renderIdeTabbar();
+    updateIdeSaveButton();
   } catch (error) {
     selectedProjectPath = previousPath;
+    selectedProjectKind = previousKind;
     syncProjectTreeSelection();
     updateProjectPreview(error.message, "File preview failed.");
+  }
+}
+
+async function saveActiveIdeFile() {
+  const tab = activeIdeViewTab();
+  if (!tab?.payload?.editable) {
+    ideSetOperationStatus("当前内容不可编辑。", "error");
+    return false;
+  }
+  if (!tab.dirty) {
+    ideSetOperationStatus(`无需保存：${tab.path}`);
+    return true;
+  }
+  const button = actionButtons.get("project-save");
+  setBusy(button, true, "保存中");
+  try {
+    const result = await requestJson("/api/project/file", {
+      method: "PUT",
+      body: JSON.stringify({
+        path: tab.path,
+        content: tab.payload.content,
+        revision: tab.payload.revision,
+      }),
+    });
+    tab.payload.revision = result.revision || tab.payload.revision;
+    tab.payload.savedContent = tab.payload.content;
+    tab.dirty = false;
+    renderIdeTabbar();
+    updateIdeSaveButton();
+    ideSetOperationStatus(`已保存：${tab.path}`, "success");
+    return true;
+  } catch (error) {
+    if (error.status === 409) {
+      ideSetOperationStatus(`保存冲突：${tab.path} 已被外部修改。`, "error");
+      if (window.confirm("文件已被外部修改。是否放弃当前编辑并重新加载磁盘版本？")) {
+        tab.dirty = false;
+        await openProjectFile(tab.path, { forceReload: true });
+      }
+    } else {
+      ideSetOperationStatus(`保存失败：${error.message}`, "error");
+    }
+    return false;
+  } finally {
+    setBusy(button, false);
+    updateIdeSaveButton();
+  }
+}
+
+function currentProjectParentPath() {
+  if (selectedProjectKind === "dir") return selectedProjectPath || "";
+  if (selectedProjectPath) return projectParentPath(selectedProjectPath);
+  return projectTreeRoot?.relative_path || "";
+}
+
+async function createProjectEntry(kind) {
+  const parentPath = currentProjectParentPath();
+  const label = kind === "dir" ? "目录" : "文件";
+  const name = window.prompt(`在 ${parentPath || "workspace root"} 新建${label}：`, kind === "dir" ? "new-folder" : "new-file.txt");
+  if (!name) return;
+  try {
+    const result = await requestJson("/api/project/entry", {
+      method: "POST",
+      body: JSON.stringify({ parent_path: parentPath, name, kind }),
+    });
+    ideSetOperationStatus(`${result.message}：${result.path}`, "success");
+    await loadProjectTree(projectTreeRoot?.relative_path || "");
+    selectedProjectPath = result.path;
+    selectedProjectKind = kind;
+    if (kind === "file") await openProjectFile(result.path);
+  } catch (error) {
+    ideSetOperationStatus(`新建失败：${error.message}`, "error");
+  }
+}
+
+async function renameSelectedProjectEntry() {
+  const path = selectedProjectPath;
+  if (!path) {
+    ideSetOperationStatus("请先选择要重命名的文件或目录。", "error");
+    return;
+  }
+  const tab = ideState.tabs.find((item) => item.kind === "view" && item.path === path);
+  if (tab?.dirty) {
+    if (!window.confirm("当前文件有未保存修改。先保存再重命名？")) return;
+    setIdeActiveTab(tab.id);
+    if (!(await saveActiveIdeFile())) return;
+  }
+  const newName = window.prompt("输入新名称：", ideBaseName(path));
+  if (!newName || newName === ideBaseName(path)) return;
+  try {
+    const result = await requestJson("/api/project/entry", {
+      method: "PATCH",
+      body: JSON.stringify({
+        path,
+        new_name: newName,
+        revision: tab?.payload?.revision || null,
+      }),
+    });
+    const oldPrefix = `${path}/`;
+    ideState.tabs.forEach((item) => {
+      if (item.path === path) item.path = result.path;
+      else if (item.path.startsWith(oldPrefix)) item.path = `${result.path}/${item.path.slice(oldPrefix.length)}`;
+      if (item.right === path) item.right = result.path;
+      else if (item.right?.startsWith(oldPrefix)) item.right = `${result.path}/${item.right.slice(oldPrefix.length)}`;
+      item.title = ideTabTitleOf(item);
+    });
+    selectedProjectPath = result.path;
+    persistIdeTabs();
+    renderIdeTabbar();
+    ideSetOperationStatus(`已重命名：${result.path}`, "success");
+    await loadProjectTree(projectTreeRoot?.relative_path || "");
+    if (selectedProjectKind === "file") await openProjectFile(result.path, { forceReload: true });
+  } catch (error) {
+    ideSetOperationStatus(`重命名失败：${error.message}`, "error");
+  }
+}
+
+async function deleteSelectedProjectEntry() {
+  const path = selectedProjectPath;
+  if (!path) {
+    ideSetOperationStatus("请先选择要删除的文件或目录。", "error");
+    return;
+  }
+  const affected = ideState.tabs.filter((item) => item.path === path || item.path.startsWith(`${path}/`));
+  if (affected.some((item) => item.dirty)) {
+    if (!window.confirm("删除会丢弃相关标签中的未保存修改，仍要继续吗？")) return;
+  }
+  const recursive = selectedProjectKind === "dir";
+  if (!window.confirm(`确定删除${recursive ? "目录及其全部内容" : "文件"}“${path}”？此操作不可撤销。`)) return;
+  const currentTab = ideState.tabs.find((item) => item.kind === "view" && item.path === path);
+  try {
+    await requestJson("/api/project/entry", {
+      method: "DELETE",
+      body: JSON.stringify({
+        path,
+        revision: currentTab?.payload?.revision || null,
+        recursive,
+        confirm: true,
+      }),
+    });
+    ideState.tabs = ideState.tabs.filter(
+      (item) => !(item.path === path || item.path.startsWith(`${path}/`) || item.right === path || item.right?.startsWith(`${path}/`)),
+    );
+    ideState.activeTabId = ideState.tabs[0]?.id || null;
+    selectedProjectPath = "";
+    selectedProjectKind = "";
+    persistIdeTabs();
+    renderIdeTabbar();
+    if (ideState.activeTabId) activateIdeTab(ideState.activeTabId);
+    else updateProjectPreview("从左侧目录树选择文件进行查看或编辑。", "View");
+    ideSetOperationStatus(`已删除：${path}`, "success");
+    await loadProjectTree(projectTreeRoot?.relative_path || "");
+  } catch (error) {
+    ideSetOperationStatus(`删除失败：${error.message}`, "error");
   }
 }
 
@@ -13182,7 +13686,8 @@ function renderIdeTabbar() {
         : tab.path;
     const label = document.createElement("span");
     label.className = "ide-tab-label";
-    label.textContent = tab.title;
+    label.textContent = `${tab.dirty ? "● " : ""}${tab.title}`;
+    el.classList.toggle("is-dirty", Boolean(tab.dirty));
     const close = document.createElement("span");
     close.className = "ide-tab-close";
     close.textContent = "×";
@@ -13225,6 +13730,7 @@ function setIdeActiveTab(id, { skipRender = false } = {}) {
   if (!skipRender) {
     renderIdeTabbar();
   }
+  updateIdeSaveButton();
 }
 
 function openIdeViewTab(path, { payload = null } = {}) {
@@ -13307,11 +13813,20 @@ function renderIdeTabContent(tab) {
     }
   } else {
     if (tab.payload && tab.payload.content != null) {
-      renderProjectContent(
-        tab.payload.content,
-        tab.payload.lang || syntaxLangForPath(tab.path),
-        tab.payload.meta || "",
-      );
+      if (tab.payload.editable) {
+        renderIdeEditableEditor(tab.payload.content, {
+          path: tab.path,
+          meta: tab.payload.meta || "",
+          encoding: tab.payload.encoding || "utf-8",
+          lineEnding: tab.payload.lineEnding || "lf",
+        });
+      } else {
+        renderProjectContent(
+          tab.payload.content,
+          tab.payload.lang || syntaxLangForPath(tab.path),
+          tab.payload.meta || "",
+        );
+      }
     } else {
       void openProjectFile(tab.path);
     }
@@ -13332,6 +13847,7 @@ function activateIdeTab(id) {
     selectedProjectPath = tab.path;
   } else {
     selectedProjectPath = tab.path;
+    selectedProjectKind = "file";
     syncProjectTreeSelection();
   }
   renderIdeTabContent(tab);
@@ -13340,6 +13856,9 @@ function activateIdeTab(id) {
 function closeIdeTab(id) {
   const idx = ideState.tabs.findIndex((tab) => tab.id === id);
   if (idx < 0) {
+    return;
+  }
+  if (ideState.tabs[idx].dirty && !window.confirm(`“${ideState.tabs[idx].title}”有未保存修改，确定关闭吗？`)) {
     return;
   }
   const wasActive = ideState.tabs[idx].id === ideState.activeTabId;
@@ -13359,6 +13878,7 @@ function closeIdeTab(id) {
         "Select a file from the project tree to preview content.",
         "View",
       );
+      updateIdeSaveButton();
     }
   } else {
     persistIdeTabs();
@@ -13383,6 +13903,7 @@ function restoreIdeTabsOnInit() {
     syncIdeDiffPathsUI();
   } else {
     selectedProjectPath = tab.path;
+    selectedProjectKind = "file";
     syncProjectTreeSelection();
   }
   renderIdeTabContent(tab);

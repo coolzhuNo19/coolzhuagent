@@ -2060,6 +2060,30 @@ button:disabled {
   white-space: nowrap;
   border-radius: 3px 3px 0 0;
 }
+.ide-tab.is-dirty .ide-tab-label {
+  color: var(--gold, #ffdd5b);
+}
+.ide-operation-status {
+  margin: 0;
+  padding: 3px 8px;
+  min-height: 20px;
+  color: rgba(224, 237, 247, 0.75);
+  font-size: 11px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.ide-operation-status.is-error {
+  color: #ff9a9a;
+}
+.ide-operation-status.is-success {
+  color: #8fd9a0;
+}
+.mini-button.is-danger {
+  color: #ffb3b3;
+}
+.mini-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 .ide-tab:hover {
   background: rgba(255, 255, 255, 0.05);
   color: rgba(255, 255, 255, 0.85);
@@ -3771,6 +3795,42 @@ body.ui-3d .window-icon.window-icon-logs {
 .ide-code-surface .line-code {
   white-space: pre;
   padding-left: 0;
+}
+.ide-editor.is-editable {
+  overflow: hidden;
+}
+.ide-editor.is-editable .ide-gutter {
+  overflow: hidden;
+  padding-bottom: 50vh;
+}
+.ide-edit-surface {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  min-height: 0;
+  resize: none;
+  overflow: auto;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 8px 12px;
+  border: 0;
+  outline: 0;
+  color: #eaf3fa;
+  background: rgba(6, 16, 24, 0.4);
+  font: inherit;
+  line-height: inherit;
+  white-space: pre;
+  tab-size: 4;
+}
+.project-tree-warning {
+  margin: 4px 8px;
+  padding: 5px 7px;
+  color: #ffcb7d;
+  font-size: 11px;
+  border: 1px solid rgba(255, 174, 77, 0.35);
+  border-radius: 4px;
+  background: rgba(114, 59, 14, 0.22);
 }
 .ide-truncate-notice {
   position: sticky;
