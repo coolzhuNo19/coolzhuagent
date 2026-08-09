@@ -108,11 +108,17 @@
               <aside class="project-command-rail">
                 <div class="ide-toolbar">
                   <button class="mini-button ide-mode-toggle" data-action="project-mode-toggle" type="button" title="切换 View / Diff"><img data-role="ide-mode-toggle-icon" src="./assets/icons-wuxia/diff.svg" alt="" /><span data-role="ide-mode-toggle-label">Diff</span></button>
+                  <button class="mini-button" data-action="project-save" type="button" title="保存当前文件 (Ctrl+S)" disabled>保存</button>
+                  <button class="mini-button" data-action="project-new-file" type="button" title="新建文件">+文件</button>
+                  <button class="mini-button" data-action="project-new-dir" type="button" title="新建目录">+目录</button>
+                  <button class="mini-button" data-action="project-rename" type="button" title="重命名当前文件或目录">重命名</button>
+                  <button class="mini-button is-danger" data-action="project-delete" type="button" title="删除当前文件或目录">删除</button>
                   <button class="mini-button" data-action="project-refresh" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" />刷新</button>
                   <button class="mini-button" data-action="project-symbol-index" type="button" title="增量构建符号索引"><img src="./assets/icons-wuxia/search.svg" alt="" />索引</button>
                   <input class="ide-omni-search" data-role="ide-omni-search" type="search" placeholder="搜文件 @函数 :行号" spellcheck="false" autocomplete="off" />
                 </div>
                 <p class="ide-index-status" data-role="project-symbol-index-status">符号索引尚未手动刷新。</p>
+                <p class="ide-operation-status" data-role="ide-operation-status" aria-live="polite">编辑器已就绪。</p>
                 <div class="ide-diff-paths" data-role="ide-diff-paths" hidden>
                   <span class="ide-diff-left-label" data-role="ide-diff-left-label">—</span>
                   <input class="ide-diff-right" data-role="ide-diff-right" placeholder="右侧文件路径，回车对比" spellcheck="false" autocomplete="off" />
@@ -598,6 +604,7 @@
                     <button class="link-button" data-action="chat-room-new" type="button">新建</button>
                     <button class="link-button" data-action="chat-room-rename" type="button">重命名</button>
                     <button class="link-button" data-action="chat-room-delete" type="button">删除</button>
+                    <button class="link-button" data-action="chat-room-diagnostics" type="button">诊断设置</button>
                     <button class="link-button" data-action="chat-handoff-toggle" type="button">任务链</button>
                     <button class="link-button" data-action="chat-handoff-manual" type="button">转交</button>
                     <button class="link-button" data-action="message-load-older" type="button">更早</button>
@@ -989,7 +996,10 @@
                       <strong>模块自检</strong>
                       <span>使用真实 health endpoint</span>
                     </div>
-                    <button class="mini-button" data-action="diagnostics-window-refresh" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" />刷新</button>
+                    <div class="button-row">
+                      <button class="mini-button" data-action="diagnostics-window-refresh" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" />刷新</button>
+                      <button class="mini-button" data-action="diagnostics-functional" type="button">常用功能自检</button>
+                    </div>
                   </header>
                   <article class="logs-window-health-card is-unknown">
                     <strong data-role="logs-window-health-status">等待刷新</strong>
@@ -1011,6 +1021,10 @@
                     <div data-role="logs-window-suggestions">
                       <p>暂无修复建议。</p>
                     </div>
+                  </section>
+                  <section class="module-selfcheck-functional" aria-label="常用功能自检结果">
+                    <header><strong>常用功能自检</strong><span data-role="functional-selfcheck-status">未运行</span></header>
+                    <pre data-role="functional-selfcheck-output">点击“常用功能自检”执行只读本地检查。</pre>
                   </section>
                   <section class="logs-window-self-update module-selfcheck-plan" aria-label="Self update plan">
                     <header><strong>Self update</strong><span data-role="self-update-status">not loaded</span></header>

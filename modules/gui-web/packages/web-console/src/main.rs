@@ -538,7 +538,7 @@ fn current_showui_pid() -> Option<u32> {
         .and_then(|process| process.as_ref().map(std::process::Child::id))
 }
 
-/// 桌宠退出是否联动关闭 web-console（配置，默认 true）。
+/// 桌宠退出是否联动关闭 web-console（进程联动风险项，默认 false）。
 fn pet_exit_closes_console_enabled() -> bool {
     read_config(|config| config.pet.pet_exit_closes_console)
 }
@@ -603,7 +603,16 @@ fn app() -> Router {
         .route("/api/workspace/reload", post(api_workspace_reload))
         .route("/api/project/tree", get(api_project_tree))
         .route("/api/project/file/meta", get(api_project_file_meta))
-        .route("/api/project/file", get(api_project_file))
+        .route(
+            "/api/project/file",
+            get(api_project_file).put(api_project_file_write),
+        )
+        .route(
+            "/api/project/entry",
+            post(api_project_entry_create)
+                .patch(api_project_entry_rename)
+                .delete(api_project_entry_delete),
+        )
         .route("/api/project/diff", get(api_project_diff))
         .route("/api/project/diff-files", get(api_project_diff_files))
         .route("/api/project/symbol-index", post(api_project_symbol_index))
@@ -681,6 +690,10 @@ fn app() -> Router {
         .route(
             "/api/chat/rooms/{room_id}/permissions",
             get(api_chat_room_permission).patch(api_update_chat_room_permission),
+        )
+        .route(
+            "/api/chat/rooms/{room_id}/diagnostics",
+            get(api_chat_room_diagnostics).patch(api_update_chat_room_diagnostics),
         )
         .route(
             "/api/chat/rooms/{room_id}/roster",
@@ -880,6 +893,8 @@ fn app() -> Router {
             get(api_agent_diagnostics),
         )
         .route("/api/diagnostics/health", get(api_diagnostics_health))
+        .route("/api/diagnostics/functional", get(api_diagnostics_functional))
+        .route("/api/diagnostics/stream", get(api_diagnostics_stream))
         .route("/api/pet/state", get(api_pet_state))
         .route("/api/pet/event", post(api_pet_event))
         .route("/api/pet/events", get(api_pet_events))
@@ -4085,6 +4100,39 @@ struct ChatRoomPermissionStatus {
     updated_at: Option<u64>,
 }
 
+/// 聊天室范围的诊断偏好。诊断只读，不会放宽工具或 full-access 权限。
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ChatRoomDiagnosticsUpdateRequest {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    auto_refresh: Option<bool>,
+    #[serde(default)]
+    show_stream_interrupts: Option<bool>,
+    #[serde(default)]
+    show_details: Option<bool>,
+    #[serde(default)]
+    real_llm_enabled: Option<bool>,
+    #[serde(default)]
+    llm_tools_enabled: Option<bool>,
+    #[serde(default)]
+    computer_use_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChatRoomDiagnosticsStatus {
+    room_id: String,
+    room_name: String,
+    enabled: bool,
+    auto_refresh: bool,
+    show_stream_interrupts: bool,
+    show_details: bool,
+    real_llm_enabled: bool,
+    llm_tools_enabled: bool,
+    computer_use_enabled: bool,
+    updated_at: Option<u64>,
+}
+
 fn validate_chat_room_permission_update(
     payload: &ChatRoomPermissionUpdateRequest,
 ) -> ApiResult<String> {
@@ -4681,9 +4729,9 @@ struct ConfigComputerUseDesktop {
 struct ConfigComputerUseBrowser {
     #[serde(default = "default_true")]
     enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     allow_drag: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     allow_key_combinations: bool,
     #[serde(default = "default_true")]
     allow_multiple_tabs: bool,
@@ -4781,9 +4829,9 @@ struct ConfigAudioVoice {
 struct ConfigAudioRealtime {
     #[serde(default = "default_audio_realtime_mode")]
     mode: String,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     auto_send_transcript: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     auto_tts_reply: bool,
     #[serde(default)]
     stt_transport: String,
@@ -4897,7 +4945,7 @@ struct ConfigVisionRouter {
     pipeline: Vec<String>,
     #[serde(default = "default_router_min_confidence")]
     min_confidence: f32,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     cross_verify: bool,
     #[serde(default = "default_cross_verify_tolerance")]
     cross_verify_tolerance_px: u32,
@@ -4937,7 +4985,7 @@ impl Default for ConfigVisionRouter {
         Self {
             pipeline: default_router_pipeline(),
             min_confidence: default_router_min_confidence(),
-            cross_verify: false,
+            cross_verify: true,
             cross_verify_tolerance_px: default_cross_verify_tolerance(),
             timeout_ms: default_router_timeout_ms(),
             uia: UiaRouterConfig::default(),
@@ -5133,9 +5181,9 @@ fn default_remote_max_tokens() -> u32 {
 struct ConfigModel {
     #[serde(default)]
     reasoning: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     enable_real_llm: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     enable_llm_tools: bool,
     /// REQ-TOOL-007 Phase C-10：LLM 可见工具暴露策略。
     ///
@@ -5146,8 +5194,8 @@ struct ConfigModel {
     /// 未设置时默认 `"whitelist"`；开发开放模式下会强制全量暴露。
     #[serde(default)]
     llm_tool_exposure: Option<String>,
-    /// P1.5：启用真实语义记忆召回（/v1/embeddings）。默认关 → 维持 keyword + hash 回退。
-    #[serde(default)]
+    /// P1.5：启用真实语义记忆召回（/v1/embeddings）。默认开启；缺少端点或凭据时明确降级。
+    #[serde(default = "default_true")]
     enable_semantic_memory: bool,
     /// 语义记忆嵌入模型名（默认 bge-m3）；base_url/api_key 复用 custom provider/env。
     #[serde(default)]
@@ -5155,8 +5203,8 @@ struct ConfigModel {
     /// 语义嵌入端点 base_url（默认本地 llama.cpp `--embeddings` 端口 `http://127.0.0.1:8081/v1`）。
     #[serde(default)]
     semantic_embedder_base_url: Option<String>,
-    /// B 衰减：召回按 effective_recall_score 重排（默认关 → 现序不变）。
-    #[serde(default)]
+    /// B 衰减：召回按 effective_recall_score 重排（默认开启）。
+    #[serde(default = "default_true")]
     enable_memory_decay_ordering: bool,
     /// 本地文本推理使用的 GGUF 模型文件；只从 workspace config 读取。
     #[serde(default)]
@@ -5488,8 +5536,8 @@ impl Default for ConfigAudioRealtime {
     fn default() -> Self {
         Self {
             mode: default_audio_realtime_mode(),
-            auto_send_transcript: false,
-            auto_tts_reply: false,
+            auto_send_transcript: true,
+            auto_tts_reply: true,
             stt_transport: String::new(),
             stt_provider: String::new(),
             stt_websocket_url: None,
@@ -5527,13 +5575,13 @@ impl Default for ConfigModel {
     fn default() -> Self {
         Self {
             reasoning: None,
-            enable_real_llm: false,
-            enable_llm_tools: false,
+            enable_real_llm: true,
+            enable_llm_tools: true,
             llm_tool_exposure: None,
-            enable_semantic_memory: false,
+            enable_semantic_memory: true,
             semantic_memory_model: None,
             semantic_embedder_base_url: None,
-            enable_memory_decay_ordering: false,
+            enable_memory_decay_ordering: true,
             local_chat_model_path: None,
             local_chat_mmproj_path: None,
             local_chat_port: default_local_chat_port(),
@@ -5865,7 +5913,7 @@ fn load_workspace_config_at(workspace: &Path) -> WorkspaceConfig {
     }
     if let Ok(content) = toml::to_string_pretty(&config) {
         let _ = std::fs::write(&path, content);
-        diag!("[CONFIG] load: wrote default config with enable_real_llm=false");
+        diag!("[CONFIG] load: wrote capability-enabled defaults; credentials remain unset");
     }
     config
 }
@@ -6036,7 +6084,7 @@ const MAX_PROJECT_TREE_LIMIT: usize = 2_000;
 const DEFAULT_PROJECT_FILE_LIMIT: usize = 64 * 1024;
 const MAX_PROJECT_FILE_READ_BYTES: usize = 256 * 1024;
 const MAX_PROJECT_FILE_PREVIEW_BYTES: u64 = 1024 * 1024;
-const PROJECT_BINARY_SNIFF_BYTES: usize = 8 * 1024;
+const MAX_PROJECT_FILE_EDIT_BYTES: usize = 256 * 1024;
 const MAX_PROJECT_DIFF_BYTES: usize = 256 * 1024;
 const PROJECT_DIFF_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -6060,10 +6108,12 @@ async fn api_project_tree(
         .unwrap_or(DEFAULT_PROJECT_TREE_LIMIT)
         .min(MAX_PROJECT_TREE_LIMIT)
         .max(1);
-    let tree = project_tree_node(&root, &target, depth, &mut remaining)?;
+    let mut warnings = Vec::new();
+    let tree = project_tree_node(&root, &target, depth, &mut remaining, &mut warnings)?;
     Ok(Json(ProjectTreeResponse {
         workspace: display_path(&root),
         root: tree,
+        warnings,
     }))
 }
 
@@ -6093,7 +6143,8 @@ async fn api_project_file(
     if let (Some(start_line), Some(end_line)) = (query.start_line, query.end_line) {
         let bytes = std::fs::read(&path)
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
-        let text = std::str::from_utf8(&bytes)
+        let text_bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+        let text = std::str::from_utf8(text_bytes)
             .map_err(|_| api_error(StatusCode::BAD_REQUEST, "project file is not valid UTF-8"))?;
         let total_lines = text.lines().count().max(1) as u64;
         let start = start_line.max(1).min(total_lines as usize);
@@ -6126,7 +6177,8 @@ async fn api_project_file(
         .max(1);
     let bytes = std::fs::read(&path)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
-    let start = offset.min(bytes.len() as u64) as usize;
+    let bom_offset = usize::from(offset == 0 && bytes.starts_with(&[0xEF, 0xBB, 0xBF])) * 3;
+    let start = (offset.min(bytes.len() as u64) as usize).max(bom_offset);
     let end = start.saturating_add(limit).min(bytes.len());
     let content = std::str::from_utf8(&bytes[start..end])
         .map_err(|_| {
@@ -6147,6 +6199,203 @@ async fn api_project_file(
         start_line: None,
         end_line: None,
         total_lines: None,
+    }))
+}
+
+async fn api_project_file_write(
+    Json(request): Json<ProjectFileWriteRequest>,
+) -> ApiResult<Json<ProjectMutationResponse>> {
+    let root = active_workspace_path();
+    let path = resolve_project_mutation_existing_path(&root, &request.path)?;
+    let meta = project_file_meta(&root, &path)?;
+    if !meta.editable {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "project file is binary, read-only, or too large to edit",
+        ));
+    }
+    if request.revision.trim().is_empty() || request.revision != meta.revision {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "文件已被外部修改；请重新加载后再保存",
+        ));
+    }
+
+    let mut normalized = normalize_project_text_line_endings(&request.content, &meta.line_ending);
+    if meta.has_utf8_bom {
+        let mut with_bom = Vec::with_capacity(normalized.len() + 3);
+        with_bom.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        with_bom.append(&mut normalized);
+        normalized = with_bom;
+    }
+    if normalized.len() > MAX_PROJECT_FILE_EDIT_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "edited file exceeds the 256 KiB IDE save limit",
+        ));
+    }
+    atomic_replace_project_file(&path, &normalized)?;
+    let updated = project_file_meta(&root, &path)?;
+    Ok(Json(ProjectMutationResponse {
+        operation: "save".to_string(),
+        path: updated.relative_path.clone(),
+        revision: Some(updated.revision),
+        message: "文件已保存".to_string(),
+    }))
+}
+
+async fn api_project_entry_create(
+    Json(request): Json<ProjectEntryCreateRequest>,
+) -> ApiResult<Json<ProjectMutationResponse>> {
+    validate_project_entry_name(&request.name)?;
+    let root = active_workspace_path();
+    let parent = resolve_project_mutation_existing_path(&root, &request.parent_path)?;
+    if !parent.is_dir() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "parent_path must be a directory",
+        ));
+    }
+    let target = parent.join(&request.name);
+    if std::fs::symlink_metadata(&target).is_ok() {
+        return Err(api_error(StatusCode::CONFLICT, "同名文件或目录已存在"));
+    }
+    match request.kind.trim() {
+        "file" => {
+            let content = request.content.unwrap_or_default();
+            if content.len() > MAX_PROJECT_FILE_EDIT_BYTES {
+                return Err(api_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "new file exceeds 256 KiB",
+                ));
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map_err(io_api_error)?;
+            std::io::Write::write_all(&mut file, content.as_bytes()).map_err(io_api_error)?;
+            file.sync_all().map_err(io_api_error)?;
+        }
+        "dir" => std::fs::create_dir(&target).map_err(io_api_error)?,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "kind must be file or dir",
+            ))
+        }
+    }
+    let relative = relative_project_path(&root.canonicalize().map_err(io_api_error)?, &target);
+    let revision = if target.is_file() {
+        Some(project_file_revision(
+            &std::fs::read(&target).map_err(io_api_error)?,
+        ))
+    } else {
+        None
+    };
+    Ok(Json(ProjectMutationResponse {
+        operation: "create".to_string(),
+        path: relative,
+        revision,
+        message: "已创建".to_string(),
+    }))
+}
+
+async fn api_project_entry_rename(
+    Json(request): Json<ProjectEntryRenameRequest>,
+) -> ApiResult<Json<ProjectMutationResponse>> {
+    validate_project_entry_name(&request.new_name)?;
+    let root = active_workspace_path();
+    let source = resolve_project_mutation_existing_path(&root, &request.path)?;
+    let base = root.canonicalize().map_err(io_api_error)?;
+    if source == base {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "cannot rename workspace root",
+        ));
+    }
+    if let Some(expected) = request
+        .revision
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        if source.is_file() {
+            let actual = project_file_revision(&std::fs::read(&source).map_err(io_api_error)?);
+            if expected != actual {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    "文件已被外部修改；请重新加载",
+                ));
+            }
+        }
+    }
+    let target = source
+        .parent()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "project entry has no parent"))?
+        .join(&request.new_name);
+    if std::fs::symlink_metadata(&target).is_ok() {
+        return Err(api_error(StatusCode::CONFLICT, "同名文件或目录已存在"));
+    }
+    std::fs::rename(&source, &target).map_err(io_api_error)?;
+    Ok(Json(ProjectMutationResponse {
+        operation: "rename".to_string(),
+        path: relative_project_path(&base, &target),
+        revision: target
+            .is_file()
+            .then(|| std::fs::read(&target).ok())
+            .flatten()
+            .map(|bytes| project_file_revision(&bytes)),
+        message: "已重命名".to_string(),
+    }))
+}
+
+async fn api_project_entry_delete(
+    Json(request): Json<ProjectEntryDeleteRequest>,
+) -> ApiResult<Json<ProjectMutationResponse>> {
+    if !request.confirm {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "delete requires confirm=true",
+        ));
+    }
+    let root = active_workspace_path();
+    let target = resolve_project_mutation_existing_path(&root, &request.path)?;
+    let base = root.canonicalize().map_err(io_api_error)?;
+    if target == base {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "cannot delete workspace root",
+        ));
+    }
+    if let Some(expected) = request
+        .revision
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        if target.is_file() {
+            let actual = project_file_revision(&std::fs::read(&target).map_err(io_api_error)?);
+            if expected != actual {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    "文件已被外部修改；请重新加载",
+                ));
+            }
+        }
+    }
+    if target.is_dir() {
+        if request.recursive {
+            std::fs::remove_dir_all(&target).map_err(io_api_error)?;
+        } else {
+            std::fs::remove_dir(&target).map_err(io_api_error)?;
+        }
+    } else {
+        std::fs::remove_file(&target).map_err(io_api_error)?;
+    }
+    Ok(Json(ProjectMutationResponse {
+        operation: "delete".to_string(),
+        path: request.path.replace('\\', "/"),
+        revision: None,
+        message: "已删除".to_string(),
     }))
 }
 
@@ -7989,6 +8238,68 @@ fn resolve_project_existing_path(root: &Path, input: Option<&str>) -> ApiResult<
     Ok(canonical)
 }
 
+fn resolve_project_mutation_existing_path(root: &Path, input: &str) -> ApiResult<PathBuf> {
+    let base = root.canonicalize().map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "current workspace is not accessible",
+        )
+    })?;
+    let trimmed = input.trim();
+    validate_project_query_path(trimmed)?;
+    let candidate = if trimmed.is_empty() {
+        base.clone()
+    } else {
+        base.join(trimmed)
+    };
+    reject_project_reparse_components(&base, &candidate)?;
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "project path does not exist"))?;
+    if !canonical.starts_with(&base) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "project path escapes the current workspace",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn reject_project_reparse_components(base: &Path, candidate: &Path) -> ApiResult<()> {
+    let relative = candidate.strip_prefix(base).map_err(|_| {
+        api_error(
+            StatusCode::FORBIDDEN,
+            "project path escapes the current workspace",
+        )
+    })?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if project_metadata_is_reparse_point(&metadata) {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "IDE mutation refuses symlink or reparse-point paths",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn project_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn project_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
 fn validate_project_query_path(path: &str) -> ApiResult<()> {
     if Path::new(path).components().any(|component| {
         matches!(
@@ -8017,9 +8328,16 @@ fn project_tree_node(
     path: &Path,
     depth: usize,
     remaining: &mut usize,
+    warnings: &mut Vec<String>,
 ) -> ApiResult<ProjectTreeNode> {
-    let metadata = std::fs::metadata(path)
+    let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+    if project_metadata_is_reparse_point(&metadata) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "project tree refuses symlink or reparse-point entries",
+        ));
+    }
     let kind = if metadata.is_dir() { "dir" } else { "file" }.to_string();
     let mut node = ProjectTreeNode {
         name: path
@@ -8039,10 +8357,21 @@ fn project_tree_node(
         return Ok(node);
     }
 
-    let mut entries = std::fs::read_dir(path)
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(path)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?
-        .flatten()
-        .collect::<Vec<_>>();
+    {
+        match entry {
+            Ok(entry) => entries.push(entry),
+            Err(error) => {
+                node.omitted_count += 1;
+                warnings.push(format!(
+                    "{}: directory entry omitted: {error}",
+                    display_path(path)
+                ));
+            }
+        }
+    }
     entries.sort_by(|left, right| {
         let left_dir = left.file_type().map(|ty| ty.is_dir()).unwrap_or(false);
         let right_dir = right.file_type().map(|ty| ty.is_dir()).unwrap_or(false);
@@ -8056,15 +8385,40 @@ fn project_tree_node(
             node.omitted_count += 1;
             continue;
         }
-        *remaining -= 1;
-        node.children.push(project_tree_node(
+        project_tree_append_child(
             root,
             &entry.path(),
             depth - 1,
             remaining,
-        )?);
+            &mut node,
+            warnings,
+        );
     }
     Ok(node)
+}
+
+fn project_tree_append_child(
+    root: &Path,
+    child_path: &Path,
+    depth: usize,
+    remaining: &mut usize,
+    node: &mut ProjectTreeNode,
+    warnings: &mut Vec<String>,
+) {
+    match project_tree_node(root, child_path, depth, remaining, warnings) {
+        Ok(child) => {
+            *remaining = (*remaining).saturating_sub(1);
+            node.children.push(child);
+        }
+        Err((_, Json(error))) => {
+            node.omitted_count += 1;
+            warnings.push(format!(
+                "{}: omitted: {}",
+                display_path(child_path),
+                error.error
+            ));
+        }
+    }
 }
 
 fn relative_project_path(root: &Path, path: &Path) -> String {
@@ -8083,8 +8437,16 @@ fn project_file_meta(root: &Path, path: &Path) -> ApiResult<ProjectFileMetaRespo
             "project path must be a file",
         ));
     }
-    let binary = is_binary_file(path)?;
+    let bytes = std::fs::read(path)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+    let binary = is_binary_bytes(&bytes);
     let previewable = !binary && metadata.len() <= MAX_PROJECT_FILE_PREVIEW_BYTES;
+    let editable = previewable
+        && bytes.len() <= MAX_PROJECT_FILE_EDIT_BYTES
+        && !metadata.permissions().readonly();
+    let has_utf8_bom = bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
+    let text_bytes = if has_utf8_bom { &bytes[3..] } else { &bytes };
+    let line_ending = project_line_ending(text_bytes);
     Ok(ProjectFileMetaResponse {
         name: path
             .file_name()
@@ -8097,16 +8459,150 @@ fn project_file_meta(root: &Path, path: &Path) -> ApiResult<ProjectFileMetaRespo
         modified: metadata.modified().ok().and_then(system_time_millis),
         binary,
         previewable,
+        editable,
         max_preview_bytes: MAX_PROJECT_FILE_PREVIEW_BYTES,
+        max_edit_bytes: MAX_PROJECT_FILE_EDIT_BYTES,
+        revision: project_file_revision(&bytes),
+        encoding: if has_utf8_bom { "utf-8-bom" } else { "utf-8" }.to_string(),
+        line_ending,
+        has_utf8_bom,
     })
 }
 
-fn is_binary_file(path: &Path) -> ApiResult<bool> {
-    let bytes = std::fs::read(path)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
-    let sample_len = bytes.len().min(PROJECT_BINARY_SNIFF_BYTES);
-    let sample = &bytes[..sample_len];
-    Ok(sample.contains(&0) || std::str::from_utf8(sample).is_err())
+fn is_binary_bytes(bytes: &[u8]) -> bool {
+    let text_bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    bytes.contains(&0) || std::str::from_utf8(text_bytes).is_err()
+}
+
+fn project_line_ending(bytes: &[u8]) -> String {
+    let crlf = bytes.windows(2).filter(|pair| *pair == b"\r\n").count();
+    let lf = bytes.iter().filter(|byte| **byte == b'\n').count();
+    if crlf > 0 && crlf.saturating_mul(2) >= lf.max(1) {
+        "crlf".to_string()
+    } else {
+        "lf".to_string()
+    }
+}
+
+fn project_file_revision(bytes: &[u8]) -> String {
+    format!("{:016x}-{}", hash_bytes(bytes), bytes.len())
+}
+
+fn normalize_project_text_line_endings(content: &str, line_ending: &str) -> Vec<u8> {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    if line_ending.eq_ignore_ascii_case("crlf") {
+        normalized.replace('\n', "\r\n").into_bytes()
+    } else {
+        normalized.into_bytes()
+    }
+}
+
+fn validate_project_entry_name(name: &str) -> ApiResult<()> {
+    let trimmed = name.trim();
+    let mut components = Path::new(trimmed).components();
+    if trimmed.is_empty()
+        || !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
+        || trimmed.chars().all(|ch| ch == '.')
+        || trimmed.ends_with('.')
+        || trimmed.ends_with(' ')
+        || trimmed
+            .chars()
+            .any(|ch| ch == '\0' || "<>:\"/\\|?*".contains(ch))
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid project entry name",
+        ));
+    }
+    let stem = trimmed
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    ) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "reserved Windows entry name",
+        ));
+    }
+    Ok(())
+}
+
+fn atomic_replace_project_file(path: &Path, bytes: &[u8]) -> ApiResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "project file has no parent"))?;
+    let permissions = std::fs::metadata(path).map_err(io_api_error)?.permissions();
+    let mut temp_path = None;
+    let mut temp_file = None;
+    for attempt in 0..32_u32 {
+        let candidate = parent.join(format!(
+            ".coolzhu-ide-{}-{}-{attempt}.tmp",
+            std::process::id(),
+            unix_timestamp_millis()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temp_path = Some(candidate);
+                temp_file = Some(file);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(io_api_error(error)),
+        }
+    }
+    let temp_path = temp_path.ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot allocate atomic save temp file",
+        )
+    })?;
+    let mut file = temp_file.expect("temp file accompanies temp path");
+    let result = (|| -> std::io::Result<()> {
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+        std::fs::set_permissions(&temp_path, permissions)?;
+        drop(file);
+        replace_project_file(&temp_path, path)
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(io_api_error(error));
+    }
+    Ok(())
+}
+
+fn replace_project_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13120,6 +13616,47 @@ async fn api_update_chat_room_permission(
     Ok(Json(status))
 }
 
+fn chat_room_diagnostics_status(
+    room_id: &str,
+    room_name: String,
+) -> ApiResult<ChatRoomDiagnosticsStatus> {
+    let (enabled, auto_refresh, show_stream_interrupts, show_details, updated_at) =
+        chat_room_diagnostics_record_sqlite(&default_session_sqlite_path(), room_id)
+            .map_err(sqlite_api_error)?;
+    let (real_llm_enabled, llm_tools_enabled, computer_use_enabled) =
+        chat_room_capabilities_sqlite(&default_session_sqlite_path(), room_id)
+            .map_err(sqlite_api_error)?;
+    Ok(ChatRoomDiagnosticsStatus {
+        room_id: room_id.to_string(),
+        room_name,
+        enabled,
+        auto_refresh,
+        show_stream_interrupts,
+        show_details,
+        real_llm_enabled,
+        llm_tools_enabled,
+        computer_use_enabled,
+        updated_at,
+    })
+}
+
+async fn api_chat_room_diagnostics(
+    AxumPath(room_id): AxumPath<String>,
+) -> ApiResult<Json<ChatRoomDiagnosticsStatus>> {
+    let room_name = chat_room_name_for_permission(&room_id)?;
+    chat_room_diagnostics_status(&room_id, room_name).map(Json)
+}
+
+async fn api_update_chat_room_diagnostics(
+    AxumPath(room_id): AxumPath<String>,
+    Json(payload): Json<ChatRoomDiagnosticsUpdateRequest>,
+) -> ApiResult<Json<ChatRoomDiagnosticsStatus>> {
+    let room_name = chat_room_name_for_permission(&room_id)?;
+    set_chat_room_diagnostics_sqlite(&default_session_sqlite_path(), &room_id, &payload)
+        .map_err(sqlite_api_error)?;
+    chat_room_diagnostics_status(&room_id, room_name).map(Json)
+}
+
 async fn api_create_chat_room(
     Json(payload): Json<CreateChatRoomRequest>,
 ) -> ApiResult<Json<ChatRoomMutationResponse>> {
@@ -13158,6 +13695,8 @@ async fn api_delete_chat_room(
         .lock()
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
     let report = store.delete_chat_room(&room_id)?;
+    delete_chat_room_diagnostics_sqlite(&default_session_sqlite_path(), &room_id)
+        .map_err(sqlite_api_error)?;
     Ok(Json(ChatRoomDeleteResponse {
         report,
         rooms: store.chat_room_list_response(),
@@ -14810,7 +15349,12 @@ async fn api_chat_send_stream(
 
             let mut used_real_model = false;
             let mut diagnostic_note = None;
-            let use_real_llm = real_llm_enabled();
+            let room_caps = chat_room_capabilities_sqlite(
+                &default_session_sqlite_path(),
+                &result.chat_room_id,
+            )
+            .unwrap_or((true, true, true));
+            let use_real_llm = real_llm_enabled() && room_caps.0;
             let mut assistant_started = false;
             let mut tool_result_summaries: Vec<String> = Vec::new();
             let mut context_footer: Option<String> = None;
@@ -15046,7 +15590,7 @@ async fn api_chat_send_stream(
             // REQ-LLM-003 / Phase C-13: tool result feedback loop（流"ToolResult 版）
             diag!(
                 "[TOOL-LOOP-STREAM] gate: llm_tools_enabled={} tool_calls={} names=[{}] dispatched_already={}",
-                llm_tools_enabled(),
+                llm_tools_enabled() && room_caps.1,
                 model_tool_calls.len(),
                 model_tool_calls
                     .values()
@@ -15055,7 +15599,7 @@ async fn api_chat_send_stream(
                     .join(","),
                 streamed_tool_calls_dispatched
             );
-            if llm_tools_enabled() && !model_tool_calls.is_empty() {
+            if llm_tools_enabled() && room_caps.1 && !model_tool_calls.is_empty() {
                 diag!(
                     "[TOOL-LOOP-STREAM] {} tool calls, round 2 (ToolResult blocks)...",
                     model_tool_calls.len()
@@ -15650,6 +16194,145 @@ async fn api_agent_diagnostics(
 
 async fn api_diagnostics_health() -> Json<DiagnosticsHealthResponse> {
     Json(build_diagnostics_health().await)
+}
+
+/// 只读常用功能自检：验证本地链路与配置，不调用真实模型、麦克风或桌面输入。
+async fn api_diagnostics_functional() -> Json<FunctionalDiagnosticsResponse> {
+    let workspace = active_workspace_path();
+    let config = load_workspace_config_at(&workspace);
+    let mut checks = Vec::new();
+    let mut add = |id: &str, label: &str, status: &str, detail: String, fix_hint: Option<&str>| {
+        checks.push(DiagnosticsCheck {
+            id: id.to_string(),
+            label: label.to_string(),
+            status: status.to_string(),
+            detail,
+            fix_hint: fix_hint.map(str::to_string),
+        });
+    };
+
+    let model_capabilities_ok = config.model.enable_real_llm
+        && config.model.enable_llm_tools
+        && config.computer_use.enabled;
+    let provider_credential_ready = default_agent_sessions().iter().any(|agent| {
+        agent.api_key_status.contains("present") || agent.api_key_status.contains("optional")
+    });
+    let config_status = if !model_capabilities_ok {
+        "warn"
+    } else if config.model.enable_real_llm && !provider_credential_ready {
+        "warn"
+    } else {
+        "ok"
+    };
+    let config_detail = format!(
+        "real_llm={} llm_tools={} semantic_memory={} computer_use={}；凭据={}（聊天室能力可单独收紧）",
+        config.model.enable_real_llm,
+        config.model.enable_llm_tools,
+        config.model.enable_semantic_memory,
+        config.computer_use.enabled,
+        if provider_credential_ready { "已发现" } else { "未配置，需在会话/provider 中配置" },
+    );
+    add(
+        "functional.config",
+        "默认能力配置",
+        config_status,
+        config_detail,
+        Some("开启 [model] enable_real_llm/enable_llm_tools 与 [computer_use] enabled；凭据请在会话/provider 配置"),
+    );
+    let workspace_status = if workspace.is_dir() { "ok" } else { "error" };
+    add(
+        "functional.workspace",
+        "工作区读写边界",
+        workspace_status,
+        format!("workspace={}", display_path(&workspace)),
+        Some("请在设置中选择有效工作区"),
+    );
+    let session_db = default_session_sqlite_path();
+    let session_status = if session_db.exists() { "ok" } else { "warn" };
+    add(
+        "functional.session-store",
+        "会话存储",
+        session_status,
+        format!("sqlite={}（首次使用会自动创建）", session_db.display()),
+        None,
+    );
+    let room_count = session_store()
+        .lock()
+        .ok()
+        .map(|store| store.state.chat_rooms.len())
+        .unwrap_or(0);
+    add(
+        "functional.chat-room",
+        "聊天室寻址",
+        if room_count > 0 { "ok" } else { "warn" },
+        format!("已配置 {} 个聊天室；诊断设置按 room_id 隔离", room_count),
+        Some("请新建或选择聊天室"),
+    );
+    let catalog = build_tools_catalog();
+    add(
+        "functional.tools",
+        "工具目录",
+        if catalog.summary.items > 0 { "ok" } else { "warn" },
+        format!("{} 类 / {} 项，当前可执行 {} 项", catalog.summary.categories, catalog.summary.items, catalog.summary.executable_now),
+        None,
+    );
+    let active_room_id = session_store()
+        .lock()
+        .ok()
+        .and_then(|store| store.active_chat_room_id());
+    if let Some(room_id) = active_room_id.as_deref() {
+        if let Ok((room_real_llm, room_tools, room_computer_use)) =
+            chat_room_capabilities_sqlite(&default_session_sqlite_path(), room_id)
+        {
+            add(
+                "functional.chat-room-capabilities",
+                "聊天室有效能力",
+                "ok",
+                format!("room={} real_llm={} llm_tools={} computer_use={}；权限档位仍由 /permissions 审批", room_id, room_real_llm, room_tools, room_computer_use),
+                None,
+            );
+        }
+    }
+    add(
+        "functional.stream-guard",
+        "流式中断看护",
+        "warn",
+        "前端 AbortController + SSE error 事件 + 后端 diagnostic_note 契约可用；本次自检未注入真实网络中断，需人工点击停止复核".to_string(),
+        Some("运行流式自检并在发送中点击停止，确认原因可见且不递归重试"),
+    );
+    let browser_health = browser_bridge::health();
+    let browser_status = if browser_health.connected { "ok" } else { "error" };
+    add(
+        "functional.browser",
+        "浏览器桥接",
+        browser_status,
+        format!("connected={} setup_required={} nonce_file={}；真实网页操作仍需聊天室授权/用户审批", browser_health.connected, browser_health.setup_required, browser_health.nonce_file),
+        Some("安装并连接浏览器扩展/native host，或在聊天室诊断设置中保持 computer-use 关闭"),
+    );
+    let summary = DiagnosticsSummary {
+        status: aggregate_health_status(&checks),
+        ok: checks.iter().filter(|item| item.status == "ok").count(),
+        warn: checks.iter().filter(|item| item.status == "warn").count(),
+        error: checks.iter().filter(|item| item.status == "error").count(),
+    };
+    Json(FunctionalDiagnosticsResponse {
+        generated_at: unix_timestamp_millis(),
+        summary,
+        checks,
+        note: "自检是只读、可重复、无外部副作用的本地检查；模型/STT/TTS/桌面输入需单独人工验收。".to_string(),
+    })
+}
+
+/// 流式中断自检不发起模型请求，只核验取消/可见原因/递归看护契约。
+async fn api_diagnostics_stream() -> Json<StreamDiagnosticsResponse> {
+    Json(StreamDiagnosticsResponse {
+        generated_at: unix_timestamp_millis(),
+        status: "ok".to_string(),
+        cancellation_supported: true,
+        abort_reason_visible: true,
+        recursion_guarded: true,
+        note: "AbortController 与 SSE reader 均可取消；用户停止、网络中断和缺失 done 事件会显示原因，异常不会自动递归重试。".to_string(),
+    })
 }
 
 /// harness 运行时指标计数器：L1 监管触发次数、幂等命中次数（进程级，重启清零）。
@@ -16557,7 +17240,7 @@ fn prepare_chat_dispatch(payload: SendMessageRequest) -> ApiResult<PreparedChatD
     let semantic_action = semantic_action_from_intent(text);
     let calls_vision =
         should_route_to_vision_agent(text) || semantic_action.as_deref() == Some("visual_action");
-    let calls_tool = should_route_to_tool_agent(text) || semantic_action.is_some();
+    let mut calls_tool = should_route_to_tool_agent(text) || semantic_action.is_some();
     let conversation_session_id = payload.session_id.clone();
     let chat_room_id = payload
         .chat_room_id
@@ -16566,6 +17249,12 @@ fn prepare_chat_dispatch(payload: SendMessageRequest) -> ApiResult<PreparedChatD
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_CHAT_ROOM_ID)
         .to_string();
+    if let Ok((_, room_tools, room_computer_use)) =
+        chat_room_capabilities_sqlite(&default_session_sqlite_path(), &chat_room_id)
+    {
+        // 聊天室开关是全局能力的进一步收紧，不会绕过全局关闭或审批闸门。
+        calls_tool = calls_tool && room_tools && (semantic_action.as_deref() != Some("computer_use") || room_computer_use);
+    }
     let (selected_history, context_history, context_rosters, active_vision_session_id) = {
         let store = session_store()
             .lock()
@@ -21342,21 +22031,40 @@ async fn static_file(AxumPath(path): AxumPath<String>) -> impl IntoResponse {
 }
 
 async fn serve_static_path(path: &str) -> Response<Body> {
-    let Some(path) = resolve_static_path(path) else {
+    let Some(relative) = normalize_static_relative_path(path) else {
         return plain_response(StatusCode::BAD_REQUEST, "invalid static path");
     };
 
-    let Ok(bytes) = tokio::fs::read(&path).await else {
-        return plain_response(StatusCode::NOT_FOUND, "static file not found");
+    let candidates = static_path_candidates(&relative);
+    let mut bytes = None;
+    for candidate in &candidates {
+        if let Ok(content) = tokio::fs::read(candidate).await {
+            bytes = Some(content);
+            break;
+        }
+    }
+    // 安装包应携带完整前端目录；核心启动文件再提供编译期内嵌兜底，
+    // 避免安装目录漏文件或被安全软件隔离时直接返回空白 404 页面。
+    let bytes = bytes.or_else(|| embedded_static_file(&relative).map(<[u8]>::to_vec));
+    let Some(bytes) = bytes else {
+        warn!(
+            request_path = %relative.display(),
+            searched = ?candidates,
+            "packaged static file not found"
+        );
+        return plain_response(
+            StatusCode::NOT_FOUND,
+            "static file not found in packaged web-console assets",
+        );
     };
 
     let mut response = Response::new(Body::from(bytes));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static(content_type_for_path(&path)),
+        HeaderValue::from_static(content_type_for_path(&relative)),
     );
-    // 禁用 WebView2/浏览器缓存：静态资源是读盘实时内容，前端改动（含桌宠拖放轮询）应立即生效，
-    // 不被 WebView2 对无缓存头响应的启发式缓存遮蔽（实测旧 app.js 缓存导致桌宠拖放附件不显示）。
+    // 禁用 WebView2/浏览器缓存：开发态优先读盘、安装态可回退内嵌资源，
+    // 两种模式都不应被启发式缓存遮蔽前端更新。
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-cache, no-store, must-revalidate"),
@@ -21365,6 +22073,16 @@ async fn serve_static_path(path: &str) -> Response<Body> {
 }
 
 fn resolve_static_path(path: &str) -> Option<PathBuf> {
+    let relative = normalize_static_relative_path(path)?;
+    let candidates = static_path_candidates(&relative);
+    candidates
+        .iter()
+        .find(|candidate| candidate.is_file())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+fn normalize_static_relative_path(path: &str) -> Option<PathBuf> {
     let relative = path.trim_start_matches('/');
     let relative = if relative.is_empty() {
         "index.html"
@@ -21372,7 +22090,7 @@ fn resolve_static_path(path: &str) -> Option<PathBuf> {
         relative
     };
 
-    let mut output = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut output = PathBuf::new();
     for component in Path::new(relative).components() {
         match component {
             Component::Normal(segment) => output.push(segment),
@@ -21380,6 +22098,65 @@ fn resolve_static_path(path: &str) -> Option<PathBuf> {
         }
     }
     Some(output)
+}
+
+fn package_static_root_from_executable(executable: &Path) -> Option<PathBuf> {
+    let install_root = executable.parent()?.parent()?;
+    Some(
+        install_root
+            .join("modules")
+            .join("gui-web")
+            .join("packages")
+            .join("web-console"),
+    )
+}
+
+fn static_root_candidates() -> Vec<PathBuf> {
+    if let Some(root) = env::var_os("COOLZHU_WEB_STATIC_ROOT") {
+        if !root.is_empty() {
+            // 显式覆盖用于企业部署和隔离验收；核心启动文件仍可回退到内嵌副本。
+            return vec![PathBuf::from(root)];
+        }
+    }
+    let mut roots = Vec::new();
+    if let Ok(executable) = env::current_exe() {
+        if let Some(root) = package_static_root_from_executable(&executable) {
+            roots.push(root);
+        }
+    }
+    if let Ok(current_dir) = env::current_dir() {
+        roots.push(
+            current_dir
+                .join("modules")
+                .join("gui-web")
+                .join("packages")
+                .join("web-console"),
+        );
+    }
+    // 开发态保留源码热更新路径；安装态不再依赖这一编译机绝对路径。
+    roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    roots.dedup();
+    roots
+}
+
+fn static_path_candidates(relative: &Path) -> Vec<PathBuf> {
+    static_root_candidates()
+        .into_iter()
+        .map(|root| root.join(relative))
+        .collect()
+}
+
+fn embedded_static_file(relative: &Path) -> Option<&'static [u8]> {
+    let normalized = relative.to_string_lossy().replace('\\', "/");
+    match normalized.as_str() {
+        "index.html" => Some(include_bytes!("../index.html")),
+        "src/app.js" => Some(include_bytes!("app.js")),
+        "src/styles.css" => Some(include_bytes!("styles.css")),
+        "src/realtime_voice_capture.js" => Some(include_bytes!("realtime_voice_capture.js")),
+        "src/realtime_audio_output.js" => Some(include_bytes!("realtime_audio_output.js")),
+        "src/stt_tail_capture.js" => Some(include_bytes!("stt_tail_capture.js")),
+        _ => None,
+    }
 }
 
 fn content_type_for_path(path: &Path) -> &'static str {
@@ -21611,7 +22388,7 @@ fn current_semantic_ids() -> Vec<String> {
     SEMANTIC_IDS.try_with(Clone::clone).unwrap_or_default()
 }
 
-/// P1.5：是否启用真实语义记忆召回（默认关）。
+/// P1.5：是否启用真实语义记忆召回（默认开；缺配置时显式降级）。
 fn semantic_memory_enabled() -> bool {
     read_config(|config| config.model.enable_semantic_memory)
 }
@@ -21619,7 +22396,7 @@ fn semantic_memory_enabled() -> bool {
 /// B 衰减：半衰期（默认 7 天，ms）。
 const MEMORY_DECAY_HALF_LIFE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
-/// B 衰减：是否按 effective_recall_score 重排召回候选（默认关 → 现序不变）。
+/// B 衰减：是否按 effective_recall_score 重排召回候选（默认开）。
 fn memory_decay_ordering_enabled() -> bool {
     read_config(|config| config.model.enable_memory_decay_ordering)
 }
@@ -22156,7 +22933,15 @@ async fn agent_chat_response(
     collaboration_roster: Option<&ChatRosterResponse>,
     chat_room_id: Option<&str>,
 ) -> AgentModelResponse {
-    let use_real_llm = real_llm_enabled();
+    let room_real_llm = chat_room_id
+        .and_then(|room_id| chat_room_capabilities_sqlite(&default_session_sqlite_path(), room_id).ok())
+        .map(|(room_real_llm, _, _)| room_real_llm)
+        .unwrap_or(true);
+    let room_llm_tools = chat_room_id
+        .and_then(|room_id| chat_room_capabilities_sqlite(&default_session_sqlite_path(), room_id).ok())
+        .map(|(_, room_llm_tools, _)| room_llm_tools)
+        .unwrap_or(true);
+    let use_real_llm = real_llm_enabled() && room_real_llm;
     diag!("[LLM-CHAIN] agent_chat_response: real_llm_enabled={use_real_llm}, agent={}, provider={}, model={}",
         agent.name, agent.provider, agent.model);
     // 会话链路为 async：coolzhu-diagnostics 的 span 上下文是 thread-local、不跨 .await，
@@ -22176,7 +22961,7 @@ async fn agent_chat_response(
     );
     if use_real_llm {
         diag!("[LLM-CHAIN] calling call_agent_model...");
-        let use_tool_loop = llm_tools_enabled();
+        let use_tool_loop = llm_tools_enabled() && room_llm_tools;
         diag!("[LLM-CHAIN] llm_tools_enabled={use_tool_loop}");
         let semantic_ids = if semantic_memory_enabled() {
             compute_semantic_recall(agent, prompt).await
@@ -23536,7 +24321,7 @@ fn select_context_memory_beads(
     let superseded = load_superseded_bead_ids(&agent.id);
     candidates.retain(|bead| !superseded.contains(&bead.id));
 
-    // B 衰减：门控（默认关 → 现序不变）。开启后按 effective_recall_score 重排，
+    // B 衰减：能力开关（首次安装默认开）。开启后按 effective_recall_score 重排，
     // 让高 confidence + 新鲜的记忆上浮（pinned 不衰减）。访问强化（access_count）待字段扩展后补。
     if memory_decay_ordering_enabled() {
         warm_memory_access(&agent.id);
@@ -33994,6 +34779,7 @@ fn initialize_session_schema(connection: &Connection) -> rusqlite::Result<()> {
     apply_session_migration_v13(connection)?;
     apply_session_migration_v14(connection)?;
     apply_session_migration_v15(connection)?;
+    apply_session_migration_v16(connection)?;
     Ok(())
 }
 
@@ -34081,6 +34867,32 @@ fn apply_session_migration_v15(connection: &Connection) -> rusqlite::Result<()> 
     }
     Ok(())
 }
+
+/// Schema v16：聊天室维度的诊断显示偏好。默认启用基础诊断，但不改变权限授予。
+fn apply_session_migration_v16(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS chat_room_diagnostics (
+            room_id TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            auto_refresh INTEGER NOT NULL DEFAULT 0,
+            show_stream_interrupts INTEGER NOT NULL DEFAULT 1,
+            show_details INTEGER NOT NULL DEFAULT 1,
+            real_llm_enabled INTEGER NOT NULL DEFAULT 1,
+            llm_tools_enabled INTEGER NOT NULL DEFAULT 1,
+            computer_use_enabled INTEGER NOT NULL DEFAULT 1,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE
+        );
+        "#,
+    )?;
+    ensure_table_column(connection, "chat_room_diagnostics", "real_llm_enabled", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_table_column(connection, "chat_room_diagnostics", "llm_tools_enabled", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_table_column(connection, "chat_room_diagnostics", "computer_use_enabled", "INTEGER NOT NULL DEFAULT 1")?;
+    // 保持现有 user_version=15 契约，避免旧版迁移测试/第三方库把未知版本视为不兼容。
+    // 表本身使用 IF NOT EXISTS，随每次 schema 初始化安全补齐。
+    Ok(())
+}
 fn chat_room_permission_profile_sqlite(path: &Path, room_id: &str) -> rusqlite::Result<String> {
     let connection = open_session_connection(path)?;
     initialize_session_schema(&connection)?;
@@ -34142,6 +34954,104 @@ fn chat_room_permission_record_sqlite(
         )
         .optional()
         .map(|record| record.unwrap_or_else(|| (ROOM_PERMISSION_WORKSPACE_WRITE.to_string(), None)))
+}
+
+fn chat_room_diagnostics_record_sqlite(
+    path: &Path,
+    room_id: &str,
+) -> rusqlite::Result<(bool, bool, bool, bool, Option<u64>)> {
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    connection
+        .query_row(
+            "SELECT enabled, auto_refresh, show_stream_interrupts, show_details, updated_at \
+             FROM chat_room_diagnostics WHERE room_id = ?1",
+            params![room_id],
+            |row| {
+                let enabled: i64 = row.get(0)?;
+                let auto_refresh: i64 = row.get(1)?;
+                let show_stream_interrupts: i64 = row.get(2)?;
+                let show_details: i64 = row.get(3)?;
+                let updated_at: i64 = row.get(4)?;
+                Ok((
+                    enabled != 0,
+                    auto_refresh != 0,
+                    show_stream_interrupts != 0,
+                    show_details != 0,
+                    Some(updated_at.max(0) as u64),
+                ))
+            },
+        )
+        .optional()
+        .map(|record| record.unwrap_or((true, false, true, true, None)))
+}
+
+fn set_chat_room_diagnostics_sqlite(
+    path: &Path,
+    room_id: &str,
+    update: &ChatRoomDiagnosticsUpdateRequest,
+) -> rusqlite::Result<()> {
+    let (current_enabled, current_auto_refresh, current_interrupts, current_details, _) =
+        chat_room_diagnostics_record_sqlite(path, room_id)?;
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    connection.execute(
+        "INSERT INTO chat_room_diagnostics(room_id, enabled, auto_refresh, show_stream_interrupts, show_details, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(room_id) DO UPDATE SET \
+           enabled = excluded.enabled, auto_refresh = excluded.auto_refresh, \
+           show_stream_interrupts = excluded.show_stream_interrupts, show_details = excluded.show_details, \
+           updated_at = excluded.updated_at",
+        params![
+            room_id,
+            if update.enabled.unwrap_or(current_enabled) { 1 } else { 0 },
+            if update.auto_refresh.unwrap_or(current_auto_refresh) { 1 } else { 0 },
+            if update.show_stream_interrupts.unwrap_or(current_interrupts) { 1 } else { 0 },
+            if update.show_details.unwrap_or(current_details) { 1 } else { 0 },
+            u64_to_i64(unix_timestamp_millis()),
+        ],
+    )?;
+    connection.execute(
+        "UPDATE chat_room_diagnostics SET real_llm_enabled = COALESCE(?2, real_llm_enabled), \
+         llm_tools_enabled = COALESCE(?3, llm_tools_enabled), \
+         computer_use_enabled = COALESCE(?4, computer_use_enabled) WHERE room_id = ?1",
+        params![
+            room_id,
+            update.real_llm_enabled.map(|value| if value { 1 } else { 0 }),
+            update.llm_tools_enabled.map(|value| if value { 1 } else { 0 }),
+            update.computer_use_enabled.map(|value| if value { 1 } else { 0 }),
+        ],
+    )?;
+    Ok(())
+}
+
+fn chat_room_capabilities_sqlite(path: &Path, room_id: &str) -> rusqlite::Result<(bool, bool, bool)> {
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    connection
+        .query_row(
+            "SELECT real_llm_enabled, llm_tools_enabled, computer_use_enabled \
+             FROM chat_room_diagnostics WHERE room_id = ?1",
+            params![room_id],
+            |row| {
+                let real_llm: i64 = row.get(0)?;
+                let tools: i64 = row.get(1)?;
+                let computer_use: i64 = row.get(2)?;
+                Ok((real_llm != 0, tools != 0, computer_use != 0))
+            },
+        )
+        .optional()
+        .map(|record| record.unwrap_or((true, true, true)))
+}
+
+fn delete_chat_room_diagnostics_sqlite(path: &Path, room_id: &str) -> rusqlite::Result<()> {
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    connection.execute(
+        "DELETE FROM chat_room_diagnostics WHERE room_id = ?1",
+        params![room_id],
+    )?;
+    Ok(())
 }
 
 /// REQ-WEB-SESSION-007 / REQ-MEM-006：Schema v2 迁移。
@@ -39663,7 +40573,7 @@ fn base_url_with_optional_endpoint(base_url: &str, endpoint: Option<&str>) -> Op
 fn api_key_status_label(api_key_ref: &str) -> String {
     let value = api_key_ref.trim();
     if value.is_empty() {
-        return "待配".to_string();
+        return "未配置（能力已启用）".to_string();
     }
     let lower = value.to_ascii_lowercase();
     let looks_secret = lower.starts_with("sk-")
@@ -39681,6 +40591,22 @@ fn api_key_status_label(api_key_ref: &str) -> String {
         format!("已配置 Key (...{suffix})")
     } else {
         value.chars().take(64).collect()
+    }
+}
+
+fn api_key_configuration_status(api_key_ref: &str) -> String {
+    let value = api_key_ref.trim();
+    if value.is_empty() {
+        return "未配置（能力已启用）".to_string();
+    }
+    let label = api_key_status_label(value);
+    if resolve_api_key_ref(value).is_none() {
+        return format!("未配置（能力已启用；凭据引用 {label} 不可用）");
+    }
+    if looks_like_secret(value) {
+        label
+    } else {
+        format!("引用 {label}")
     }
 }
 
@@ -39723,7 +40649,7 @@ fn default_agent_sessions() -> Vec<AgentSessionDto> {
                 base_url: seed.base_url.clone(),
                 endpoint: seed.endpoint.clone(),
                 reasoning_effort: seed.reasoning_effort.clone(),
-                api_key_status: format!("引用 {}", api_key_status_label(&seed.api_key_ref)),
+                api_key_status: api_key_configuration_status(&seed.api_key_ref),
                 selectable: true,
                 enabled: true,
                 system: false,
@@ -40093,11 +41019,7 @@ fn understanding_agent_from_session(
         model: session.model.clone(),
         model_type: model_type.clone(),
         base_url: effective_agent_base_url_impl(session.base_url.as_deref(), &session.provider),
-        api_key_status: if session.api_key_ref.trim().is_empty() {
-            "待配".to_string()
-        } else {
-            format!("引用 {}", api_key_status_label(&session.api_key_ref))
-        },
+        api_key_status: api_key_configuration_status(&session.api_key_ref),
         capabilities: UnderstandingCapabilities {
             describe_screen: true,
             analyze_image: true,
@@ -40508,11 +41430,7 @@ impl PersistedSession {
             base_url: self.base_url.clone(),
             endpoint: self.endpoint.clone(),
             reasoning_effort: normalize_reasoning_effort(Some(&self.reasoning_effort)),
-            api_key_status: if self.api_key_ref.trim().is_empty() {
-                "待配".to_string()
-            } else {
-                format!("引用 {}", api_key_status_label(&self.api_key_ref))
-            },
+            api_key_status: api_key_configuration_status(&self.api_key_ref),
             active,
             updated_at: self.updated_at,
         }
@@ -40536,11 +41454,7 @@ impl PersistedSession {
             base_url: self.base_url.clone(),
             endpoint: self.endpoint.clone(),
             reasoning_effort: normalize_reasoning_effort(Some(&self.reasoning_effort)),
-            api_key_status: if self.api_key_ref.trim().is_empty() {
-                "待配".to_string()
-            } else {
-                format!("引用 {}", api_key_status_label(&self.api_key_ref))
-            },
+            api_key_status: api_key_configuration_status(&self.api_key_ref),
             selectable: true,
             enabled: true,
             system: false,
@@ -41477,6 +42391,7 @@ struct ProjectTreeQuery {
 struct ProjectTreeResponse {
     workspace: String,
     root: ProjectTreeNode,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -41506,7 +42421,13 @@ struct ProjectFileMetaResponse {
     modified: Option<u64>,
     binary: bool,
     previewable: bool,
+    editable: bool,
     max_preview_bytes: u64,
+    max_edit_bytes: usize,
+    revision: String,
+    encoding: String,
+    line_ending: String,
+    has_utf8_bom: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41535,6 +42456,50 @@ struct ProjectFileReadResponse {
     end_line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     total_lines: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectFileWriteRequest {
+    path: String,
+    content: String,
+    revision: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectEntryCreateRequest {
+    #[serde(default)]
+    parent_path: String,
+    name: String,
+    kind: String,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectEntryRenameRequest {
+    path: String,
+    new_name: String,
+    #[serde(default)]
+    revision: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectEntryDeleteRequest {
+    path: String,
+    #[serde(default)]
+    revision: Option<String>,
+    #[serde(default)]
+    recursive: bool,
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectMutationResponse {
+    operation: String,
+    path: String,
+    revision: Option<String>,
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41791,6 +42756,24 @@ struct DiagnosticsHealthResponse {
     latest_capture: CaptureMetadata,
     tools: ToolCatalogSummary,
     voice_monitor: VoiceMonitorStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct FunctionalDiagnosticsResponse {
+    generated_at: u64,
+    summary: DiagnosticsSummary,
+    checks: Vec<DiagnosticsCheck>,
+    note: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamDiagnosticsResponse {
+    generated_at: u64,
+    status: String,
+    cancellation_supported: bool,
+    abort_reason_visible: bool,
+    recursion_guarded: bool,
+    note: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -46723,6 +47706,33 @@ mod tests {
     }
 
     #[test]
+    fn embedded_static_core_covers_console_bootstrap_files() {
+        for path in [
+            "index.html",
+            "src/app.js",
+            "src/styles.css",
+            "src/realtime_voice_capture.js",
+            "src/realtime_audio_output.js",
+            "src/stt_tail_capture.js",
+        ] {
+            let content = super::embedded_static_file(Path::new(path))
+                .unwrap_or_else(|| panic!("missing embedded static file: {path}"));
+            assert!(!content.is_empty(), "empty embedded static file: {path}");
+        }
+        assert!(super::embedded_static_file(Path::new("assets/icons/code.png")).is_none());
+    }
+
+    #[test]
+    fn packaged_static_root_is_resolved_beside_bin_directory() {
+        let executable = Path::new("C:/Program Files/CoolzhuAgent/bin/coolzhu-web-console.exe");
+        let root = super::package_static_root_from_executable(executable).unwrap();
+        assert_eq!(
+            root,
+            Path::new("C:/Program Files/CoolzhuAgent/modules/gui-web/packages/web-console")
+        );
+    }
+
+    #[test]
     fn desktop_pet_candidates_include_package_bin_neighbor() {
         let package_web_console = Path::new("C:/repo/package/bin/coolzhu-web-console.exe");
         let manifest_dir = Path::new("C:/repo/modules/gui-web/packages/web-console");
@@ -46801,6 +47811,35 @@ mod tests {
         assert_eq!(error.0, axum::http::StatusCode::FORBIDDEN);
     }
 
+    #[test]
+    fn project_tree_metadata_failure_omits_only_bad_entry_and_keeps_later_file() {
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let root = temp.path().canonicalize().unwrap();
+        let good = root.join("z-later.txt");
+        std::fs::write(&good, "still visible").unwrap();
+        let mut remaining = 10;
+        let mut warnings = Vec::new();
+        let mut node = super::project_tree_node(&root, &root, 0, &mut remaining, &mut warnings)
+            .expect("root node");
+
+        super::project_tree_append_child(
+            &root,
+            &root.join("missing-entry-for-test.invalid"),
+            0,
+            &mut remaining,
+            &mut node,
+            &mut warnings,
+        );
+        super::project_tree_append_child(&root, &good, 0, &mut remaining, &mut node, &mut warnings);
+
+        assert_eq!(node.omitted_count, 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(node
+            .children
+            .iter()
+            .any(|child| child.name == "z-later.txt"));
+    }
+
     #[tokio::test]
     async fn project_file_reads_text_page() {
         let _guard = config_test_guard();
@@ -46857,6 +47896,237 @@ mod tests {
         .await
         .expect_err("binary file should not preview");
         assert_eq!(error.0, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn first_start_writes_capability_enabled_but_permission_safe_config() {
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let config_path = temp.path().join(super::CONFIG_FILE_NAME);
+        assert!(!config_path.exists());
+
+        let config = super::load_workspace_config_at(temp.path());
+        assert!(
+            config_path.is_file(),
+            "first start must materialize coolzhu.toml"
+        );
+        assert!(config.model.enable_real_llm);
+        assert!(config.model.enable_llm_tools);
+        assert!(config.model.enable_semantic_memory);
+        assert!(config.model.enable_memory_decay_ordering);
+        assert!(config.computer_use.enabled);
+        assert!(config.computer_use.desktop.enabled);
+        assert!(config.computer_use.browser.enabled);
+        assert!(config.computer_use.browser.allow_drag);
+        assert!(config.computer_use.browser.allow_key_combinations);
+        assert!(config.audio.realtime.auto_send_transcript);
+        assert!(config.audio.realtime.auto_tts_reply);
+        assert!(config.vision.router.as_ref().unwrap().cross_verify);
+        assert!(!config.tool.dev_open_permissions);
+        assert!(config.tool.permission_profile.is_empty());
+        assert!(config.tool.execution.command_gate_enabled);
+
+        let persisted = std::fs::read_to_string(&config_path).expect("read generated config");
+        let parsed: super::WorkspaceConfig =
+            toml::from_str(&persisted).expect("parse generated config");
+        assert!(parsed.model.enable_real_llm);
+        assert!(parsed.model.enable_llm_tools);
+        assert!(parsed.model.enable_semantic_memory);
+        assert!(!parsed.tool.dev_open_permissions);
+        assert!(
+            !persisted.contains("api_key ="),
+            "credentials must not be packaged"
+        );
+        assert_eq!(super::api_key_status_label(""), "未配置（能力已启用）");
+        assert_eq!(
+            super::api_key_configuration_status(""),
+            "未配置（能力已启用）"
+        );
+        let missing_status = super::api_key_configuration_status(
+            "__coolzhu_missing_api_key_for_first_start_test__.txt",
+        );
+        assert!(missing_status.contains("未配置（能力已启用"));
+        assert!(missing_status.contains("凭据引用"));
+        assert!(missing_status.contains("不可用"));
+        let configured_status =
+            super::api_key_configuration_status("sk-coolzhu-test-placeholder-1234567890");
+        assert!(configured_status.starts_with("已配置 Key"));
+        assert!(!configured_status.contains("sk-coolzhu"));
+    }
+
+    #[test]
+    fn serde_missing_capability_fields_matches_default_and_explicit_false_is_preserved() {
+        let missing: super::WorkspaceConfig = toml::from_str("").expect("empty config");
+        assert!(missing.model.enable_real_llm);
+        assert!(missing.model.enable_llm_tools);
+        assert!(missing.model.enable_semantic_memory);
+        assert!(missing.model.enable_memory_decay_ordering);
+        assert!(missing.audio.realtime.auto_send_transcript);
+        assert!(missing.audio.realtime.auto_tts_reply);
+        assert!(!missing.tool.dev_open_permissions);
+
+        let explicit: super::WorkspaceConfig = toml::from_str(
+            "[model]\nenable_real_llm = false\nenable_llm_tools = false\nenable_semantic_memory = false\nenable_memory_decay_ordering = false\n",
+        )
+        .expect("explicit config");
+        assert!(!explicit.model.enable_real_llm);
+        assert!(!explicit.model.enable_llm_tools);
+        assert!(!explicit.model.enable_semantic_memory);
+        assert!(!explicit.model.enable_memory_decay_ordering);
+    }
+
+    #[tokio::test]
+    async fn project_save_preserves_bom_crlf_and_refreshes_revision() {
+        let _guard = config_test_guard();
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let path = temp.path().join("note.txt");
+        std::fs::write(&path, b"\xEF\xBB\xBFfirst\r\nsecond\r\n").expect("seed text");
+        super::reload_workspace_scope(temp.path().canonicalize().unwrap()).expect("workspace");
+        let before = super::project_file_meta(temp.path(), &path).expect("metadata");
+        assert_eq!(before.encoding, "utf-8-bom");
+        assert_eq!(before.line_ending, "crlf");
+
+        let Json(saved) = super::api_project_file_write(Json(super::ProjectFileWriteRequest {
+            path: "note.txt".to_string(),
+            content: "changed\ntext\n".to_string(),
+            revision: before.revision.clone(),
+        }))
+        .await
+        .expect("save");
+        assert_ne!(saved.revision.as_deref(), Some(before.revision.as_str()));
+        assert_eq!(
+            std::fs::read(&path).expect("read saved"),
+            b"\xEF\xBB\xBFchanged\r\ntext\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_save_detects_external_revision_conflict() {
+        let _guard = config_test_guard();
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let path = temp.path().join("note.txt");
+        std::fs::write(&path, "one\n").expect("seed");
+        super::reload_workspace_scope(temp.path().canonicalize().unwrap()).expect("workspace");
+        let revision = super::project_file_meta(temp.path(), &path)
+            .unwrap()
+            .revision;
+        std::fs::write(&path, "external\n").expect("external edit");
+        let error = super::api_project_file_write(Json(super::ProjectFileWriteRequest {
+            path: "note.txt".to_string(),
+            content: "editor\n".to_string(),
+            revision,
+        }))
+        .await
+        .expect_err("stale write must conflict");
+        assert_eq!(error.0, axum::http::StatusCode::CONFLICT);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external\n");
+    }
+
+    #[test]
+    fn atomic_replace_overwrites_existing_target_without_delete_gap() {
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let target = temp.path().join("target.txt");
+        let source = temp.path().join(".atomic.tmp");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::write(&source, "new").unwrap();
+        super::replace_project_file(&source, &target).expect("platform replace existing");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert!(!source.exists());
+    }
+
+    #[tokio::test]
+    async fn project_mutation_status_contract_covers_400_403_409_413() {
+        let _guard = config_test_guard();
+        let temp = tempfile::tempdir().expect("temp workspace");
+        std::fs::write(temp.path().join("note.txt"), "safe\n").unwrap();
+        std::fs::write(
+            temp.path().join("large.txt"),
+            vec![b'a'; super::MAX_PROJECT_FILE_EDIT_BYTES + 1],
+        )
+        .unwrap();
+        super::reload_workspace_scope(temp.path().canonicalize().unwrap()).expect("workspace");
+
+        let no_confirm = super::api_project_entry_delete(Json(super::ProjectEntryDeleteRequest {
+            path: "note.txt".to_string(),
+            revision: None,
+            recursive: false,
+            confirm: false,
+        }))
+        .await
+        .expect_err("confirmation required");
+        assert_eq!(no_confirm.0, axum::http::StatusCode::BAD_REQUEST);
+
+        let escape = super::api_project_entry_rename(Json(super::ProjectEntryRenameRequest {
+            path: "../note.txt".to_string(),
+            new_name: "renamed.txt".to_string(),
+            revision: None,
+        }))
+        .await
+        .expect_err("escape forbidden");
+        assert_eq!(escape.0, axum::http::StatusCode::FORBIDDEN);
+
+        let conflict = super::api_project_entry_create(Json(super::ProjectEntryCreateRequest {
+            parent_path: String::new(),
+            name: "note.txt".to_string(),
+            kind: "file".to_string(),
+            content: None,
+        }))
+        .await
+        .expect_err("duplicate conflicts");
+        assert_eq!(conflict.0, axum::http::StatusCode::CONFLICT);
+
+        let large_meta =
+            super::project_file_meta(temp.path(), &temp.path().join("large.txt")).unwrap();
+        let too_large = super::api_project_file_write(Json(super::ProjectFileWriteRequest {
+            path: "large.txt".to_string(),
+            content: "small".to_string(),
+            revision: large_meta.revision,
+        }))
+        .await
+        .expect_err("large file is read-only");
+        assert_eq!(too_large.0, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn project_rename_and_delete_open_file_backend_contract() {
+        let _guard = config_test_guard();
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let old = temp.path().join("old.txt");
+        std::fs::write(&old, "value\n").unwrap();
+        super::reload_workspace_scope(temp.path().canonicalize().unwrap()).expect("workspace");
+        let revision = super::project_file_meta(temp.path(), &old)
+            .unwrap()
+            .revision;
+        let Json(renamed) =
+            super::api_project_entry_rename(Json(super::ProjectEntryRenameRequest {
+                path: "old.txt".to_string(),
+                new_name: "new.txt".to_string(),
+                revision: Some(revision),
+            }))
+            .await
+            .expect("rename");
+        assert_eq!(renamed.path, "new.txt");
+        assert!(!old.exists());
+        let new_path = temp.path().join("new.txt");
+        let new_revision = super::project_file_meta(temp.path(), &new_path)
+            .unwrap()
+            .revision;
+        let _ = super::api_project_entry_delete(Json(super::ProjectEntryDeleteRequest {
+            path: "new.txt".to_string(),
+            revision: Some(new_revision),
+            recursive: false,
+            confirm: true,
+        }))
+        .await
+        .expect("delete");
+        assert!(!new_path.exists());
+    }
+
+    #[test]
+    fn project_entry_name_rejects_dot_only_and_windows_reserved_names() {
+        for name in ["...", ".", "CON", "nul.txt", "bad/name", "trail."] {
+            assert!(super::validate_project_entry_name(name).is_err(), "{name}");
+        }
+        assert!(super::validate_project_entry_name("normal.txt").is_ok());
     }
 
     #[tokio::test]
@@ -48915,14 +50185,11 @@ mod tests {
 
     #[test]
     fn packaged_default_workspace_prefers_explicit_runtime_directory() {
-        let runtime_dir =
-            std::path::PathBuf::from(r"C:\Users\test\AppData\Local\CoolzhuAgent");
+        let runtime_dir = std::path::PathBuf::from(r"C:\Users\test\AppData\Local\CoolzhuAgent");
         let workspace = super::default_workspace_path_from(
             Some(runtime_dir.clone()),
             Some(std::path::PathBuf::from(r"C:\Users\test")),
-            Some(std::path::PathBuf::from(
-                r"C:\Program Files\CoolzhuAgent",
-            )),
+            Some(std::path::PathBuf::from(r"C:\Program Files\CoolzhuAgent")),
         );
         assert_eq!(workspace, runtime_dir);
     }
@@ -57400,8 +58667,9 @@ attach: last_assistant
         let _guard = config_test_guard();
         let prev = {
             let mut guard = super::workspace_config().lock().expect("lock");
-            // 确保干净默认：enable_llm_tools = false（Default::default() 即如此）
-            std::mem::replace(&mut *guard, super::WorkspaceConfig::default())
+            let mut disabled = super::WorkspaceConfig::default();
+            disabled.model.enable_llm_tools = false;
+            std::mem::replace(&mut *guard, disabled)
         };
         assert!(super::llm_tool_definitions().is_none());
         let _ = std::mem::replace(&mut *super::workspace_config().lock().expect("lock"), prev);
@@ -58867,6 +60135,46 @@ attach: last_assistant
     }
 
     #[test]
+    fn chat_room_diagnostics_preferences_persist_and_default_safe() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("sessions.sqlite3");
+        let connection = super::open_session_connection(&db_path).expect("open sqlite");
+        super::initialize_session_schema(&connection).expect("schema");
+        connection
+            .execute(
+                "INSERT INTO chat_rooms(id, name, created_at, updated_at) VALUES (?1, ?2, 1, 1)",
+                rusqlite::params!["room-diag", "Diag room"],
+            )
+            .expect("insert room");
+        drop(connection);
+        let initial = super::chat_room_diagnostics_record_sqlite(&db_path, "room-diag")
+            .expect("read default");
+        assert_eq!(initial, (true, false, true, true, None));
+        super::set_chat_room_diagnostics_sqlite(
+            &db_path,
+            "room-diag",
+            &super::ChatRoomDiagnosticsUpdateRequest {
+                enabled: Some(false),
+                auto_refresh: Some(true),
+                show_stream_interrupts: Some(false),
+                show_details: Some(true),
+                real_llm_enabled: Some(false),
+                llm_tools_enabled: Some(true),
+                computer_use_enabled: Some(false),
+            },
+        )
+        .expect("persist preferences");
+        let saved = super::chat_room_diagnostics_record_sqlite(&db_path, "room-diag")
+            .expect("read saved");
+        assert_eq!(saved.0, false);
+        assert_eq!(saved.1, true);
+        assert_eq!(saved.2, false);
+        assert_eq!(saved.3, true);
+        assert!(saved.4.is_some());
+        assert_eq!(super::chat_room_capabilities_sqlite(&db_path, "room-diag").expect("read capabilities"), (false, true, false));
+    }
+
+    #[test]
     fn chat_room_full_access_requires_both_risk_confirmations() {
         let missing_ack = super::ChatRoomPermissionUpdateRequest {
             permission_profile: super::ROOM_PERMISSION_FULL_ACCESS.to_string(),
@@ -59623,7 +60931,10 @@ attach: last_assistant
         std::fs::write(&path, malformed).expect("write malformed config");
 
         let config = super::load_workspace_config_at(temp.path());
-        assert!(!config.model.enable_real_llm, "fallback default is used");
+        assert!(
+            config.model.enable_real_llm,
+            "capability-enabled fallback default is used"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).expect("read malformed config"),
             malformed,
@@ -60933,6 +62244,211 @@ attach: last_assistant
     }
 
     #[test]
+    fn web_frontend_project_window_has_complete_editing_contract() {
+        for action in [
+            "project-save",
+            "project-new-file",
+            "project-new-dir",
+            "project-rename",
+            "project-delete",
+        ] {
+            assert!(
+                WEB_INDEX_HTML.contains(&format!("data-action=\"{action}\"")),
+                "{action}"
+            );
+        }
+        for contract in [
+            "function renderIdeEditableEditor",
+            "function saveActiveIdeFile",
+            "function createProjectEntry",
+            "function renameSelectedProjectEntry",
+            "function deleteSelectedProjectEntry",
+            "method: \"PUT\"",
+            "method: \"PATCH\"",
+            "method: \"DELETE\"",
+            "error.status === 409",
+            "findIdeTabByKind(\"view\", path, \"\")",
+            "item.path = result.path",
+            "tab.dirty",
+        ] {
+            assert!(
+                WEB_APP_JS.contains(contract),
+                "missing frontend editing contract: {contract}"
+            );
+        }
+        assert!(WEB_APP_JS.contains("event.key.toLowerCase() === \"s\""));
+        assert!(WEB_APP_JS.contains("window.confirm"));
+        assert!(WEB_STYLES_CSS.contains(".ide-edit-surface"));
+        assert!(WEB_STYLES_CSS.contains(".project-tree-warning"));
+    }
+
+    #[test]
+    fn web_frontend_icon_resolver_only_returns_packaged_assets() {
+        fn quoted_values(source: &str) -> Vec<String> {
+            let mut values = Vec::new();
+            let mut rest = source;
+            while let Some(start) = rest.find('"') {
+                rest = &rest[start + 1..];
+                let Some(end) = rest.find('"') else {
+                    break;
+                };
+                values.push(rest[..end].to_string());
+                rest = &rest[end + 1..];
+            }
+            values
+        }
+
+        fn source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let start_index = source.find(start).unwrap_or_else(|| panic!("missing {start}"));
+            let tail = &source[start_index..];
+            let end_index = tail.find(end).unwrap_or_else(|| panic!("missing {end}"));
+            &tail[..end_index]
+        }
+
+        fn returned_string_literals(source: &str) -> std::collections::BTreeSet<String> {
+            let mut result = std::collections::BTreeSet::new();
+            let mut rest = source;
+            while let Some(start) = rest.find("return \"") {
+                rest = &rest[start + "return \"".len()..];
+                let Some(end) = rest.find('"') else {
+                    break;
+                };
+                result.insert(rest[..end].to_string());
+                rest = &rest[end + 1..];
+            }
+            result
+        }
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let wuxia_dir = manifest_dir.join("assets/icons-wuxia");
+        let legacy_dir = manifest_dir.join("assets/icons");
+
+        let alias_section = source_section(
+            WEB_APP_JS,
+            "const WUXIA_ICON_ALIASES = new Map([",
+            "]);\n// 仅保留源码资源目录中真实存在",
+        );
+        let alias_values = quoted_values(alias_section);
+        assert_eq!(alias_values.len() % 2, 0, "icon alias entries must be pairs");
+        let aliases: std::collections::BTreeMap<String, String> = alias_values
+            .chunks_exact(2)
+            .map(|pair| (pair[0].clone(), pair[1].clone()))
+            .collect();
+        for (name, target) in &aliases {
+            assert!(
+                wuxia_dir.join(format!("{target}.svg")).is_file(),
+                "WUXIA_ICON_ALIASES[{name}] resolves to missing {target}.svg"
+            );
+        }
+
+        let legacy_section = source_section(
+            WEB_APP_JS,
+            "const PACKAGED_LEGACY_PNG_ICON_NAMES = new Set([",
+            "]);\nconst DEFAULT_PACKAGED_ICON_URL",
+        );
+        let legacy_names: std::collections::BTreeSet<String> =
+            quoted_values(legacy_section).into_iter().collect();
+        for name in &legacy_names {
+            assert!(
+                legacy_dir.join(format!("{name}.png")).is_file(),
+                "legacy icon whitelist contains missing {name}.png"
+            );
+        }
+
+        let assert_resolves = |name: &str| {
+            if name == "mario" || name == "robot-message" {
+                return;
+            }
+            if let Some(target) = aliases.get(name) {
+                assert!(wuxia_dir.join(format!("{target}.svg")).is_file());
+            } else {
+                assert!(
+                    legacy_names.contains(name),
+                    "runtime icon {name:?} is neither an SVG alias nor a packaged PNG whitelist entry"
+                );
+                assert!(legacy_dir.join(format!("{name}.png")).is_file());
+            }
+        };
+
+        // 静态字面量调用全部解析；icon 属性中的三元表达式只取问号后的结果值。
+        let mut rest = WEB_APP_JS;
+        while let Some(start) = rest.find("iconUrl(\"") {
+            rest = &rest[start + "iconUrl(\"".len()..];
+            let end = rest.find('"').expect("unterminated iconUrl literal");
+            assert_resolves(&rest[..end]);
+            rest = &rest[end + 1..];
+        }
+        for line in WEB_APP_JS.lines().filter(|line| line.contains("icon:")) {
+            let rhs = line.split_once("icon:").expect("filtered icon property").1;
+            let outcomes = rhs.split_once('?').map_or(rhs, |(_, outcomes)| outcomes);
+            for name in quoted_values(outcomes) {
+                assert_resolves(&name);
+            }
+        }
+
+        // 不能由 iconUrl 字面量扫描覆盖的两个运行时函数使用封闭白名单。
+        let message_icons = returned_string_literals(source_section(
+            WEB_APP_JS,
+            "function iconForMessage(message)",
+            "function kindForMessage(message)",
+        ));
+        let expected_message_icons = [
+            "chat",
+            "cli",
+            "image-preview",
+            "info-log",
+            "inner-vision",
+            "robot-message",
+            "task-list",
+            "thinking",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(message_icons, expected_message_icons);
+        for name in &message_icons {
+            assert_resolves(name);
+        }
+
+        let project_icons = returned_string_literals(source_section(
+            WEB_APP_JS,
+            "function projectIconForEntry(entry = {})",
+            "function projectGitStatus(entry = {})",
+        ));
+        let expected_project_icons = ["file", "file-type", "folder"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(project_icons, expected_project_icons);
+        for name in &project_icons {
+            assert_resolves(name);
+        }
+
+        assert!(
+            WEB_INDEX_HTML.contains("src=\"./assets/icons-wuxia/diff.svg\""),
+            "initial project diff icon must use the packaged SVG"
+        );
+        assert!(
+            WEB_APP_JS.contains("[\"diff\", \"diff\"]"),
+            "dynamic diff mode must keep using icons-wuxia/diff.svg"
+        );
+        assert!(
+            WEB_APP_JS.contains("[\"vision\", \"vision\"]"),
+            "dynamic view mode must keep using icons-wuxia/vision.svg"
+        );
+        assert!(WEB_APP_JS.contains("icon.src = iconUrl(\"diff\")"));
+        assert!(WEB_APP_JS.contains("icon.src = iconUrl(\"vision\")"));
+        assert!(WEB_APP_JS.contains("return DEFAULT_PACKAGED_ICON_URL;"));
+        assert!(
+            !WEB_INDEX_HTML.contains("assets/icons/diff.png")
+                && !WEB_APP_JS.contains("assets/icons/diff.png")
+                && !WEB_INDEX_HTML.contains("assets/icons/vision.png")
+                && !WEB_APP_JS.contains("assets/icons/vision.png"),
+            "the removed PNG fallbacks must never be requested"
+        );
+    }
+
+    #[test]
     fn web_frontend_phase5_project_outline_and_symbol_path_filter() {
         // P4.1：工程目录窗口的符号大纲侧条 + 后端按文件路径过滤（outline 模式）。
         assert!(WEB_INDEX_HTML.contains("data-role=\"ide-outline\""));
@@ -61222,6 +62738,20 @@ attach: last_assistant
         assert!(!WEB_APP_JS.contains("/api/tools/full-access"));
         assert!(WEB_APP_JS.contains("function refreshFullAccessStatus"));
         assert!(WEB_STYLES_CSS.contains(".task-full-access"));
+    }
+
+    #[test]
+    fn web_frontend_has_functional_selfcheck_and_room_diagnostics_controls() {
+        assert!(WEB_INDEX_HTML.contains("data-action=\"diagnostics-functional\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"functional-selfcheck-output\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"chat-room-diagnostics\""));
+        assert!(WEB_APP_JS.contains("data-diagnostics-field=\"real_llm_enabled\""));
+        assert!(WEB_APP_JS.contains("data-diagnostics-field=\"computer_use_enabled\""));
+        assert!(WEB_APP_JS.contains("full-access（双重确认 + 审批）"));
+        assert!(WEB_APP_JS.contains("/api/diagnostics/functional"));
+        assert!(WEB_APP_JS.contains("full-access 未完成双重确认"));
+        assert!(WEB_APP_JS.contains("/diagnostics`"));
+        assert!(WEB_APP_JS.contains("流式响应中断，未自动递归重试"));
     }
 
     #[test]
