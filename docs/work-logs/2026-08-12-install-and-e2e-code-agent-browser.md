@@ -8,6 +8,7 @@
 - 文本模型：GLM-5.2（阿里百炼）
 - 视觉模型：agnes（`agnes-2.0-flash`）
 - 重点：安装/启动、Code Agent 工程能力、工具与命令行、Computer Use、Browser Use
+- 改进 PR：[#37](https://github.com/coolzhulike/coolzhuagent/pull/37)
 
 本文不记录 API Key、Token 或凭据后缀。
 
