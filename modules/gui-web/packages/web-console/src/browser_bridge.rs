@@ -2023,14 +2023,14 @@ mod tests {
     fn browser_self_test_request_accepts_bounded_lifecycle_url() {
         let request: BrowserBridgeSelfTestRequest = serde_json::from_value(json!({
             "kind": "tab_lifecycle",
-            "url": "http://127.0.0.1:8877/tests/fixtures/computer-use-browser.html"
+            "url": "http://127.0.0.1:8765/tests/fixtures/computer-use-browser.html"
         }))
         .unwrap();
 
         assert_eq!(request.kind.as_deref(), Some("tab_lifecycle"));
         assert_eq!(
             request.url.as_deref(),
-            Some("http://127.0.0.1:8877/tests/fixtures/computer-use-browser.html")
+            Some("http://127.0.0.1:8765/tests/fixtures/computer-use-browser.html")
         );
     }
 
@@ -2038,13 +2038,13 @@ mod tests {
     fn browser_enter_self_test_selects_explicit_owned_page_url() {
         let request: BrowserBridgeSelfTestRequest = serde_json::from_value(json!({
             "kind": "enter",
-            "url": "http://127.0.0.1:8877/tests/fixtures/computer-use-browser.html"
+            "url": "http://127.0.0.1:8765/tests/fixtures/computer-use-browser.html"
         }))
         .unwrap();
 
         assert_eq!(
             browser_self_test_target_url(&request, "enter"),
-            Some("http://127.0.0.1:8877/tests/fixtures/computer-use-browser.html")
+            Some("http://127.0.0.1:8765/tests/fixtures/computer-use-browser.html")
         );
     }
 

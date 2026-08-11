@@ -893,7 +893,10 @@ fn app() -> Router {
             get(api_agent_diagnostics),
         )
         .route("/api/diagnostics/health", get(api_diagnostics_health))
-        .route("/api/diagnostics/functional", get(api_diagnostics_functional))
+        .route(
+            "/api/diagnostics/functional",
+            get(api_diagnostics_functional),
+        )
         .route("/api/diagnostics/stream", get(api_diagnostics_stream))
         .route("/api/pet/state", get(api_pet_state))
         .route("/api/pet/event", post(api_pet_event))
@@ -15392,6 +15395,7 @@ async fn api_chat_send_stream(
                     &result.image_urls,
                     &result.context_history,
                     result.context_rosters.get(&agent.id),
+                    Some(&result.chat_room_id),
                 )
                 .await {
                     Ok((mut model_stream, assembly)) => {
@@ -15730,11 +15734,12 @@ async fn api_chat_send_stream(
                 let mut loop_repeat: u32 = 0;
                 let mut round_no: u32 = 2;
                 loop {
-                    let request = agent_message_request_with_context_messages(
+                    let request = agent_message_request_with_context_messages_for_room(
                         agent,
                         false,
                         &loop_system_prompt,
                         loop_messages.clone(),
+                        Some(&result.chat_room_id),
                     );
                     let response = match provider_client_for_agent(agent) {
                         Ok(client) => match client.send_message(&request).await {
@@ -16272,8 +16277,15 @@ async fn api_diagnostics_functional() -> Json<FunctionalDiagnosticsResponse> {
     add(
         "functional.tools",
         "工具目录",
-        if catalog.summary.items > 0 { "ok" } else { "warn" },
-        format!("{} 类 / {} 项，当前可执行 {} 项", catalog.summary.categories, catalog.summary.items, catalog.summary.executable_now),
+        if catalog.summary.items > 0 {
+            "ok"
+        } else {
+            "warn"
+        },
+        format!(
+            "{} 类 / {} 项，当前可执行 {} 项",
+            catalog.summary.categories, catalog.summary.items, catalog.summary.executable_now
+        ),
         None,
     );
     let active_room_id = session_store()
@@ -16301,12 +16313,19 @@ async fn api_diagnostics_functional() -> Json<FunctionalDiagnosticsResponse> {
         Some("运行流式自检并在发送中点击停止，确认原因可见且不递归重试"),
     );
     let browser_health = browser_bridge::health();
-    let browser_status = if browser_health.connected { "ok" } else { "error" };
+    let browser_status = if browser_health.connected {
+        "ok"
+    } else {
+        "error"
+    };
     add(
         "functional.browser",
         "浏览器桥接",
         browser_status,
-        format!("connected={} setup_required={} nonce_file={}；真实网页操作仍需聊天室授权/用户审批", browser_health.connected, browser_health.setup_required, browser_health.nonce_file),
+        format!(
+            "connected={} setup_required={} nonce_file={}；真实网页操作仍需聊天室授权/用户审批",
+            browser_health.connected, browser_health.setup_required, browser_health.nonce_file
+        ),
         Some("安装并连接浏览器扩展/native host，或在聊天室诊断设置中保持 computer-use 关闭"),
     );
     let summary = DiagnosticsSummary {
@@ -16319,7 +16338,8 @@ async fn api_diagnostics_functional() -> Json<FunctionalDiagnosticsResponse> {
         generated_at: unix_timestamp_millis(),
         summary,
         checks,
-        note: "自检是只读、可重复、无外部副作用的本地检查；模型/STT/TTS/桌面输入需单独人工验收。".to_string(),
+        note: "自检是只读、可重复、无外部副作用的本地检查；模型/STT/TTS/桌面输入需单独人工验收。"
+            .to_string(),
     })
 }
 
@@ -17253,7 +17273,9 @@ fn prepare_chat_dispatch(payload: SendMessageRequest) -> ApiResult<PreparedChatD
         chat_room_capabilities_sqlite(&default_session_sqlite_path(), &chat_room_id)
     {
         // 聊天室开关是全局能力的进一步收紧，不会绕过全局关闭或审批闸门。
-        calls_tool = calls_tool && room_tools && (semantic_action.as_deref() != Some("computer_use") || room_computer_use);
+        calls_tool = calls_tool
+            && room_tools
+            && (semantic_action.as_deref() != Some("computer_use") || room_computer_use);
     }
     let (selected_history, context_history, context_rosters, active_vision_session_id) = {
         let store = session_store()
@@ -22155,6 +22177,9 @@ fn embedded_static_file(relative: &Path) -> Option<&'static [u8]> {
         "src/realtime_voice_capture.js" => Some(include_bytes!("realtime_voice_capture.js")),
         "src/realtime_audio_output.js" => Some(include_bytes!("realtime_audio_output.js")),
         "src/stt_tail_capture.js" => Some(include_bytes!("stt_tail_capture.js")),
+        "tests/fixtures/computer-use-browser.html" => Some(include_bytes!(
+            "../tests/fixtures/computer-use-browser.html"
+        )),
         _ => None,
     }
 }
@@ -22934,11 +22959,15 @@ async fn agent_chat_response(
     chat_room_id: Option<&str>,
 ) -> AgentModelResponse {
     let room_real_llm = chat_room_id
-        .and_then(|room_id| chat_room_capabilities_sqlite(&default_session_sqlite_path(), room_id).ok())
+        .and_then(|room_id| {
+            chat_room_capabilities_sqlite(&default_session_sqlite_path(), room_id).ok()
+        })
         .map(|(room_real_llm, _, _)| room_real_llm)
         .unwrap_or(true);
     let room_llm_tools = chat_room_id
-        .and_then(|room_id| chat_room_capabilities_sqlite(&default_session_sqlite_path(), room_id).ok())
+        .and_then(|room_id| {
+            chat_room_capabilities_sqlite(&default_session_sqlite_path(), room_id).ok()
+        })
         .map(|(_, room_llm_tools, _)| room_llm_tools)
         .unwrap_or(true);
     let use_real_llm = real_llm_enabled() && room_real_llm;
@@ -23498,14 +23527,15 @@ async fn call_agent_model_with_tool_loop(
     let mut terminal_supervisor_answer: Option<String> = None;
     for round in 0..=max_tool_feedback_rounds {
         let request = if let Some(ref msgs) = history {
-            agent_message_request_with_context_messages(
+            agent_message_request_with_context_messages_for_room(
                 agent,
                 false,
                 &assembly.system_prompt,
                 msgs.clone(),
+                chat_room_id,
             )
         } else {
-            agent_message_request_with_context(agent, false, &assembly)
+            agent_message_request_with_context_for_room(agent, false, &assembly, chat_room_id)
         };
         let response = provider_client_for_agent(agent)?
             .send_message(&request)
@@ -26966,6 +26996,7 @@ async fn stream_agent_model(
     image_urls: &[String],
     context_history: &[PersistedChatMessage],
     collaboration_roster: Option<&ChatRosterResponse>,
+    chat_room_id: Option<&str>,
 ) -> Result<(api::MessageStream, ContextAssembly), api::ApiError> {
     let assembly = build_context_assembly_with_roster(
         agent,
@@ -26975,7 +27006,7 @@ async fn stream_agent_model(
         context_build_options_for_agent(agent),
         collaboration_roster,
     );
-    let request = agent_message_request_with_context(agent, true, &assembly);
+    let request = agent_message_request_with_context_for_room(agent, true, &assembly, chat_room_id);
     let stream = provider_client_for_agent(agent)?
         .stream_message(&request)
         .await?;
@@ -27703,11 +27734,21 @@ fn agent_message_request_with_context(
     stream: bool,
     assembly: &ContextAssembly,
 ) -> MessageRequest {
-    agent_message_request_with_context_messages(
+    agent_message_request_with_context_for_room(agent, stream, assembly, None)
+}
+
+fn agent_message_request_with_context_for_room(
+    agent: &AgentSessionDto,
+    stream: bool,
+    assembly: &ContextAssembly,
+    chat_room_id: Option<&str>,
+) -> MessageRequest {
+    agent_message_request_with_context_messages_for_room(
         agent,
         stream,
         &assembly.system_prompt,
         assembly.messages.clone(),
+        chat_room_id,
     )
 }
 
@@ -27717,7 +27758,23 @@ fn agent_message_request_with_context_messages(
     system_prompt: &str,
     messages: Vec<InputMessage>,
 ) -> MessageRequest {
-    let tools = llm_tool_definitions();
+    agent_message_request_with_context_messages_for_room(
+        agent,
+        stream,
+        system_prompt,
+        messages,
+        None,
+    )
+}
+
+fn agent_message_request_with_context_messages_for_room(
+    agent: &AgentSessionDto,
+    stream: bool,
+    system_prompt: &str,
+    messages: Vec<InputMessage>,
+    chat_room_id: Option<&str>,
+) -> MessageRequest {
+    let tools = llm_tool_definitions_for_room(chat_room_id);
     agent_message_request_build_with_system(
         agent,
         messages,
@@ -27815,10 +27872,44 @@ fn text_mentions_computer_use_entry(lower: &str) -> bool {
         || lower.contains("computer-use.perform")
 }
 
+/// 显式否定 computer-use 入口时不能仅因出现工具名就强制 tool_choice。
+/// 去掉空白后匹配，兼容中英文提示及三种历史工具名写法。
+fn text_negates_computer_use_entry(lower: &str) -> bool {
+    let compact = lower.split_whitespace().collect::<String>();
+    const NEGATED_PREFIXES: &[&str] = &[
+        "donotuse",
+        "don'tuse",
+        "mustnotuse",
+        "neveruse",
+        "withoutusing",
+        "avoidusing",
+        "不要使用",
+        "不要调用",
+        "禁止使用",
+        "禁止调用",
+        "不能使用",
+        "不能调用",
+        "不应使用",
+        "不应调用",
+        "无需使用",
+        "无需调用",
+    ];
+    const ENTRIES: &[&str] = &[
+        COMPUTER_USE_TOOL_NAME,
+        "computer_use.perform",
+        "computer-use.perform",
+    ];
+    NEGATED_PREFIXES.iter().any(|prefix| {
+        ENTRIES
+            .iter()
+            .any(|entry| compact.contains(&format!("{prefix}{entry}")))
+    })
+}
+
 fn text_has_computer_use_intent(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     if text_mentions_computer_use_entry(&lower) {
-        return true;
+        return !text_negates_computer_use_entry(&lower);
     }
     vision_request_has_action_intent(&lower)
         && contains_any(
@@ -28194,6 +28285,22 @@ mod intent_gate_tests {
     }
 
     #[test]
+    fn negated_computer_use_entry_does_not_force_task_tool() {
+        for text in [
+            "Do not use computer_use_perform for shell commands or file editing.",
+            "不要使用 computer_use.perform 执行命令",
+            "禁止调用 computer-use.perform 修改文件",
+        ] {
+            let messages = vec![user(text)];
+            assert!(!messages_have_computer_use_intent(&messages), "{text}");
+            assert!(
+                formal_computer_use_tool_request_from_intent(text).is_none(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn tool_feedback_round_does_not_force_a_new_computer_use_call() {
         let msgs = vec![
             user("请在浏览器里点击设置按钮"),
@@ -28399,12 +28506,44 @@ fn llm_tool_exposure_mode() -> &'static str {
 ///
 /// 选取原则：只"`PermissionMode::ReadOnly` 工具，保证暴露给 LLM 的工具都能实际执。
 /// （C-11 "runtime 后），避"暴露了但 executor "handle"的一致"gap。
-fn default_llm_tool_allowlist() -> std::collections::BTreeSet<&'static str> {
+fn llm_tool_allowlist_for_permission(
+    granted_permission: PermissionMode,
+) -> std::collections::BTreeSet<&'static str> {
     tools::mvp_tool_specs()
         .into_iter()
-        .filter(|spec| matches!(spec.required_permission, PermissionMode::ReadOnly))
+        .filter(|spec| match granted_permission {
+            PermissionMode::ReadOnly | PermissionMode::Prompt => {
+                matches!(spec.required_permission, PermissionMode::ReadOnly)
+            }
+            PermissionMode::WorkspaceWrite => matches!(
+                spec.required_permission,
+                PermissionMode::ReadOnly | PermissionMode::WorkspaceWrite
+            ),
+            PermissionMode::DangerFullAccess | PermissionMode::Allow => true,
+        })
         .map(|spec| spec.name)
         .collect()
+}
+
+fn default_llm_tool_allowlist() -> std::collections::BTreeSet<&'static str> {
+    llm_tool_allowlist_for_permission(PermissionMode::ReadOnly)
+}
+
+fn llm_tool_permission_for_room(chat_room_id: Option<&str>) -> PermissionMode {
+    let Some(room_id) = chat_room_id else {
+        return PermissionMode::ReadOnly;
+    };
+    match chat_room_permission_profile_sqlite(&default_session_sqlite_path(), room_id) {
+        Ok(profile) if profile == ROOM_PERMISSION_FULL_ACCESS => PermissionMode::DangerFullAccess,
+        Ok(profile) if profile == ROOM_PERMISSION_WORKSPACE_WRITE => PermissionMode::WorkspaceWrite,
+        Ok(_) => PermissionMode::ReadOnly,
+        Err(error) => {
+            diag!(
+                "[TOOL-REG] failed to resolve room permission room={room_id}: {error}; using read-only exposure"
+            );
+            PermissionMode::ReadOnly
+        }
+    }
 }
 
 /// Phase C-10：为 registry 工具"LLM description 中追加权限提示。
@@ -28459,7 +28598,7 @@ fn computer_use_tool_definition() -> ToolDefinition {
         // 会让 DeepSeek / 百炼等直接 400 拒绝整个请求，退化成本地回退文案。
         name: COMPUTER_USE_TOOL_NAME.to_string(),
         description: Some(
-            "Complete one user-authorized desktop or browser task. Describe the goal and observable success criteria; the runtime owns observation, planning, bounded input, and verification."
+            "Complete one user-authorized desktop or browser UI task. Do not use this tool for shell commands, code execution, or file editing. Describe the goal and observable success criteria; the runtime owns observation, planning, bounded input, and verification."
                 .to_string(),
         ),
         input_schema: json!({
@@ -28556,6 +28695,16 @@ fn chat_handoff_tool_definition() -> ToolDefinition {
 }
 
 fn llm_tool_definitions() -> Option<Vec<ToolDefinition>> {
+    llm_tool_definitions_for_permission(PermissionMode::ReadOnly)
+}
+
+fn llm_tool_definitions_for_room(chat_room_id: Option<&str>) -> Option<Vec<ToolDefinition>> {
+    llm_tool_definitions_for_permission(llm_tool_permission_for_room(chat_room_id))
+}
+
+fn llm_tool_definitions_for_permission(
+    granted_permission: PermissionMode,
+) -> Option<Vec<ToolDefinition>> {
     if !llm_tools_enabled() {
         diag!(
             "[LLM-TOOLS] definitions disabled dev_open={} config_enable={}",
@@ -28581,7 +28730,11 @@ fn llm_tool_definitions() -> Option<Vec<ToolDefinition>> {
 
     defs.push(chat_handoff_tool_definition());
 
-    let allowlist = default_llm_tool_allowlist();
+    let allowlist = if matches!(granted_permission, PermissionMode::ReadOnly) {
+        default_llm_tool_allowlist()
+    } else {
+        llm_tool_allowlist_for_permission(granted_permission)
+    };
     for spec in tools::mvp_tool_specs() {
         // ToolSearch 是「发现工具」元工具：工具已直接暴露给模型，它在此纯属冗余，
         // 却常被弱模型（如 agnes flash）对纯问答类消息反射性误调。统一不暴露给 LLM。
@@ -28598,9 +28751,10 @@ fn llm_tool_definitions() -> Option<Vec<ToolDefinition>> {
         });
     }
     diag!(
-        "[TOOL-REG] exposed {} tools (mode={}, dev_open={}): {}",
+        "[TOOL-REG] exposed {} tools (mode={}, room_permission={}, dev_open={}): {}",
         defs.len(),
         mode,
+        granted_permission.as_str(),
         dev_open_tool_permissions_enabled(),
         tool_definition_names(&defs)
     );
@@ -34886,9 +35040,24 @@ fn apply_session_migration_v16(connection: &Connection) -> rusqlite::Result<()> 
         );
         "#,
     )?;
-    ensure_table_column(connection, "chat_room_diagnostics", "real_llm_enabled", "INTEGER NOT NULL DEFAULT 1")?;
-    ensure_table_column(connection, "chat_room_diagnostics", "llm_tools_enabled", "INTEGER NOT NULL DEFAULT 1")?;
-    ensure_table_column(connection, "chat_room_diagnostics", "computer_use_enabled", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_table_column(
+        connection,
+        "chat_room_diagnostics",
+        "real_llm_enabled",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_table_column(
+        connection,
+        "chat_room_diagnostics",
+        "llm_tools_enabled",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_table_column(
+        connection,
+        "chat_room_diagnostics",
+        "computer_use_enabled",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
     // 保持现有 user_version=15 契约，避免旧版迁移测试/第三方库把未知版本视为不兼容。
     // 表本身使用 IF NOT EXISTS，随每次 schema 初始化安全补齐。
     Ok(())
@@ -35017,15 +35186,24 @@ fn set_chat_room_diagnostics_sqlite(
          computer_use_enabled = COALESCE(?4, computer_use_enabled) WHERE room_id = ?1",
         params![
             room_id,
-            update.real_llm_enabled.map(|value| if value { 1 } else { 0 }),
-            update.llm_tools_enabled.map(|value| if value { 1 } else { 0 }),
-            update.computer_use_enabled.map(|value| if value { 1 } else { 0 }),
+            update
+                .real_llm_enabled
+                .map(|value| if value { 1 } else { 0 }),
+            update
+                .llm_tools_enabled
+                .map(|value| if value { 1 } else { 0 }),
+            update
+                .computer_use_enabled
+                .map(|value| if value { 1 } else { 0 }),
         ],
     )?;
     Ok(())
 }
 
-fn chat_room_capabilities_sqlite(path: &Path, room_id: &str) -> rusqlite::Result<(bool, bool, bool)> {
+fn chat_room_capabilities_sqlite(
+    path: &Path,
+    room_id: &str,
+) -> rusqlite::Result<(bool, bool, bool)> {
     let connection = open_session_connection(path)?;
     initialize_session_schema(&connection)?;
     connection
@@ -45797,7 +45975,7 @@ async fn api_realtime_model_stream_probe(
         )));
     }
 
-    let stream_result = stream_agent_model(&agent, &prompt, &[], &[], None).await;
+    let stream_result = stream_agent_model(&agent, &prompt, &[], &[], None, None).await;
     let Ok((mut model_stream, _assembly)) = stream_result else {
         return Ok(Json(error_response(format!(
             "Model stream probe failed to start: {}",
@@ -47714,6 +47892,7 @@ mod tests {
             "src/realtime_voice_capture.js",
             "src/realtime_audio_output.js",
             "src/stt_tail_capture.js",
+            "tests/fixtures/computer-use-browser.html",
         ] {
             let content = super::embedded_static_file(Path::new(path))
                 .unwrap_or_else(|| panic!("missing embedded static file: {path}"));
@@ -58722,6 +58901,60 @@ attach: last_assistant
     }
 
     #[test]
+    fn llm_tool_definitions_whitelist_follows_room_permission_scope() {
+        use super::{ConfigModel, WorkspaceConfig};
+        let _guard = config_test_guard();
+        let patched = WorkspaceConfig {
+            model: ConfigModel {
+                enable_llm_tools: true,
+                llm_tool_exposure: None,
+                ..ConfigModel::default()
+            },
+            ..WorkspaceConfig::default()
+        };
+        let prev = {
+            let mut guard = super::workspace_config().lock().expect("lock");
+            std::mem::replace(&mut *guard, patched)
+        };
+
+        let workspace_defs =
+            super::llm_tool_definitions_for_permission(super::PermissionMode::WorkspaceWrite)
+                .expect("workspace-write tools");
+        let workspace_names = workspace_defs
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(workspace_names.contains(&"read_file"));
+        assert!(workspace_names.contains(&"write_file"));
+        assert!(workspace_names.contains(&"edit_file"));
+        assert!(!workspace_names.contains(&"PowerShell"));
+        assert!(!workspace_names.contains(&"bash"));
+
+        let full_access_defs =
+            super::llm_tool_definitions_for_permission(super::PermissionMode::DangerFullAccess)
+                .expect("full-access tools");
+        let full_access_names = full_access_defs
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(full_access_names.contains(&"write_file"));
+        assert!(full_access_names.contains(&"PowerShell"));
+        assert!(full_access_names.contains(&"bash"));
+
+        let computer_use = workspace_defs
+            .iter()
+            .find(|definition| definition.name == super::COMPUTER_USE_TOOL_NAME)
+            .expect("computer use tool");
+        assert!(computer_use
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Do not use this tool for shell commands"));
+
+        let _ = std::mem::replace(&mut *super::workspace_config().lock().expect("lock"), prev);
+    }
+
+    #[test]
     fn llm_tool_definitions_dev_open_defaults_to_all_registry() {
         use super::{ConfigModel, ConfigTool, WorkspaceConfig};
         let _guard = config_test_guard();
@@ -60164,14 +60397,17 @@ attach: last_assistant
             },
         )
         .expect("persist preferences");
-        let saved = super::chat_room_diagnostics_record_sqlite(&db_path, "room-diag")
-            .expect("read saved");
+        let saved =
+            super::chat_room_diagnostics_record_sqlite(&db_path, "room-diag").expect("read saved");
         assert_eq!(saved.0, false);
         assert_eq!(saved.1, true);
         assert_eq!(saved.2, false);
         assert_eq!(saved.3, true);
         assert!(saved.4.is_some());
-        assert_eq!(super::chat_room_capabilities_sqlite(&db_path, "room-diag").expect("read capabilities"), (false, true, false));
+        assert_eq!(
+            super::chat_room_capabilities_sqlite(&db_path, "room-diag").expect("read capabilities"),
+            (false, true, false)
+        );
     }
 
     #[test]
@@ -62299,7 +62535,9 @@ attach: last_assistant
         }
 
         fn source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-            let start_index = source.find(start).unwrap_or_else(|| panic!("missing {start}"));
+            let start_index = source
+                .find(start)
+                .unwrap_or_else(|| panic!("missing {start}"));
             let tail = &source[start_index..];
             let end_index = tail.find(end).unwrap_or_else(|| panic!("missing {end}"));
             &tail[..end_index]
@@ -62329,7 +62567,11 @@ attach: last_assistant
             "]);\n// 仅保留源码资源目录中真实存在",
         );
         let alias_values = quoted_values(alias_section);
-        assert_eq!(alias_values.len() % 2, 0, "icon alias entries must be pairs");
+        assert_eq!(
+            alias_values.len() % 2,
+            0,
+            "icon alias entries must be pairs"
+        );
         let aliases: std::collections::BTreeMap<String, String> = alias_values
             .chunks_exact(2)
             .map(|pair| (pair[0].clone(), pair[1].clone()))
@@ -63515,7 +63757,7 @@ attach: last_assistant
     fn stream_model_tool_loop_reuses_full_context_assembly() {
         assert!(WEB_MAIN_RS.contains("(assembly.messages.clone(), assembly.system_prompt.clone())"));
         assert!(WEB_MAIN_RS.contains(
-            "agent_message_request_with_context_messages(\n                        agent,\n                        false,\n                        &loop_system_prompt,"
+            "agent_message_request_with_context_messages_for_room(\n                        agent,\n                        false,\n                        &loop_system_prompt,"
         ));
         assert!(!WEB_MAIN_RS.contains(
             "let round_messages = vec![\n                    InputMessage::user_text(result.user_content.clone())"
@@ -64061,6 +64303,8 @@ attach: last_assistant
         assert!(WEB_INDEX_HTML.contains("data-action=\"browser-bridge-probe\""));
         assert!(WEB_INDEX_HTML.contains("data-action=\"browser-bridge-self-test\""));
         assert!(WEB_APP_JS.contains("/api/computer-use/browser/self-test"));
+        assert!(WEB_APP_JS.contains("function initializeBrowserBridgeTargetUrl"));
+        assert!(WEB_APP_JS.contains("/tests/fixtures/computer-use-browser.html"));
         assert!(WEB_APP_JS.contains("browserWindowUpdateNavigationControls"));
         assert!(WEB_APP_JS.contains("系统默认浏览器由外部进程管理"));
         assert!(WEB_INDEX_HTML.contains("data-action=\"safe-context-menu-test\""));

@@ -177,6 +177,7 @@ document.addEventListener("DOMContentLoaded", () => {
   initializeWorkbenchWindows();
   initializeBridgeVisualEffects();
   initClawbotSegments();
+  initializeBrowserBridgeTargetUrl();
 
   actionButtons.get("capture")?.addEventListener("click", captureDesktop);
   actionButtons.get("stability-run")?.addEventListener("click", runStability);
@@ -8071,6 +8072,13 @@ function setBrowserBridgeOutput(value, { error = false } = {}) {
   }
   output.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
   output.classList.toggle("is-error", error);
+}
+
+function initializeBrowserBridgeTargetUrl() {
+  const input = document.querySelector('[data-role="browser-bridge-target-url"]');
+  if (input && !input.value.trim()) {
+    input.value = new URL("/tests/fixtures/computer-use-browser.html", window.location.origin).href;
+  }
 }
 
 async function runBrowserBridgeDiagnostic(action, button) {
