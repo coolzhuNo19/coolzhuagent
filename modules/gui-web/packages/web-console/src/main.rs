@@ -15150,19 +15150,22 @@ async fn api_chat_send(
         if let Some(task) = context_lifecycle_task(agent, &task_id, &context_lifecycle) {
             tasks.push(task);
         }
+        let semantic_tool_side_route = should_run_semantic_tool_side_route(
+            result.calls_vision,
+            result.calls_tool,
+            &result.user_content,
+        );
         append_semantic_tool_tasks(
             &mut tasks,
             agent,
             &task_id,
             result.calls_vision,
-            result.calls_tool,
+            result.calls_tool && semantic_tool_side_route,
         );
 
         // 纯视觉理解（看 / 描述屏幕，无明确 GUI 操作意图）不执行 computer-use 动作，
         // 交给多模态会话看图理解；仅"视觉 + 动作意图"或工具意图才进 run_tool_intent_message。
-        let vision_action_intent =
-            result.calls_vision && vision_request_has_action_intent(&result.user_content);
-        if (vision_action_intent || result.calls_tool)
+        if semantic_tool_side_route
             && !model_tool_write_executed
             && !has_pending_model_tool_requests
             && !formal_computer_use_intent
@@ -15986,9 +15989,12 @@ async fn api_chat_send_stream(
                 }
             }
             // 同上：纯视觉理解不触发 computer-use 动作，仅视觉动作意图 / 工具意图才执行。
-            let vision_action_intent =
-                result.calls_vision && vision_request_has_action_intent(&result.user_content);
-            if (vision_action_intent || result.calls_tool)
+            let semantic_tool_side_route = should_run_semantic_tool_side_route(
+                result.calls_vision,
+                result.calls_tool,
+                &result.user_content,
+            );
+            if semantic_tool_side_route
                 && !streamed_tool_write_executed
                 && !has_pending_stream_model_tool_calls
                 && !formal_computer_use_intent
@@ -16111,7 +16117,7 @@ async fn api_chat_send_stream(
                 agent,
                 &task_id,
                 result.calls_vision,
-                result.calls_tool,
+                result.calls_tool && semantic_tool_side_route,
             );
         }
 
@@ -27872,6 +27878,43 @@ fn text_mentions_computer_use_entry(lower: &str) -> bool {
         || lower.contains("computer-use.perform")
 }
 
+/// 用户明确要求整轮不使用任何工具时，动作词只能作为待描述内容，而不能重新开启工具。
+/// 例如视觉报告字段里的 `selected option` / `drag labels` 不应覆盖 `Do not use tools`。
+fn text_explicitly_disables_all_tools(text: &str) -> bool {
+    let compact = text
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<String>();
+    [
+        "donotusetools",
+        "donotuseanytools",
+        "don'tusetools",
+        "don'tuseanytools",
+        "mustnotusetools",
+        "mustnotuseanytools",
+        "withoutusingtools",
+        "withoutusinganytools",
+        "withouttools",
+        "withoutanytools",
+        "禁止使用工具",
+        "禁止使用任何工具",
+        "禁止调用工具",
+        "禁止调用任何工具",
+        "不要使用工具",
+        "不要使用任何工具",
+        "不要调用工具",
+        "不要调用任何工具",
+        "不能使用工具",
+        "不能使用任何工具",
+        "不能调用工具",
+        "不能调用任何工具",
+        "无需使用工具",
+        "无需调用工具",
+    ]
+    .iter()
+    .any(|phrase| compact.contains(phrase))
+}
+
 /// 显式否定 computer-use 入口时不能仅因出现工具名就强制 tool_choice。
 /// 去掉空白后匹配，兼容中英文提示及三种历史工具名写法。
 fn text_negates_computer_use_entry(lower: &str) -> bool {
@@ -27907,6 +27950,9 @@ fn text_negates_computer_use_entry(lower: &str) -> bool {
 }
 
 fn text_has_computer_use_intent(text: &str) -> bool {
+    if text_explicitly_disables_all_tools(text) {
+        return false;
+    }
     let lower = text.to_ascii_lowercase();
     if text_mentions_computer_use_entry(&lower) {
         return !text_negates_computer_use_entry(&lower);
@@ -28081,6 +28127,9 @@ fn first_http_url(text: &str) -> Option<String> {
 /// （创建 / 生成 / 部署 / 搜索 / 运行…）与中英文常见说法，避免误伤真实任务；
 /// 仅当文本完全不含这些动作信号时，才视为纯问答而关闭工具暴露。
 fn text_has_tool_action_intent(text: &str) -> bool {
+    if text_explicitly_disables_all_tools(text) {
+        return false;
+    }
     let mut t = text.to_ascii_lowercase();
     // 否定式约束不是工具意图。先移除常见的“禁止某动作”短语，再检查文本里是否还有其它真实动作。
     // 例如“不可以搜索网络，依靠自己的知识解答”不能因为包含“搜索”而暴露 20 个工具 schema。
@@ -28298,6 +28347,26 @@ mod intent_gate_tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_no_tools_vision_report_does_not_enable_or_force_computer_use() {
+        let prompt = "Vision regression using only the attached screenshot. Report the selected option and drag/drop labels. Do not use any tools.";
+        let messages = vec![user(prompt)];
+
+        assert!(!text_has_tool_action_intent(prompt));
+        assert!(text_explicitly_disables_all_tools(
+            "不要使用任何工具，只描述截图。"
+        ));
+        assert!(!messages_have_tool_intent(&messages));
+        assert!(!messages_have_computer_use_intent(&messages));
+        assert!(formal_computer_use_tool_request_from_intent(prompt).is_none());
+        assert!(!should_run_semantic_tool_side_route(true, true, prompt));
+        assert!(should_run_semantic_tool_side_route(
+            true,
+            false,
+            "Click the button in the screenshot"
+        ));
     }
 
     #[test]
@@ -41274,6 +41343,11 @@ fn vision_request_has_action_intent(text: &str) -> bool {
             "operate",
         ],
     )
+}
+
+fn should_run_semantic_tool_side_route(calls_vision: bool, calls_tool: bool, text: &str) -> bool {
+    !text_explicitly_disables_all_tools(text)
+        && (calls_tool || (calls_vision && vision_request_has_action_intent(text)))
 }
 
 fn should_route_to_vision_agent(text: &str) -> bool {

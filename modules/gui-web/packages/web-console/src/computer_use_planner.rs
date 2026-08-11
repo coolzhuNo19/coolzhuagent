@@ -1054,6 +1054,14 @@ fn extract_requested_text_input_from_request(request: &ComputerUseRequest) -> Op
     for criterion in &request.success_criteria {
         sources.push(criterion.as_str());
     }
+    // Success criteria often carry the exact observable marker while the objective wraps it in
+    // prose such as "Type the exact text ... into Notepad". Prefer that bounded marker before
+    // the broad `type ` parser, otherwise the whole instruction tail is typed into the control.
+    for criterion in &request.success_criteria {
+        if let Some(text) = extract_bounded_marker_token(criterion) {
+            return Some(text);
+        }
+    }
     for source in &sources {
         if let Some(text) = extract_requested_text_input(source) {
             return Some(text);
@@ -1646,6 +1654,44 @@ mod tests {
         assert_eq!(action.kind, ComputerUseActionKind::TextInput);
         assert_eq!(action.target, "uia-edit-1");
         assert_eq!(action.arguments["text"], "COOLZHU-DESKTOP-E2E-38f93bb9f9a9");
+    }
+
+    #[test]
+    fn deterministic_desktop_text_input_prefers_exact_success_marker_over_objective_prose() {
+        let request: ComputerUseRequest = serde_json::from_value(json!({
+            "objective": "Type the exact text COOLZHU-CU-E2E-20260812 into the currently open Untitled Notepad editor's blank text area.",
+            "surface": "desktop",
+            "success_criteria": [
+                "the exact marker COOLZHU-CU-E2E-20260812 is visibly present in the Untitled Notepad editor"
+            ]
+        }))
+        .unwrap();
+        let observation = Observation {
+            generation: 1,
+            surface: ComputerUseSurface::Desktop,
+            surface_identity: "desktop:test".to_string(),
+            state: json!({
+                "desktop": {
+                    "elements": [
+                        {
+                            "reference": "uia-edit-1",
+                            "control_type": "Document",
+                            "enabled": true,
+                            "offscreen": false,
+                            "rect": [10, 20, 300, 80]
+                        }
+                    ]
+                }
+            }),
+            evidence: vec!["uia_snapshot:test".to_string()],
+        };
+
+        let action = deterministic_desktop_text_input_action(&request, &observation)
+            .expect("deterministic text input action");
+
+        assert_eq!(action.kind, ComputerUseActionKind::TextInput);
+        assert_eq!(action.target, "uia-edit-1");
+        assert_eq!(action.arguments["text"], "COOLZHU-CU-E2E-20260812");
     }
 
     #[test]
