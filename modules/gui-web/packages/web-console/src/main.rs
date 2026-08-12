@@ -61877,6 +61877,19 @@ attach: last_assistant
     }
 
     #[test]
+    fn web_frontend_high_dpi_short_viewport_keeps_primary_controls_reachable() {
+        assert!(WEB_STYLES_CSS.contains("@media (max-height: 760px)"));
+        assert!(WEB_STYLES_CSS.contains("--workbench-top: 11%;"));
+        assert!(WEB_STYLES_CSS.contains("--dock-width: 62px;"));
+        assert!(WEB_STYLES_CSS.contains(".ide-toolbar {\n  flex-wrap: wrap;"));
+        assert!(WEB_STYLES_CSS.contains(".ide-toolbar .ide-omni-search"));
+        assert!(
+            WEB_STYLES_CSS.contains("@media (max-width: 1200px) {\n  body.ui-3d .settings-layout")
+        );
+        assert!(WEB_STYLES_CSS.contains("body.ui-3d .settings-layout > .audio-settings"));
+    }
+
+    #[test]
     fn web_frontend_phase3_settings_slimmed_and_diagnostics_relocated() {
         // S1：探活按钮迁入模块自检列的「语音诊断」折叠卡。
         assert!(WEB_INDEX_HTML.contains("module-selfcheck-voice-diagnostic"));

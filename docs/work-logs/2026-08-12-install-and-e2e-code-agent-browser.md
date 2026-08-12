@@ -176,6 +176,44 @@ Health 返回：
 - `explicit_no_tools_vision_report_does_not_enable_or_force_computer_use`：PASS，并完成 agnes 附件回归。
 - 最新 GNU debug binary 构建 PASS；健康检查 8 ok / 3 warn / 0 error。warn 为本机视觉 capture、桌宠路径与 WebView2 探测提示，不影响本轮 API/外壳启动。
 
+## 高 DPI / 短工作区界面排查与修复
+
+当前设备的系统桌面缩放为 250%（`AppliedDPI=240`），物理分辨率约为 3200×1800，但应用可使用的逻辑工作区只有 1280×672。排查结论：
+
+- Tauri 控制台窗口原先固定为 1440×900，最小尺寸为 1180×760，并固定放在 `(48, 48)`；最小高度已经比逻辑工作区高 88px，是窗口底部超出屏幕的直接根因。
+- 外部浏览器窗口同样使用固定尺寸与位置，没有按显示器工作区限幅。
+- Web Console 没有短高度断点；工程栏 `.ide-toolbar` 禁止换行，而父容器隐藏溢出，导致窄侧栏内的按钮或搜索框会被实际裁切。
+- 设置页较早定义的两列降级规则被后续更高优先级的 `body.ui-3d .settings-layout` 三列规则覆盖。
+- 未发现 DOM `zoom`、全局 `scale` 或 `devicePixelRatio` 二次放大；DPR 只用于 WebGL canvas。聊天、任务、视觉和设置内部的部分滚动是显式设计，但在短工作区中过密。
+
+修复内容：
+
+- 控制台与外部浏览器窗口改为居中创建、降低合理最小尺寸，并使用 Tauri `prevent_overflow_with_margin` 在创建时按当前显示器工作区（扣除任务栏）限制尺寸。
+- 工程工具栏允许换行，搜索框占独立整行；设置页在 1200px 以下可靠降为两列，音频卡片跨两列。
+- 新增 760px 短高度断点，压缩 Dock、窗口标签、系统栏和视觉操作卡片的固定装饰占比。
+- 新增静态回归断言，防止关键短屏规则被后续样式覆盖。
+
+实际浏览器回归在 250% 缩放下得到 `innerWidth=1028`、`innerHeight=554`、`devicePixelRatio=1.5`：工程栏 9 个控件全部在 240px 侧栏边界内，工具栏 `scrollWidth == clientWidth`；设置页为两列、音频卡片跨整行，`body.scrollWidth == clientWidth` 且 `body.scrollHeight == clientHeight`。
+
+关联 issue：[#40](https://github.com/coolzhulike/coolzhuagent/issues/40)。
+
+## 安装器与应用图标设计稿
+
+使用内置 ImageGen 生成两套与 Web Console 深海军蓝、金黄、青蓝像素 HUD 风格一致的透明图标：
+
+- 安装器：大写 `CZ` + 向下部署到终端托盘的符号；
+- 安装后的应用：大写 `CZ` + 终端提示符与信号节点。
+
+两套 PNG 均为 1254×1254 RGBA，四角透明、未检出绿色色边；ICO 均包含 16/24/32/48/64/128/256px。32px 缩略图下仍可辨识 `CZ` 与两种用途。设计稿暂不替换生产 manifest/安装器引用，便于维护者确认后单独接入。完整提示词、去背参数和核验数据见 [`../../design-assets/coolzhu-icons-2026-08-12/README.md`](../../design-assets/coolzhu-icons-2026-08-12/README.md)。
+
+## 本轮新增验证与环境限制
+
+- Browser Extension 契约检查：6/6 PASS；Rust Browser Bridge 定向测试：18/18 PASS。
+- `cargo build -p coolzhu-web-console --target x86_64-pc-windows-gnu --target-dir target\\gnu-validation --offline -j1`：PASS，并以新 binary 重启服务。
+- 新增 CSS 规则在真实 250% 缩放浏览器中完成运行态验证。
+- Tauri 壳源码使用锁定依赖 Tauri 2.10.3 的本地源码和官方 API 签名复核；本机缺少 MSVC `link.exe`/Windows SDK，GNU host 构建又缺少 `dlltool.exe`，因此无法在本机完成 Tauri 链接与新增 Rust 测试 binary 的链接。该结果记录为验证环境限制，不判定为源码失败。
+- `git diff --check`：PASS。
+
 ## 尚待完成
 
 - 在 Edge/Chrome 扩展管理页加载仓库内 `modules/browser-extension`。扩展安装需在点击前即时确认。
