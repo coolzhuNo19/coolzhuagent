@@ -36,10 +36,10 @@
 
     <section class="drag-row" aria-label="拖拽测试">
       <div id="drag-source" class="drag-box" draggable="true">drag-me</div>
-      <div id="drop-target" class="drag-box">drop-here</div>
+      <div id="drop-target" class="drag-box" data-drop-target="true">drop-here</div>
     </section>
 
-    <output id="result" aria-live="polite">ready</output>
+    <output id="result" role="status" aria-live="polite">ready</output>
   </main>
   <script>
     const result = document.querySelector("#result");

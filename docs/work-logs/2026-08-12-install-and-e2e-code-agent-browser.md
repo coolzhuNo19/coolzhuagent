@@ -204,17 +204,42 @@ Health 返回：
 - 安装器：大写 `CZ` + 向下部署到终端托盘的符号；
 - 安装后的应用：大写 `CZ` + 终端提示符与信号节点。
 
-两套 PNG 均为 1254×1254 RGBA，四角透明、未检出绿色色边；ICO 均包含 16/24/32/48/64/128/256px。32px 缩略图下仍可辨识 `CZ` 与两种用途。设计稿暂不替换生产 manifest/安装器引用，便于维护者确认后单独接入。完整提示词、去背参数和核验数据见 [`../../design-assets/coolzhu-icons-2026-08-12/README.md`](../../design-assets/coolzhu-icons-2026-08-12/README.md)。
+两套 PNG 均为 1254×1254 RGBA，四角透明、未检出绿色色边；ICO 均包含 16/24/32/48/64/128/256px。32px 缩略图下仍可辨识 `CZ` 与两种用途。应用图标已同步到 Tauri `icons/icon.png` / `icons/icon.ico`，安装器图标已通过 WiX `ARPPRODUCTICON` 接入。完整提示词、去背参数和核验数据见 [`../../design-assets/coolzhu-icons-2026-08-12/README.md`](../../design-assets/coolzhu-icons-2026-08-12/README.md)。
 
 ## 本轮新增验证与环境限制
 
 - Browser Extension 契约检查：6/6 PASS；Rust Browser Bridge 定向测试：18/18 PASS。
 - `cargo build -p coolzhu-web-console --target x86_64-pc-windows-gnu --target-dir target\\gnu-validation --offline -j1`：PASS，并以新 binary 重启服务。
 - 新增 CSS 规则在真实 250% 缩放浏览器中完成运行态验证。
-- Tauri 壳源码使用锁定依赖 Tauri 2.10.3 的本地源码和官方 API 签名复核；本机缺少 MSVC `link.exe`/Windows SDK，GNU host 构建又缺少 `dlltool.exe`，因此无法在本机完成 Tauri 链接与新增 Rust 测试 binary 的链接。该结果记录为验证环境限制，不判定为源码失败。
+- 使用 Rust GNU toolchain 与 llvm-mingw 完成全 workspace release 构建和 Tauri release 链接；Tauri 壳首次完整构建 14 分 18 秒，接入新图标后的增量构建 2 分 46 秒，均 PASS。
 - `git diff --check`：PASS。
 
-## 尚待完成
+## 扩展加载后的 Browser Bridge 闭环
 
-- 在 Edge/Chrome 扩展管理页加载仓库内 `modules/browser-extension`。扩展安装需在点击前即时确认。
-- 扩展连接后运行产品 Browser Bridge 的滑块、拖拽、按键和 tab lifecycle 自测。
+扩展加载后 `/api/computer-use/browser/health` 返回 `connected=true`、`setup_required=false`。首次产品动态测试结果：
+
+- `slider`、`tab_lifecycle`：PASS；
+- `drag`：plan 阶段失败，`drop target was not found`；
+- `key`（Ctrl+A）、`enter`：动作分别以 `semantic=select_all`、`semantic=page_handled` 成功执行，但 verify 阶段无法看到结果。
+
+根因是扩展快照只收集可交互或显式语义节点；fixture 的拖放目标没有 `data-drop-target`，结果 `<output>` 只有 `aria-live` 而没有 `role`。补上 `data-drop-target="true"` 与 `role="status"`，并增加内嵌 fixture 静态回归后，`slider / drag / key / enter / tab_lifecycle` 五项均进入 `terminal` 且 `ok=true`。关联 issue：[#42](https://github.com/coolzhulike/coolzhuagent/issues/42)。
+
+## Release、MSI 与安装态验证
+
+- workspace release 的 8 个可执行文件与 Tauri release 均通过 GNU/llvm-mingw 完整链接。
+- Tauri 高 DPI 壳运行态边界为 `(10, 12)`、`1267×657`，右下角 `(1277, 669)`，完整落在 1280×672 逻辑工作区内；底部状态栏和右侧控件均可见。
+- `scripts/build-msi.ps1` 原先在只有仓库本地 .NET SDK 时仍直接启动 WiX apphost，因找不到 `hostfxr.dll` 失败；现改为本地 `dotnet.exe wix.dll` 调用，并增加 PowerShell 解析及契约回归。关联 issue：[#43](https://github.com/coolzhulike/coolzhuagent/issues/43)。
+- 初版 0.2.5 MSI 行政安装解包后，后端能启动但 Tauri 报缺少 `WebView2Loader.dll`。根因是发布清单只复制 Tauri EXE；已把该 DLL 作为强制 artifact 发布到 `bin/`，并增加清单回归。关联 issue：[#44](https://github.com/coolzhulike/coolzhuagent/issues/44)。
+- 修复后 MSI 行政安装解包 PASS：756 个文件、`WebView2Loader.dll` 1 个（160320 字节）。从该最终文件树启动后，后端健康检查 8 ok / 3 warn / 0 error，桌面壳完整显示，Browser Bridge 已连接，五项动态自测再次 5/5 PASS。
+- 生成包：`dist/CoolzhuAgent-0.2.5.msi`，195810816 字节；WiX `5.0.2+aa65968c`；SHA-256 `F9EF1BD30E6F6CB0CF3D00C20D9722CD8AD854EA9CDD46526012A3C9A7DE8E7A`；包安全扫描 756 文件、0 findings、`safe=true`。
+- 仓库当前没有代码签名证书，Authenticode 状态为 `NotSigned`，安装器报告明确记录 `signed=false` / `signing_status=unsigned`。
+
+系统已有 0.2.4 为 per-machine 安装。无管理员令牌的静默覆盖升级返回 MSI 1730/1603；已确认是 Windows 管理员权限门而非包内容错误。当前任务会话无法操作 UAC 安全桌面，因此采用 MSI 行政安装解包 + 最终文件树启动完成安装态内容与运行验证；真实覆盖升级仍需用户在 UAC 提示中点击“是”。
+
+## 最终新增验证
+
+- Browser Extension 契约：6/6 PASS。
+- Browser Bridge Rust 定向测试：18/18 PASS；fixture 新增语义回归 PASS。
+- Browser Bridge 动态测试：修复前 2/5，修复后源码 release 5/5，重建 MSI 最终文件树 5/5。
+- 包清单测试、包安全测试、PowerShell build-msi 语法与本地 runtime 契约：PASS。
+- MSI 行政安装：exit 0；启动链、Web Console、Tauri、Bridge：PASS。

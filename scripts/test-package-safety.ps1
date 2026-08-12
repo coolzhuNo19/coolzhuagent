@@ -244,4 +244,28 @@ foreach ($requiredExclude in @(
     }
 }
 
+$buildMsiScript = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'scripts\build-msi.ps1')
+$buildMsiTokens = $null
+$buildMsiParseErrors = $null
+[void][System.Management.Automation.Language.Parser]::ParseInput(
+    $buildMsiScript,
+    [ref]$buildMsiTokens,
+    [ref]$buildMsiParseErrors
+)
+if ($buildMsiParseErrors.Count -gt 0) {
+    throw "build-msi.ps1 parse failed: $($buildMsiParseErrors[0].Message)"
+}
+foreach ($requiredLocalRuntimeContract in @(
+    '$env:DOTNET_ROOT = $localDotnetRoot',
+    '$env:DOTNET_ROOT_X64 = $localDotnetRoot',
+    '$useLocalDotnetForWix = Test-Path',
+    '$wixBuildArgs = @(',
+    '& $localDotnetExe $wixDll @wixBuildArgs',
+    '$wixExitCode = $LASTEXITCODE'
+)) {
+    if ($buildMsiScript.IndexOf($requiredLocalRuntimeContract, [System.StringComparison]::Ordinal) -lt 0) {
+        throw "build-msi.ps1 missing local .NET runtime contract: $requiredLocalRuntimeContract"
+    }
+}
+
 Write-Output 'PASS package-safety'

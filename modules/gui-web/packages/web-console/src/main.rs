@@ -47976,6 +47976,16 @@ mod tests {
     }
 
     #[test]
+    fn browser_bridge_fixture_exposes_drag_target_and_live_result_to_snapshot() {
+        let fixture =
+            super::embedded_static_file(Path::new("tests/fixtures/computer-use-browser.html"))
+                .expect("browser bridge fixture should be embedded");
+        let fixture = std::str::from_utf8(fixture).expect("browser bridge fixture should be UTF-8");
+        assert!(fixture.contains("data-drop-target=\"true\""));
+        assert!(fixture.contains("<output id=\"result\" role=\"status\" aria-live=\"polite\""));
+    }
+
+    #[test]
     fn packaged_static_root_is_resolved_beside_bin_directory() {
         let executable = Path::new("C:/Program Files/CoolzhuAgent/bin/coolzhu-web-console.exe");
         let root = super::package_static_root_from_executable(executable).unwrap();
