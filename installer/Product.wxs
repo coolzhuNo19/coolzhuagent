@@ -6,6 +6,8 @@
            Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="已安装更高版本的 [ProductName]。" />
     <MediaTemplate EmbedCab="yes" />
+    <Icon Id="CoolzhuInstallerIcon" SourceFile="$(InstallerIcon)" />
+    <Property Id="ARPPRODUCTICON" Value="CoolzhuInstallerIcon" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLDIR" Name="CoolzhuAgent" />

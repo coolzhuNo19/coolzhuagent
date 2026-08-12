@@ -15,6 +15,10 @@ if ($artifactIds -notcontains 'gui-web.clawbot-sidecar') {
     throw 'package manifest must include gui-web.clawbot-sidecar artifact'
 }
 
+if ($artifactIds -notcontains 'gui-desktop.webview2-loader') {
+    throw 'package manifest must include the Tauri WebView2 loader artifact'
+}
+
 $nativeHost = @($manifest.artifacts | Where-Object { $_.id -eq 'gui-web.browser-native-host' })[0]
 if ([string]$nativeHost.source -ne 'modules/gui-web/target/{profile}/coolzhu-browser-native-host.exe') {
     throw "unexpected native host source: $($nativeHost.source)"
@@ -29,6 +33,14 @@ if ([string]$clawbotSidecar.source -ne 'modules/gui-web/target/{profile}/coolzhu
 }
 if ([string]$clawbotSidecar.target -ne 'bin/coolzhu-clawbot-sidecar.exe') {
     throw "unexpected ClawBot sidecar target: $($clawbotSidecar.target)"
+}
+
+$webView2Loader = @($manifest.artifacts | Where-Object { $_.id -eq 'gui-desktop.webview2-loader' })[0]
+if ([string]$webView2Loader.source -ne 'modules/gui-desktop/target/tauri-shell/{profile}/WebView2Loader.dll') {
+    throw "unexpected WebView2 loader source: $($webView2Loader.source)"
+}
+if ([string]$webView2Loader.target -ne 'bin/WebView2Loader.dll') {
+    throw "unexpected WebView2 loader target: $($webView2Loader.target)"
 }
 
 if ($resourceIds -notcontains 'browser.extension') {

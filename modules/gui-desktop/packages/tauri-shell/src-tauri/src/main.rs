@@ -308,8 +308,11 @@ fn build_console_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error
     )
     .title("COOLZHU AGENT 控制台")
     .inner_size(1440.0, 900.0)
-    .min_inner_size(1180.0, 760.0)
-    .position(48.0, 48.0)
+    // Windows 高 DPI 会显著缩小逻辑工作区；创建时以当前显示器工作区（含任务栏）
+    // 为边界，并降低最小尺寸，避免 250% 缩放下窗口底部永久落在屏幕外。
+    .min_inner_size(900.0, 520.0)
+    .center()
+    .prevent_overflow_with_margin(tauri::LogicalSize::new(16.0, 16.0))
     .visible(false)
     .focused(true)
     .build()?;
@@ -770,8 +773,9 @@ async fn browser_window_command(
             )
             .title("COOLZHU 浏览器")
             .inner_size(1200.0, 820.0)
-            .min_inner_size(800.0, 600.0)
-            .position(96.0, 72.0)
+            .min_inner_size(720.0, 480.0)
+            .center()
+            .prevent_overflow_with_margin(tauri::LogicalSize::new(16.0, 16.0))
             .focused(true)
             .build()
             .map_err(|e| {

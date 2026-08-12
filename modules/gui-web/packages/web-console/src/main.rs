@@ -47976,6 +47976,16 @@ mod tests {
     }
 
     #[test]
+    fn browser_bridge_fixture_exposes_drag_target_and_live_result_to_snapshot() {
+        let fixture =
+            super::embedded_static_file(Path::new("tests/fixtures/computer-use-browser.html"))
+                .expect("browser bridge fixture should be embedded");
+        let fixture = std::str::from_utf8(fixture).expect("browser bridge fixture should be UTF-8");
+        assert!(fixture.contains("data-drop-target=\"true\""));
+        assert!(fixture.contains("<output id=\"result\" role=\"status\" aria-live=\"polite\""));
+    }
+
+    #[test]
     fn packaged_static_root_is_resolved_beside_bin_directory() {
         let executable = Path::new("C:/Program Files/CoolzhuAgent/bin/coolzhu-web-console.exe");
         let root = super::package_static_root_from_executable(executable).unwrap();
@@ -61874,6 +61884,19 @@ attach: last_assistant
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .audio-settings .realtime-session-controls"));
         assert!(WEB_STYLES_CSS.contains("display: grid;"));
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .settings-section > h2::before"));
+    }
+
+    #[test]
+    fn web_frontend_high_dpi_short_viewport_keeps_primary_controls_reachable() {
+        assert!(WEB_STYLES_CSS.contains("@media (max-height: 760px)"));
+        assert!(WEB_STYLES_CSS.contains("--workbench-top: 11%;"));
+        assert!(WEB_STYLES_CSS.contains("--dock-width: 62px;"));
+        assert!(WEB_STYLES_CSS.contains(".ide-toolbar {\n  flex-wrap: wrap;"));
+        assert!(WEB_STYLES_CSS.contains(".ide-toolbar .ide-omni-search"));
+        assert!(
+            WEB_STYLES_CSS.contains("@media (max-width: 1200px) {\n  body.ui-3d .settings-layout")
+        );
+        assert!(WEB_STYLES_CSS.contains("body.ui-3d .settings-layout > .audio-settings"));
     }
 
     #[test]

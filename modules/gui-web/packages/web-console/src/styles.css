@@ -4218,6 +4218,16 @@ body.ui-3d .window-icon.window-icon-logs {
   align-items: center;
 }
 
+.ide-toolbar {
+  flex-wrap: wrap;
+  align-content: start;
+}
+
+.ide-toolbar .ide-omni-search {
+  flex: 1 1 100%;
+  min-width: 0;
+}
+
 .file-preview-text,
 .terminal-placeholder,
 .logs-placeholder {
@@ -10666,6 +10676,53 @@ body.ui-3d .settings-layout {
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
   gap: 12px;
   padding: 12px;
+}
+
+/* 高 DPI 设备的逻辑工作区通常显著小于物理分辨率。这里必须覆盖上面的
+   三列设计规则，避免较窄工作台仍被更高优先级的 ui-3d 选择器强制为三列。 */
+@media (max-width: 1200px) {
+  body.ui-3d .settings-layout {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  body.ui-3d .settings-layout > .audio-settings {
+    grid-column: 1 / -1;
+  }
+}
+
+/* 短工作区降低固定装饰占比，保留主操作区；当前设备 250% 缩放后的
+   可用高度为 672px，命中本断点。 */
+@media (max-height: 760px) {
+  .ui-redesign {
+    --top-region-ratio: 10%;
+    --workbench-top: 11%;
+    --workbench-bottom: 6.5%;
+    --dock-width: 62px;
+    --workbench-gap: 7px;
+  }
+
+  body.ui-3d .window-tab {
+    min-height: 34px;
+    padding: 3px;
+  }
+
+  body.ui-3d .window-icon {
+    width: 20px !important;
+    height: 20px !important;
+    max-width: 20px !important;
+    max-height: 20px !important;
+    flex-basis: 20px;
+  }
+
+  body.ui-3d .global-system-bar {
+    min-height: 28px;
+    padding-block: 3px;
+  }
+
+  body.ui-3d .vision-window-action-card {
+    min-height: 58px;
+    padding: 6px;
+  }
 }
 
 body.ui-3d .settings-section {

@@ -83,6 +83,11 @@
       }
     },
     {
+      "id": "gui-desktop.webview2-loader",
+      "source": "modules/gui-desktop/target/tauri-shell/{profile}/WebView2Loader.dll",
+      "target": "bin/WebView2Loader.dll"
+    },
+    {
       "id": "package.app-launcher",
       "source": "target/{profile}/COOLZHU-AGENT.exe",
       "target": "COOLZHU-AGENT.exe",
