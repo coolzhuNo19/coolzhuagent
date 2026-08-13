@@ -1,4 +1,6 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
+
+& (Join-Path $PSScriptRoot 'test-powershell-script-compat.ps1')
 
 $workspace = Split-Path -Parent $PSScriptRoot
 $script = Join-Path $PSScriptRoot 'project-delivery.ps1'

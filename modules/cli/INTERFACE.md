@@ -8,6 +8,14 @@
 
 - `coolzhu-command-line`
 - bin：`coolzhu-cli`
+- 用户文档：`docs/command-line.md`
+
+## 配置域契约
+
+- 启动模型优先级：`--model` > 用户/项目 `.claw` 配置 > 内置默认值。
+- GUI 模型会话与 CLI 配置当前相互独立；CLI 不得静默声称已导入 GUI 会话或凭据。
+- `agents` 表示 agent definition 文件，`skills` 表示 CLI roots 可发现的 skills；二者都不是 GUI 模型会话列表。
+- Windows 用户 root 必须支持 `HOME`，并在其缺失时回退 `USERPROFILE`；`CODEX_HOME` 是额外 root。
 
 ## 接口变更审查点
 
@@ -20,4 +28,5 @@
 ```powershell
 cargo check -p coolzhu-command-line --offline
 cargo run -p coolzhu-command-line -- --help
+cargo test -p coolzhu-command-line --offline
 ```

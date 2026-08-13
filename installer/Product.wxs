@@ -23,6 +23,21 @@
             Source="$(PackageRoot)\COOLZHU-AGENT.exe"
             KeyPath="yes" />
 
+      <!--
+        将安装根目录及 bin 目录绑定到稳定的启动器组件。Files 收集器会
+        动态生成文件组件，但空目录本身没有稳定的卸载归属；显式登记创建
+        与卸载清理，确保 RemoveFiles 后遗留的空目录也能被移除。
+      -->
+      <CreateFolder Directory="INSTALLDIR" />
+      <CreateFolder Directory="INSTALLDIR" Subdirectory="bin" />
+      <RemoveFolder Id="RemoveInstallBinDir"
+                    Directory="INSTALLDIR"
+                    Subdirectory="bin"
+                    On="uninstall" />
+      <RemoveFolder Id="RemoveInstallRootDir"
+                    Directory="INSTALLDIR"
+                    On="uninstall" />
+
       <Shortcut Id="StartMenuShortcut"
                 Directory="AppMenuDir"
                 Name="COOLZHU CODE Agent"

@@ -12315,3 +12315,38 @@ body.ui-3d .clawbot-window-panel .mini-button {
     grid-column: 1;
   }
 }
+
+/* high-dpi-short-overflow-reachability：短工作区中，复杂卡片必须交给单一父级滚动，
+   不能让后写的主题规则用 overflow:hidden 截掉主操作。该规则必须位于文件末尾，
+   确保不再被 round3 主题的固定最小高度覆盖。 */
+@media (max-height: 760px) {
+  body.ui-3d .task-pending-column,
+  body.ui-3d .module-selfcheck {
+    grid-template-rows: auto;
+    overflow: auto;
+  }
+
+  body.ui-3d .task-permission-layout .module-selfcheck-list {
+    min-height: 0;
+  }
+
+  body.ui-3d .memory-window-center-pane,
+  body.ui-3d .memory-window-source {
+    align-content: start;
+    overflow: auto;
+  }
+
+  body.ui-3d .memory-window-center-pane {
+    grid-template-rows: auto minmax(100px, 140px) minmax(140px, auto);
+  }
+
+  body.ui-3d .memory-window-source {
+    grid-template-rows: auto minmax(72px, 120px) minmax(120px, auto) minmax(120px, auto);
+  }
+
+  body.ui-3d .vision-command-rail .vision-window-action-card {
+    min-height: 0;
+    height: auto;
+    overflow: visible;
+  }
+}

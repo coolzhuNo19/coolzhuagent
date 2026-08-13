@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$BindHost = '127.0.0.1',
   [int]$Port = 8790,
   [string]$IlinkBaseUrl = 'https://ilinkai.weixin.qq.com',

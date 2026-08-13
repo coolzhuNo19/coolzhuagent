@@ -274,7 +274,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "plugin",
         aliases: &["plugins", "marketplace"],
-        summary: "Manage Claw Code plugins",
+        summary: "Manage COOLZHU CODE Agent plugins",
         argument_hint: Some(
             "[list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]",
         ),
@@ -488,7 +488,7 @@ pub fn render_slash_command_help() -> String {
     let mut lines = vec![
         "Slash commands".to_string(),
         "  Tab completes commands inside the REPL.".to_string(),
-        "  [resume] = also available via claw --resume SESSION.json".to_string(),
+        "  [resume] = also available via coolzhu-cli --resume SESSION.json".to_string(),
     ];
 
     for category in [
@@ -1261,6 +1261,17 @@ fn resolve_plugin_target(
 }
 
 fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, PathBuf)> {
+    let codex_home = non_empty_path_env("CODEX_HOME");
+    let user_home = cli_user_home_dir();
+    discover_definition_roots_from(cwd, leaf, codex_home.as_deref(), user_home.as_deref())
+}
+
+fn discover_definition_roots_from(
+    cwd: &Path,
+    leaf: &str,
+    codex_home: Option<&Path>,
+    user_home: Option<&Path>,
+) -> Vec<(DefinitionSource, PathBuf)> {
     let mut roots = Vec::new();
 
     for ancestor in cwd.ancestors() {
@@ -1276,16 +1287,15 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         );
     }
 
-    if let Ok(codex_home) = env::var("CODEX_HOME") {
+    if let Some(codex_home) = codex_home {
         push_unique_root(
             &mut roots,
             DefinitionSource::UserCodexHome,
-            PathBuf::from(codex_home).join(leaf),
+            codex_home.join(leaf),
         );
     }
 
-    if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home);
+    if let Some(home) = user_home {
         push_unique_root(
             &mut roots,
             DefinitionSource::UserCodex,
@@ -1302,6 +1312,16 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
 }
 
 fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
+    let codex_home = non_empty_path_env("CODEX_HOME");
+    let user_home = cli_user_home_dir();
+    discover_skill_roots_from(cwd, codex_home.as_deref(), user_home.as_deref())
+}
+
+fn discover_skill_roots_from(
+    cwd: &Path,
+    codex_home: Option<&Path>,
+    user_home: Option<&Path>,
+) -> Vec<SkillRoot> {
     let mut roots = Vec::new();
 
     for ancestor in cwd.ancestors() {
@@ -1331,8 +1351,7 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
-    if let Ok(codex_home) = env::var("CODEX_HOME") {
-        let codex_home = PathBuf::from(codex_home);
+    if let Some(codex_home) = codex_home {
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserCodexHome,
@@ -1347,8 +1366,7 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
-    if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home);
+    if let Some(home) = user_home {
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserCodex,
@@ -1376,6 +1394,24 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     }
 
     roots
+}
+
+fn non_empty_path_env(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn cli_user_home_dir() -> Option<PathBuf> {
+    preferred_user_home(
+        non_empty_path_env("HOME"),
+        non_empty_path_env("USERPROFILE"),
+    )
+}
+
+fn preferred_user_home(home: Option<PathBuf>, user_profile: Option<PathBuf>) -> Option<PathBuf> {
+    home.filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| user_profile.filter(|path| !path.as_os_str().is_empty()))
 }
 
 fn push_unique_root(
@@ -1594,7 +1630,13 @@ fn unquote_frontmatter_value(value: &str) -> String {
 
 fn render_agents_report(agents: &[AgentSummary]) -> String {
     if agents.is_empty() {
-        return "No agents found.".to_string();
+        return [
+            "Agents",
+            "  No agent definition files found.",
+            "  Meaning          CLI agent definitions, not GUI model sessions",
+            "  Sources          project roots plus $CODEX_HOME and $HOME/$USERPROFILE",
+        ]
+        .join("\n");
     }
 
     let total_active = agents
@@ -1652,7 +1694,13 @@ fn agent_detail(agent: &AgentSummary) -> String {
 
 fn render_skills_report(skills: &[SkillSummary]) -> String {
     if skills.is_empty() {
-        return "No skills found.".to_string();
+        return [
+            "Skills",
+            "  No CLI-discoverable skills found.",
+            "  Meaning          CLI skills, not GUI model-session configuration",
+            "  Sources          project roots plus $CODEX_HOME and $HOME/$USERPROFILE; includes legacy /commands",
+        ]
+        .join("\n");
     }
 
     let total_active = skills
@@ -1709,8 +1757,9 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Agents".to_string(),
         "  Usage            /agents".to_string(),
-        "  Direct CLI       claw agents".to_string(),
-        "  Sources          .codex/agents, .claw/agents, $CODEX_HOME/agents".to_string(),
+        "  Direct CLI       coolzhu-cli agents".to_string(),
+        "  Meaning          Agent definition files, not GUI model sessions".to_string(),
+        "  Sources          project roots plus $CODEX_HOME and $HOME/$USERPROFILE".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -1722,8 +1771,9 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Skills".to_string(),
         "  Usage            /skills".to_string(),
-        "  Direct CLI       claw skills".to_string(),
-        "  Sources          .codex/skills, .claw/skills, legacy /commands".to_string(),
+        "  Direct CLI       coolzhu-cli skills".to_string(),
+        "  Meaning          CLI-discoverable skills; GUI model sessions are separate".to_string(),
+        "  Sources          project roots plus $CODEX_HOME and $HOME/$USERPROFILE; includes legacy /commands".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -1790,9 +1840,10 @@ pub fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_branch_slash_command, handle_commit_slash_command, handle_plugins_slash_command,
-        handle_slash_command, handle_worktree_slash_command, load_agents_from_roots,
-        load_skills_from_roots, render_agents_report, render_plugins_report, render_skills_report,
+        discover_definition_roots_from, discover_skill_roots_from, handle_branch_slash_command,
+        handle_commit_slash_command, handle_plugins_slash_command, handle_slash_command,
+        handle_worktree_slash_command, load_agents_from_roots, load_skills_from_roots,
+        preferred_user_home, render_agents_report, render_plugins_report, render_skills_report,
         render_slash_command_help, resume_supported_slash_commands, slash_command_specs,
         suggest_slash_commands, DefinitionSource, SkillOrigin, SkillRoot, SlashCommand,
     };
@@ -2112,7 +2163,7 @@ mod tests {
     #[test]
     fn renders_help_from_shared_specs() {
         let help = render_slash_command_help();
-        assert!(help.contains("available via claw --resume SESSION.json"));
+        assert!(help.contains("available via coolzhu-cli --resume SESSION.json"));
         assert!(help.contains("Core flow"));
         assert!(help.contains("Workspace & memory"));
         assert!(help.contains("Sessions & output"));
@@ -2406,13 +2457,95 @@ mod tests {
     }
 
     #[test]
+    fn userprofile_is_used_when_home_is_missing() {
+        let user_profile = temp_dir("windows-userprofile");
+        assert_eq!(
+            preferred_user_home(None, Some(user_profile.clone())),
+            Some(user_profile.clone())
+        );
+        assert_eq!(
+            preferred_user_home(Some(PathBuf::new()), Some(user_profile.clone())),
+            Some(user_profile.clone())
+        );
+
+        let home = temp_dir("explicit-home");
+        assert_eq!(
+            preferred_user_home(Some(home.clone()), Some(user_profile)),
+            Some(home)
+        );
+    }
+
+    #[test]
+    fn discovery_includes_codex_home_and_windows_userprofile_roots() {
+        let workspace = temp_dir("discovery-workspace");
+        let codex_home = temp_dir("discovery-codex-home");
+        let user_profile = temp_dir("discovery-userprofile");
+        write_agent(
+            &codex_home.join("agents"),
+            "codex-home-agent",
+            "CODEX_HOME agent",
+            "gpt-5.4",
+            "high",
+        );
+        write_agent(
+            &user_profile.join(".codex").join("agents"),
+            "profile-agent",
+            "USERPROFILE agent",
+            "gpt-5.4-mini",
+            "medium",
+        );
+        write_skill(
+            &codex_home.join("skills"),
+            "codex-home-skill",
+            "CODEX_HOME skill",
+        );
+        write_skill(
+            &user_profile.join(".codex").join("skills"),
+            "profile-skill",
+            "USERPROFILE skill",
+        );
+
+        let agent_roots = discover_definition_roots_from(
+            &workspace,
+            "agents",
+            Some(&codex_home),
+            Some(&user_profile),
+        );
+        let agents = load_agents_from_roots(&agent_roots).expect("agent roots should load");
+        assert!(agents.iter().any(|agent| agent.name == "codex-home-agent"));
+        assert!(agents.iter().any(|agent| agent.name == "profile-agent"));
+
+        let skill_roots =
+            discover_skill_roots_from(&workspace, Some(&codex_home), Some(&user_profile));
+        let skills = load_skills_from_roots(&skill_roots).expect("skill roots should load");
+        assert!(skills.iter().any(|skill| skill.name == "codex-home-skill"));
+        assert!(skills.iter().any(|skill| skill.name == "profile-skill"));
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(codex_home);
+        let _ = fs::remove_dir_all(user_profile);
+    }
+
+    #[test]
+    fn empty_discovery_reports_explain_cli_and_gui_domains() {
+        let agents = render_agents_report(&[]);
+        assert!(agents.contains("agent definition files"));
+        assert!(agents.contains("not GUI model sessions"));
+
+        let skills = render_skills_report(&[]);
+        assert!(skills.contains("CLI-discoverable skills"));
+        assert!(skills.contains("not GUI model-session configuration"));
+    }
+
+    #[test]
     fn agents_and_skills_usage_support_help_and_unexpected_args() {
         let cwd = temp_dir("slash-usage");
 
         let agents_help =
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents"));
-        assert!(agents_help.contains("Direct CLI       claw agents"));
+        assert!(agents_help.contains("Direct CLI       coolzhu-cli agents"));
+        assert!(agents_help.contains("not GUI model sessions"));
 
         let agents_unexpected =
             super::handle_agents_slash_command(Some("show planner"), &cwd).expect("agents usage");

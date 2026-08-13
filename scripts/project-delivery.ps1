@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$WorkspaceRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$DestinationRoot = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'coolzhu-agent-project'),
     [string]$CurationMap = (Join-Path (Split-Path -Parent $PSScriptRoot) 'docs\obsidian-curation-map.json'),

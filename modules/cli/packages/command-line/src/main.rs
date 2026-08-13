@@ -16,11 +16,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
-    max_tokens_for_model as api_max_tokens_for_model,
+    detect_provider_kind, max_tokens_for_model as api_max_tokens_for_model,
     resolve_model_alias as api_resolve_model_alias, resolve_startup_auth_source, AuthSource,
     ClawApiClient, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    MessageResponse, OutputContentBlock, ProviderClient, ProviderKind,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -46,17 +46,37 @@ use serde_json::json;
 use tools::GlobalToolRegistry;
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const PRODUCT_NAME: &str = "COOLZHU CODE Agent";
+const CLI_COMMAND: &str = "coolzhu-cli";
 fn max_tokens_for_model(model: &str) -> u32 {
     api_max_tokens_for_model(model)
 }
 const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const BUILD_TARGET: Option<&str> = option_env!("TARGET");
-const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
+const VERSION: &str = env!("COOLZHU_RELEASE_VERSION");
+const BUILD_DATE: &str = env!("COOLZHU_BUILD_DATE");
+const BUILD_TARGET: &str = env!("COOLZHU_BUILD_TARGET");
+const GIT_SHA: &str = env!("COOLZHU_GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
 type AllowedToolSet = BTreeSet<String>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelSelectionSource {
+    ExplicitFlag,
+    CliConfig,
+    BuiltInDefault,
+}
+
+impl ModelSelectionSource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ExplicitFlag => "--model",
+            Self::CliConfig => "CLI .claw configuration",
+            Self::BuiltInDefault => "built-in default (GUI sessions are not imported)",
+        }
+    }
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -75,11 +95,11 @@ fn render_cli_error(problem: &str) -> String {
         };
         lines.push(format!("{label}{line}"));
     }
-    lines.push("  Help             claw --help".to_string());
+    lines.push(format!("  Help             {CLI_COMMAND} --help"));
     lines.join("\n")
 }
 
-fn load_config_to_env() -> Result<(), Box<dyn std::error::Error>> {
+fn load_config_to_env() -> Result<Option<String>, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     if let Ok(config) = loader.load() {
@@ -90,14 +110,34 @@ fn load_config_to_env() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(provider) = config.get("provider").and_then(|v| v.as_str()) {
             env::set_var("PROVIDER", provider);
         }
+        return Ok(config
+            .model()
+            .map(resolve_model_alias)
+            .filter(|model| !model.trim().is_empty()));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    load_config_to_env()?;
+    let configured_default_model = load_config_to_env()?;
     let args: Vec<String> = env::args().skip(1).collect();
-    match parse_args(&args)? {
+    let model_source = if has_explicit_model_flag(&args) {
+        ModelSelectionSource::ExplicitFlag
+    } else if configured_default_model.is_some() {
+        ModelSelectionSource::CliConfig
+    } else {
+        ModelSelectionSource::BuiltInDefault
+    };
+    let action = configured_default_model.as_deref().map_or_else(
+        || parse_args(&args),
+        |model| parse_args_with_default_model(&args, model),
+    )?;
+    if model_source == ModelSelectionSource::BuiltInDefault
+        && matches!(&action, CliAction::Prompt { .. } | CliAction::Repl { .. })
+    {
+        eprintln!("{}", render_builtin_model_notice(DEFAULT_MODEL));
+    }
+    match action {
         CliAction::DumpManifests => dump_manifests(),
         CliAction::BootstrapPlan => print_bootstrap_plan(),
         CliAction::Agents { args } => LiveCli::print_agents(args.as_deref())?,
@@ -114,7 +154,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-        } => LiveCli::new(model, true, allowed_tools, permission_mode)?
+        } => initialize_live_cli(model, allowed_tools, permission_mode, model_source)?
             .run_turn_with_output(&prompt, output_format)?,
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
@@ -123,10 +163,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
-        } => run_repl(model, allowed_tools, permission_mode)?,
+        } => run_repl(model, allowed_tools, permission_mode, model_source)?,
         CliAction::Help => print_help(),
     }
     Ok(())
+}
+
+fn has_explicit_model_flag(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--model" || arg.starts_with("--model="))
+}
+
+fn render_builtin_model_notice(model: &str) -> String {
+    format!(
+        "Model selection notice\n  Model            {model}\n  Model source     built-in default\n  Config scope     No --model or CLI .claw model was found; GUI model sessions are separate and are not imported."
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,7 +238,15 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    parse_args_with_default_model(args, DEFAULT_MODEL)
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_args_with_default_model(
+    args: &[String],
+    configured_default_model: &str,
+) -> Result<CliAction, String> {
+    let mut model = resolve_model_alias(configured_default_model);
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode = default_permission_mode();
     let mut wants_version = false;
@@ -239,7 +298,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "-p" => {
-                // Claw Code compat: -p "prompt" = one-shot prompt
+                // 兼容旧 CLI：-p "prompt" 表示 one-shot prompt。
                 let prompt = args[index + 1..].join(" ");
                 if prompt.trim().is_empty() {
                     return Err("-p requires a prompt string".to_string());
@@ -253,7 +312,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 });
             }
             "--print" => {
-                // Claw Code compat: --print makes output non-interactive
+                // 兼容旧 CLI：--print 切换为非交互输出。
                 output_format = CliOutputFormat::Text;
                 index += 1;
             }
@@ -346,6 +405,7 @@ fn parse_direct_slash_cli_action(rest: &[String]) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
         Some(SlashCommand::Help) => Ok(CliAction::Help),
+        Some(SlashCommand::Version) => Ok(CliAction::Version),
         Some(SlashCommand::Agents { args }) => Ok(CliAction::Agents { args }),
         Some(SlashCommand::Skills { args }) => Ok(CliAction::Skills { args }),
         Some(command) => Err(format_direct_slash_command_error(
@@ -369,10 +429,13 @@ fn format_direct_slash_command_error(command: &str, is_unknown: bool) -> String 
     if is_unknown {
         append_slash_command_suggestions(&mut lines, trimmed);
     } else {
-        lines.push("  Try              Start `claw` to use interactive slash commands".to_string());
+        lines.push(format!(
+            "  Try              Start `{CLI_COMMAND}` to use interactive slash commands"
+        ));
         lines.push(
-            "  Tip              Resume-safe commands also work with `claw --resume SESSION.json ...`"
-                .to_string(),
+            format!(
+                "  Tip              Resume-safe commands also work with `{CLI_COMMAND} --resume SESSION.json ...`"
+            ),
         );
     }
     lines.join("\n")
@@ -530,7 +593,7 @@ fn run_login() -> Result<(), Box<dyn std::error::Error>> {
         OAuthAuthorizationRequest::from_config(oauth, redirect_uri.clone(), state.clone(), &pkce)
             .build_url();
 
-    println!("Starting Claw OAuth login...");
+    println!("Starting {PRODUCT_NAME} OAuth login...");
     println!("Listening for callback on {redirect_uri}");
     if let Err(error) = open_browser(&authorize_url) {
         eprintln!("warning: failed to open browser automatically: {error}");
@@ -565,13 +628,13 @@ fn run_login() -> Result<(), Box<dyn std::error::Error>> {
         expires_at: token_set.expires_at,
         scopes: token_set.scopes,
     })?;
-    println!("Claw OAuth login complete.");
+    println!("{PRODUCT_NAME} OAuth login complete.");
     Ok(())
 }
 
 fn run_logout() -> Result<(), Box<dyn std::error::Error>> {
     clear_oauth_credentials()?;
-    println!("Claw OAuth credentials cleared.");
+    println!("{PRODUCT_NAME} OAuth credentials cleared.");
     Ok(())
 }
 
@@ -616,9 +679,9 @@ fn wait_for_oauth_callback(
     let callback = parse_oauth_callback_request_target(target)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let body = if callback.error.is_some() {
-        "Claw OAuth login failed. You can close this window."
+        "COOLZHU CODE Agent OAuth login failed. You can close this window."
     } else {
-        "Claw OAuth login succeeded. You can close this window."
+        "COOLZHU CODE Agent OAuth login succeeded. You can close this window."
     };
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -1033,8 +1096,9 @@ fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    model_source: ModelSelectionSource,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+    let mut cli = initialize_live_cli(model, allowed_tools, permission_mode, model_source)?;
     let mut editor = input::LineEditor::new("> ", slash_command_completion_candidates());
     println!("{}", cli.startup_banner());
 
@@ -1067,6 +1131,54 @@ fn run_repl(
     }
 
     Ok(())
+}
+
+fn initialize_live_cli(
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    model_source: ModelSelectionSource,
+) -> Result<LiveCli, Box<dyn std::error::Error>> {
+    let model_for_error = model.clone();
+    LiveCli::new(model, true, allowed_tools, permission_mode).map_err(|error| {
+        Box::new(io::Error::other(render_model_initialization_error(
+            &model_for_error,
+            model_source,
+            &error.to_string(),
+        ))) as Box<dyn std::error::Error>
+    })
+}
+
+fn render_model_initialization_error(
+    model: &str,
+    model_source: ModelSelectionSource,
+    cause: &str,
+) -> String {
+    let (provider, credentials) = model_provider_guidance(model);
+    format!(
+        "Model initialization failed\n  Model            {model}\n  Provider         {provider}\n  Model source     {}\n  Credentials      {credentials}\n  Config scope     CLI reads user/project .claw settings; GUI model sessions are separate and are not imported.\n  Cause            {cause}",
+        model_source.label()
+    )
+}
+
+fn model_provider_guidance(model: &str) -> (&'static str, &'static str) {
+    match detect_provider_kind(model) {
+        ProviderKind::ClawApi | ProviderKind::Anthropic => (
+            "Anthropic / CLI OAuth",
+            "ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY (or `coolzhu-cli login`)",
+        ),
+        ProviderKind::Xai => ("xAI", "XAI_API_KEY"),
+        ProviderKind::OpenAi => ("OpenAI", "OPENAI_API_KEY"),
+        ProviderKind::ZhipuAi => ("Zhipu AI", "ZAI_API_KEY or BIGMODEL_API_KEY"),
+        ProviderKind::AlibabaBailian => ("Alibaba DashScope", "DASHSCOPE_API_KEY"),
+        ProviderKind::BaiduQianfan => ("Baidu Qianfan", "QIANFAN_API_KEY"),
+        ProviderKind::ByteDanceArk => ("ByteDance Ark", "ARK_API_KEY"),
+        ProviderKind::DeepSeek => ("DeepSeek", "DEEPSEEK_API_KEY"),
+        ProviderKind::Custom => (
+            "Custom OpenAI-compatible",
+            "CUSTOM_API_KEY (optional for local endpoints)",
+        ),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1150,9 +1262,9 @@ impl LiveCli {
             format!(
                 "{} {}",
                 if color {
-                    "\x1b[1;38;5;45m🦞 Claw Code\x1b[0m"
+                    "\x1b[1;38;5;45m>_ COOLZHU CODE Agent\x1b[0m"
                 } else {
-                    "Claw Code"
+                    PRODUCT_NAME
                 },
                 if color {
                     "\x1b[2m· ready\x1b[0m"
@@ -2550,10 +2662,8 @@ fn parse_titled_body(value: &str) -> Option<(String, String)> {
 }
 
 fn render_version_report() -> String {
-    let git_sha = GIT_SHA.unwrap_or("unknown");
-    let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}\n\nSupport\n  Help             claw --help\n  REPL             /help"
+        "{PRODUCT_NAME}\n  Version          {VERSION}\n  Git SHA          {GIT_SHA}\n  Target           {BUILD_TARGET}\n  Build date       {BUILD_DATE}\n\nSupport\n  Help             {CLI_COMMAND} --help\n  REPL             /help"
     )
 }
 
@@ -4162,7 +4272,7 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 }
 
 fn print_help_to(out: &mut impl Write) -> io::Result<()> {
-    writeln!(out, "Claw Code CLI v{VERSION}")?;
+    writeln!(out, "{PRODUCT_NAME} CLI v{VERSION}")?;
     writeln!(
         out,
         "  Interactive coding assistant for the current workspace."
@@ -4171,19 +4281,19 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Quick start")?;
     writeln!(
         out,
-        "  claw                                  Start the interactive REPL"
+        "  coolzhu-cli                           Start the interactive REPL"
     )?;
     writeln!(
         out,
-        "  claw \"summarize this repo\"            Run one prompt and exit"
+        "  coolzhu-cli \"summarize this repo\"     Run one prompt and exit"
     )?;
     writeln!(
         out,
-        "  claw prompt \"explain src/main.rs\"     Explicit one-shot prompt"
+        "  coolzhu-cli prompt \"explain src/main.rs\"  Explicit one-shot prompt"
     )?;
     writeln!(
         out,
-        "  claw --resume SESSION.json /status    Inspect a saved session"
+        "  coolzhu-cli --resume SESSION.json /status  Inspect a saved session"
     )?;
     writeln!(out)?;
     writeln!(out, "Interactive essentials")?;
@@ -4219,32 +4329,35 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Commands")?;
     writeln!(
         out,
-        "  claw dump-manifests                   Read upstream TS sources and print extracted counts"
+        "  coolzhu-cli dump-manifests            Read upstream TS sources and print extracted counts"
     )?;
     writeln!(
         out,
-        "  claw bootstrap-plan                   Print the bootstrap phase skeleton"
+        "  coolzhu-cli bootstrap-plan            Print the bootstrap phase skeleton"
     )?;
     writeln!(
         out,
-        "  claw agents                           List configured agents"
+        "  coolzhu-cli agents                    List agent definition files (not GUI model sessions)"
     )?;
     writeln!(
         out,
-        "  claw skills                           List installed skills"
-    )?;
-    writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
-    writeln!(
-        out,
-        "  claw login                            Start the OAuth login flow"
+        "  coolzhu-cli skills                    List CLI-discoverable skills"
     )?;
     writeln!(
         out,
-        "  claw logout                           Clear saved OAuth credentials"
+        "  coolzhu-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]"
     )?;
     writeln!(
         out,
-        "  claw init                             Scaffold CLAW.md + local files"
+        "  coolzhu-cli login                     Start the OAuth login flow"
+    )?;
+    writeln!(
+        out,
+        "  coolzhu-cli logout                    Clear saved OAuth credentials"
+    )?;
+    writeln!(
+        out,
+        "  coolzhu-cli init                      Scaffold CLAW.md + local files"
     )?;
     writeln!(out)?;
     writeln!(out, "Flags")?;
@@ -4273,6 +4386,20 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  --version, -V                         Print version and build information"
     )?;
     writeln!(out)?;
+    writeln!(out, "Configuration scope")?;
+    writeln!(
+        out,
+        "  Model priority    --model > user/project .claw settings > built-in default"
+    )?;
+    writeln!(
+        out,
+        "  GUI sessions      Separate configuration domain; not imported by the CLI"
+    )?;
+    writeln!(
+        out,
+        "  More              See docs/command-line.md for providers and credential variables"
+    )?;
+    writeln!(out)?;
     writeln!(out, "Slash command reference")?;
     writeln!(out, "{}", render_slash_command_help())?;
     writeln!(out)?;
@@ -4286,23 +4413,23 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         .join(", ");
     writeln!(out, "Resume-safe commands: {resume_commands}")?;
     writeln!(out, "Examples")?;
-    writeln!(out, "  claw --model opus \"summarize this repo\"")?;
+    writeln!(out, "  coolzhu-cli --model opus \"summarize this repo\"")?;
     writeln!(
         out,
-        "  claw --output-format json prompt \"explain src/main.rs\""
+        "  coolzhu-cli --output-format json prompt \"explain src/main.rs\""
     )?;
     writeln!(
         out,
-        "  claw --allowedTools read,glob \"summarize Cargo.toml\""
+        "  coolzhu-cli --allowedTools read,glob \"summarize Cargo.toml\""
     )?;
     writeln!(
         out,
-        "  claw --resume session.json /status /diff /export notes.txt"
+        "  coolzhu-cli --resume session.json /status /diff /export notes.txt"
     )?;
-    writeln!(out, "  claw agents")?;
-    writeln!(out, "  claw /skills")?;
-    writeln!(out, "  claw login")?;
-    writeln!(out, "  claw init")?;
+    writeln!(out, "  coolzhu-cli agents")?;
+    writeln!(out, "  coolzhu-cli /skills")?;
+    writeln!(out, "  coolzhu-cli login")?;
+    writeln!(out, "  coolzhu-cli init")?;
     Ok(())
 }
 
@@ -4316,13 +4443,16 @@ mod tests {
         describe_tool_progress, filter_tool_specs, format_compact_report, format_cost_report,
         format_internal_prompt_progress_line, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_resume_report,
-        format_status_report, format_tool_call_start, format_tool_result,
-        normalize_permission_mode, parse_args, parse_git_status_metadata, permission_policy,
-        print_help_to, push_output_block, render_config_report, render_memory_report,
-        render_repl_help, render_unknown_repl_command, resolve_model_alias, response_to_events,
+        format_status_report, format_tool_call_start, format_tool_result, has_explicit_model_flag,
+        normalize_permission_mode, parse_args, parse_args_with_default_model,
+        parse_git_status_metadata, permission_policy, print_help_to, push_output_block,
+        render_builtin_model_notice, render_config_report, render_memory_report,
+        render_model_initialization_error, render_repl_help, render_unknown_repl_command,
+        render_version_report, resolve_model_alias, response_to_events,
         resume_supported_slash_commands, slash_command_completion_candidates, status_context,
         CliAction, CliOutputFormat, CliToolExecutor, InternalPromptProgressEvent,
-        InternalPromptProgressState, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        InternalPromptProgressState, ModelSelectionSource, SlashCommand, StatusUsage, BUILD_DATE,
+        BUILD_TARGET, DEFAULT_MODEL, GIT_SHA, PRODUCT_NAME, VERSION,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
     use plugins::{PluginTool, PluginToolDefinition, PluginToolPermission};
@@ -4498,6 +4628,95 @@ mod tests {
             parse_args(&["-V".to_string()]).expect("args should parse"),
             CliAction::Version
         );
+        assert_eq!(
+            parse_args(&["/version".to_string()]).expect("/version should parse directly"),
+            CliAction::Version
+        );
+    }
+
+    #[test]
+    fn configured_model_is_default_but_explicit_flag_wins() {
+        let configured =
+            parse_args_with_default_model(&["prompt".to_string(), "hello".to_string()], "glm-5.2")
+                .expect("configured model should parse");
+        assert_eq!(
+            configured,
+            CliAction::Prompt {
+                prompt: "hello".to_string(),
+                model: "glm-5.2".to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+            }
+        );
+
+        let explicit = parse_args_with_default_model(
+            &[
+                "--model".to_string(),
+                "sonnet".to_string(),
+                "prompt".to_string(),
+                "hello".to_string(),
+            ],
+            "glm-5.2",
+        )
+        .expect("explicit model should parse");
+        assert!(has_explicit_model_flag(&[
+            "--model".to_string(),
+            "sonnet".to_string()
+        ]));
+        assert_eq!(
+            explicit,
+            CliAction::Prompt {
+                prompt: "hello".to_string(),
+                model: "claude-sonnet-4-6".to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+            }
+        );
+    }
+
+    #[test]
+    fn model_initialization_error_names_provider_credentials_and_config_scope() {
+        let glm_error = render_model_initialization_error(
+            "glm-5.2",
+            ModelSelectionSource::CliConfig,
+            "missing credentials",
+        );
+        assert!(glm_error.contains("Alibaba DashScope"));
+        assert!(glm_error.contains("DASHSCOPE_API_KEY"));
+        assert!(!glm_error.contains("ANTHROPIC_"));
+        assert!(glm_error.contains("GUI model sessions are separate"));
+
+        let default_error = render_model_initialization_error(
+            DEFAULT_MODEL,
+            ModelSelectionSource::BuiltInDefault,
+            "missing credentials",
+        );
+        assert!(default_error.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(default_error.contains("built-in default"));
+        assert!(default_error.contains("GUI sessions are not imported"));
+    }
+
+    #[test]
+    fn built_in_model_selection_is_never_silent() {
+        let notice = render_builtin_model_notice(DEFAULT_MODEL);
+        assert!(notice.contains(DEFAULT_MODEL));
+        assert!(notice.contains("built-in default"));
+        assert!(notice.contains("No --model or CLI .claw model was found"));
+        assert!(notice.contains("GUI model sessions are separate"));
+    }
+
+    #[test]
+    fn version_report_uses_coolzhu_brand_and_injected_build_metadata() {
+        let report = render_version_report();
+        assert!(report.starts_with(PRODUCT_NAME));
+        assert!(report.contains(&format!("Version          {VERSION}")));
+        assert!(report.contains(&format!("Git SHA          {GIT_SHA}")));
+        assert!(report.contains(&format!("Target           {BUILD_TARGET}")));
+        assert!(report.contains(&format!("Build date       {BUILD_DATE}")));
+        assert!(report.contains("coolzhu-cli --help"));
+        assert!(!report.contains("Claw Code"));
     }
 
     #[test]
@@ -4689,7 +4908,7 @@ mod tests {
         let help = commands::render_slash_command_help();
         assert!(help.contains("Slash commands"));
         assert!(help.contains("Tab completes commands inside the REPL."));
-        assert!(help.contains("available via claw --resume SESSION.json"));
+        assert!(help.contains("available via coolzhu-cli --resume SESSION.json"));
     }
 
     #[test]
@@ -4815,10 +5034,15 @@ mod tests {
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
-        assert!(help.contains("claw init"));
-        assert!(help.contains("claw agents"));
-        assert!(help.contains("claw skills"));
-        assert!(help.contains("claw /skills"));
+        assert!(help.contains("coolzhu-cli init"));
+        assert!(help.contains("coolzhu-cli agents"));
+        assert!(help.contains("coolzhu-cli skills"));
+        assert!(help.contains("coolzhu-cli /skills"));
+        assert!(help.contains("COOLZHU CODE Agent CLI"));
+        assert!(help.contains("GUI sessions      Separate configuration domain"));
+        assert!(help.contains("not GUI model sessions"));
+        assert!(!help.contains("\n  claw "));
+        assert!(!help.contains("Claw Code"));
     }
 
     #[test]
@@ -5138,7 +5362,7 @@ mod tests {
             task_label: "ship plugin progress".to_string(),
             step: 3,
             phase: "running read_file".to_string(),
-            detail: Some("reading rust/crates/claw-cli/src/main.rs".to_string()),
+            detail: Some("reading modules/cli/coolzhu-cli/src/main.rs".to_string()),
             saw_final_text: false,
         };
 
@@ -5185,8 +5409,8 @@ mod tests {
             "reading src/main.rs"
         );
         assert!(
-            describe_tool_progress("bash", r#"{"command":"cargo test -p claw-cli"}"#)
-                .contains("cargo test -p claw-cli")
+            describe_tool_progress("bash", r#"{"command":"cargo test -p coolzhu-cli"}"#)
+                .contains("cargo test -p coolzhu-cli")
         );
         assert_eq!(
             describe_tool_progress("grep_search", r#"{"pattern":"ultraplan","path":"rust"}"#),
