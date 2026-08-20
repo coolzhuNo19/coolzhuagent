@@ -21,6 +21,7 @@ const PET_WINDOW_SIZE: f64 = 152.0;
 const PET_THEME_JSON: &str = include_str!("../../ui/assets/pet-theme.json");
 const WEB_CONSOLE_PID_ARG: &str = "--web-console-pid";
 const WEB_CONSOLE_PID_ENV: &str = "COOLZHU_WEB_CONSOLE_PID";
+const WEB_CONSOLE_PROCESS_NAME: &str = "coolzhu-web-console.exe";
 const DIAGNOSTICS_MODULE: &str = "tauri-shell";
 static WEB_CONSOLE_PARENT_MONITOR_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -283,7 +284,7 @@ fn build_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             "show" => show_console(app),
             "hide" => hide_console(app),
             "pet" => show_pet(app),
-            "quit" => app.exit(0),
+            "quit" => quit_application(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, _event| {
@@ -364,7 +365,7 @@ fn build_pet_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     pet_window.on_window_event(move |event| match event {
         WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
-            app_for_close.exit(0);
+            quit_application(&app_for_close);
         }
         WindowEvent::Moved(_) | WindowEvent::Focused(_) => {
             repair_pet_window_chrome(&pet_for_events);
@@ -523,7 +524,75 @@ fn hide_console_command(app: tauri::AppHandle) {
 
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
+    quit_application(&app);
+}
+
+/// 关闭桌宠时，同时回收由安装器 launcher 拉起的 Web Console。
+///
+/// Tauri 与 web-console 是两个独立进程；仅调用 `app.exit` 会留下 8765
+/// 监听和后台 agent。PID 由 launcher 注入，且在 Windows 上先核对进程名，
+/// 防止陈旧/被复用的 PID 指向无关进程后被 taskkill 误伤。
+fn quit_application(app: &tauri::AppHandle) {
+    terminate_owned_web_console_process();
     app.exit(0);
+}
+
+fn owned_web_console_pid(args: &[String], current_pid: u32) -> Option<u32> {
+    web_console_parent_pid(args).filter(|pid| *pid != current_pid)
+}
+
+fn terminate_owned_web_console_process() {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(pid) = owned_web_console_pid(&args, std::process::id()) else {
+        return;
+    };
+
+    #[cfg(windows)]
+    {
+        if !windows_process_name_matches(pid, WEB_CONSOLE_PROCESS_NAME) {
+            return;
+        }
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        if !matches!(status, Ok(exit) if exit.success()) {
+            diagnostics::error_event(
+                DIAGNOSTICS_MODULE,
+                "web_console_shutdown_failed",
+                "Failed to terminate the launcher-owned Web Console",
+                &std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("taskkill failed for pid {pid}"),
+                ),
+                &[("pid", pid.to_string())],
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_name_matches(pid: u32, expected_name: &str) -> bool {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    let expected = format!("\"{}\"", expected_name.to_ascii_lowercase());
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.to_ascii_lowercase().starts_with(&expected))
 }
 
 #[tauri::command]
@@ -1483,10 +1552,10 @@ struct PetStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        console_toggle_decision, default_pet_state_message, normalize_pet_state,
-        pet_action_frame_offsets, pet_action_frame_scales, pet_action_frames, pet_action_from_args,
-        pet_bubble_asset,
-        normalize_gui_web_url, pet_status_for_event, startup_visibility, throne_drop_contains, throne_snap_position,
+        console_toggle_decision, default_pet_state_message, normalize_gui_web_url,
+        normalize_pet_state, owned_web_console_pid, pet_action_frame_offsets,
+        pet_action_frame_scales, pet_action_frames, pet_action_from_args, pet_bubble_asset,
+        pet_status_for_event, startup_visibility, throne_drop_contains, throne_snap_position,
         web_console_parent_pid_from_args_or_env, ConsoleToggleDecision, ThroneZone, PET_THEME_JSON,
         PET_WINDOW_SIZE,
     };
@@ -1555,7 +1624,7 @@ mod tests {
         );
         assert_eq!(
             MAIN_RS.matches("diagnostics::error_event(\n").count(),
-            8,
+            9,
             "init failure and every Tauri shell error should use diagnostics::error_event"
         );
         for removed_helper in ["log_tauri_shell_error", "escape_json", "unix_millis"] {
@@ -1833,6 +1902,46 @@ mod tests {
             web_console_parent_pid_from_args_or_env(&no_arg, Some("not-a-pid".to_string())),
             None
         );
+    }
+
+    #[test]
+    fn pet_exit_only_targets_launcher_owned_web_console_pid() {
+        let args = vec![
+            "coolzhu-tauri-shell.exe".to_string(),
+            "--web-console-pid=12345".to_string(),
+        ];
+        assert_eq!(owned_web_console_pid(&args, 9999), Some(12345));
+        assert_eq!(
+            owned_web_console_pid(&args, 12345),
+            None,
+            "the shell must never taskkill itself when a stale pid equals its own pid"
+        );
+
+        let standalone = vec!["coolzhu-tauri-shell.exe".to_string()];
+        assert_eq!(owned_web_console_pid(&standalone, 9999), None);
+    }
+
+    #[test]
+    fn pet_exit_path_reclaims_web_console_before_app_exit() {
+        let production = MAIN_RS
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source should precede tests");
+        let quit = production
+            .find("fn quit_application(")
+            .expect("quit_application should exist");
+        let terminate = production[quit..]
+            .find("terminate_owned_web_console_process();")
+            .map(|offset| quit + offset)
+            .expect("quit_application should terminate the owned web console");
+        let exit = production[terminate..]
+            .find("app.exit(0);")
+            .map(|offset| terminate + offset)
+            .expect("quit_application should exit the Tauri app");
+        assert!(terminate < exit);
+        assert!(production.contains("quit_application(&app_for_close)"));
+        assert!(production.contains("quit_application(app)"));
+        assert!(production.contains("#[tauri::command]\nfn quit_app"));
     }
 
     #[test]

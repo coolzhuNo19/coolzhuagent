@@ -538,7 +538,7 @@ fn current_showui_pid() -> Option<u32> {
         .and_then(|process| process.as_ref().map(std::process::Child::id))
 }
 
-/// 桌宠退出是否联动关闭 web-console（进程联动风险项，默认 false）。
+/// 桌宠退出是否联动关闭 web-console（默认开启；显式配置 false 才保留控制台）。
 fn pet_exit_closes_console_enabled() -> bool {
     read_config(|config| config.pet.pet_exit_closes_console)
 }
@@ -5282,8 +5282,8 @@ struct ConfigPet {
     enabled: bool,
     #[serde(default)]
     exe_path: Option<String>,
-    /// 桌宠退出时是否联动关闭 web-console（默认 false）。开启后桌宠退出会带动控制台优雅退出。
-    #[serde(default)]
+    /// 桌宠退出时是否联动关闭 web-console（默认 true）。显式设为 false 才保留控制台。
+    #[serde(default = "default_true")]
     pet_exit_closes_console: bool,
 }
 
@@ -5611,7 +5611,7 @@ impl Default for ConfigPet {
         Self {
             enabled: default_true(),
             exe_path: None,
-            pet_exit_closes_console: false,
+            pet_exit_closes_console: true,
         }
     }
 }
@@ -63964,17 +63964,17 @@ attach: last_assistant
         assert!(WEB_MAIN_RS.contains(".stderr(Stdio::null())"));
         let forced_exit = ["std::process", "::exit(0)"].concat();
         assert!(!WEB_MAIN_RS.contains(&forced_exit)); // 优雅退出（信号 + with_graceful_shutdown），不用硬退出
-                                                      // 桌宠退出联动 web-console（可配置 pet_exit_closes_console，默认关）：新设计
+                                                      // 桌宠退出联动 web-console（可配置 pet_exit_closes_console，默认开）：新设计
         assert!(WEB_MAIN_RS.contains("pet_exit_closes_console"));
         assert!(WEB_MAIN_RS.contains("web_console_shutdown_signal"));
         assert!(WEB_MAIN_RS.contains("with_graceful_shutdown"));
     }
 
     #[test]
-    fn web_console_pet_exit_does_not_close_console_by_default() {
+    fn web_console_pet_exit_closes_console_by_default() {
         assert!(
-            !super::ConfigPet::default().pet_exit_closes_console,
-            "web-console should stay reachable by default when the desktop pet exits"
+            super::ConfigPet::default().pet_exit_closes_console,
+            "web-console should close by default when the desktop pet exits"
         );
         assert!(WEB_MAIN_RS.contains("pet_exit_closes_console"));
         assert!(WEB_MAIN_RS.contains("pet_exit_closes_console_enabled"));

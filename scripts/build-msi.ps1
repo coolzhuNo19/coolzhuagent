@@ -19,6 +19,7 @@ $packageRootCandidate = if ([System.IO.Path]::IsPathRooted($PackageRoot)) {
 $packageRoot = [System.IO.Path]::GetFullPath($packageRootCandidate).TrimEnd('\', '/')
 $productWxs = Join-Path $workspace 'installer\Product.wxs'
 $installerIcon = Join-Path $workspace 'docs\design-assets\coolzhu-icons-2026-08-12\coolzhu-installer-icon.ico'
+$applicationIcon = Join-Path $workspace 'docs\design-assets\coolzhu-icons-2026-08-12\coolzhu-application-icon.ico'
 $distDir = Join-Path $workspace 'dist'
 $localDotnetExe = Join-Path $workspace 'tmp\tools\dotnet\dotnet.exe'
 $wixToolDir = Join-Path $workspace 'tmp\tools\wix'
@@ -174,6 +175,9 @@ if (-not (Test-Path -LiteralPath $productWxs)) {
 if (-not (Test-Path -LiteralPath $installerIcon -PathType Leaf)) {
     throw "Installer icon missing: $installerIcon"
 }
+if (-not (Test-Path -LiteralPath $applicationIcon -PathType Leaf)) {
+    throw "Application icon missing: $applicationIcon"
+}
 
 $packageSafetyReport = Join-Path $distDir "CoolzhuAgent-$Version-package-safety.json"
 New-Item -ItemType Directory -Force -Path $distDir | Out-Null
@@ -228,6 +232,7 @@ $wixBuildArgs = @(
     '-d', "Version=$Version",
     '-d', "PackageRoot=$packageRoot",
     '-d', "InstallerIcon=$installerIcon",
+    '-d', "ApplicationIcon=$applicationIcon",
     '-out', $stagingMsi
 )
 if ($useLocalDotnetForWix) {

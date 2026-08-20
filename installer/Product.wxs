@@ -7,6 +7,7 @@
     <MajorUpgrade DowngradeErrorMessage="已安装更高版本的 [ProductName]。" />
     <MediaTemplate EmbedCab="yes" />
     <Icon Id="CoolzhuInstallerIcon" SourceFile="$(InstallerIcon)" />
+    <Icon Id="CoolzhuApplicationIcon" SourceFile="$(ApplicationIcon)" />
     <Property Id="ARPPRODUCTICON" Value="CoolzhuInstallerIcon" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
@@ -42,11 +43,13 @@
                 Directory="AppMenuDir"
                 Name="COOLZHU CODE Agent"
                 Target="[INSTALLDIR]COOLZHU-AGENT.exe"
+                Icon="CoolzhuApplicationIcon"
                 WorkingDirectory="INSTALLDIR" />
       <Shortcut Id="DesktopShortcut"
                 Directory="DesktopFolder"
                 Name="COOLZHU CODE Agent"
                 Target="[INSTALLDIR]COOLZHU-AGENT.exe"
+                Icon="CoolzhuApplicationIcon"
                 WorkingDirectory="INSTALLDIR" />
       <RemoveFolder Id="RemoveAppMenuDir"
                     Directory="AppMenuDir"

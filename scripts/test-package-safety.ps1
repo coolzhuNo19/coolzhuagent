@@ -248,6 +248,38 @@ foreach ($requiredExclude in @(
     }
 }
 
+# Windows 小尺寸/高 DPI 图标契约：ICO 必须保留完整的 Shell 尺寸集合，且
+# 安装器构建脚本和两个快捷方式都必须显式使用应用 ICO，不能退回 launcher 默认图标。
+$iconAssetRoot = Join-Path $workspace 'docs\design-assets\coolzhu-icons-2026-08-12'
+$applicationIcon = Join-Path $iconAssetRoot 'coolzhu-application-icon.ico'
+$installerIcon = Join-Path $iconAssetRoot 'coolzhu-installer-icon.ico'
+foreach ($iconPath in @($applicationIcon, $installerIcon)) {
+    if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
+        throw "icon asset missing: $iconPath"
+    }
+    $iconBytes = [System.IO.File]::ReadAllBytes($iconPath)
+    if ($iconBytes.Length -lt 22 -or $iconBytes[0] -ne 0 -or $iconBytes[1] -ne 0 -or $iconBytes[2] -ne 1 -or $iconBytes[3] -ne 0) {
+        throw "invalid ICO header: $iconPath"
+    }
+    $iconCount = [int]$iconBytes[4] + (256 * [int]$iconBytes[5])
+    if ($iconCount -lt 7 -or $iconBytes.Length -lt (6 + (16 * $iconCount))) {
+        throw "ICO does not contain the expected multi-size directory: $iconPath"
+    }
+    $sizes = @(
+        for ($index = 0; $index -lt $iconCount; $index += 1) {
+            $offset = 6 + (16 * $index)
+            $width = if ($iconBytes[$offset] -eq 0) { 256 } else { [int]$iconBytes[$offset] }
+            $height = if ($iconBytes[$offset + 1] -eq 0) { 256 } else { [int]$iconBytes[$offset + 1] }
+            if ($width -ne $height) { throw "non-square ICO entry at index ${index}: $iconPath" }
+            $width
+        }
+    )
+    foreach ($expectedSize in @(16, 24, 32, 48, 64, 128, 256)) {
+        if ($sizes -notcontains $expectedSize) {
+            throw "ICO missing ${expectedSize}px entry: $iconPath"
+        }
+    }
+}
 # 由稳定组件拥有安装目录，避免收集得到的文件组件在卸载后遗留空目录。
 # 让 XML 解析器直接加载文件，并遵循 XML 声明中的默认 UTF-8 编码。
 $productWxsXml = New-Object System.Xml.XmlDocument
@@ -285,8 +317,45 @@ foreach ($contract in $installDirectoryContracts) {
         throw "Product.wxs missing installer directory contract: $($contract.Name)"
     }
 }
+$applicationIconNode = $productWxsXml.SelectSingleNode(
+    '//wix:Icon[@Id="CoolzhuApplicationIcon" and @SourceFile="$(ApplicationIcon)"]',
+    $wixNamespace
+)
+if (-not $applicationIconNode) {
+    throw 'Product.wxs missing CoolzhuApplicationIcon source contract'
+}
+foreach ($shortcutId in @('StartMenuShortcut', 'DesktopShortcut')) {
+    $shortcut = $launcherComponent.SelectSingleNode(
+        "wix:Shortcut[@Id='$shortcutId' and @Icon='CoolzhuApplicationIcon']",
+        $wixNamespace
+    )
+    if (-not $shortcut) {
+        throw "Product.wxs shortcut missing application icon contract: $shortcutId"
+    }
+}
 
 $buildMsiScript = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'scripts\build-msi.ps1')
+$buildMsiIconContracts = @(
+    '$applicationIcon = Join-Path',
+    'ApplicationIcon=$applicationIcon',
+    'Application icon missing'
+)
+foreach ($requiredIconContract in $buildMsiIconContracts) {
+    if ($buildMsiScript.IndexOf($requiredIconContract, [System.StringComparison]::Ordinal) -lt 0) {
+        throw "build-msi.ps1 missing application icon contract: $requiredIconContract"
+    }
+}
+$tauriBuildScript = Get-Content -Raw -Encoding UTF8 -LiteralPath (
+    Join-Path $workspace 'modules\gui-desktop\packages\tauri-shell\src-tauri\build.rs'
+)
+foreach ($requiredTauriIconContract in @(
+    'rerun-if-changed=icons/icon.ico',
+    'rerun-if-changed=icons/icon.png'
+)) {
+    if ($tauriBuildScript.IndexOf($requiredTauriIconContract, [System.StringComparison]::Ordinal) -lt 0) {
+        throw "Tauri build.rs missing icon rebuild contract: $requiredTauriIconContract"
+    }
+}
 $buildMsiTokens = $null
 $buildMsiParseErrors = $null
 $buildMsiAst = [System.Management.Automation.Language.Parser]::ParseInput(
