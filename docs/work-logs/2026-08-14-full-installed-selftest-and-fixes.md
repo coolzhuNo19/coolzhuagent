@@ -53,8 +53,11 @@
 | #50 | 诊断日志记录 API Key/Key reference 的前缀 | 新版本只记录布尔 `reference_present`，不记录任何内容、派生前后缀或指纹；增加源码级回归。 |
 | #51 | Windows `core.autocrlf` 使 14 项前端静态契约批量假失败 | 仅在测试输入侧规范化 CRLF/CR 为 LF；ASR 回归不再依赖本机 ffmpeg 的英文错误文本。 |
 | #52 | 文档规定执行 `module_linkage_smoke`，但当前 main 缺少该测试目标 | 恢复根级 4 项模块联接 smoke，覆盖 computer-use 锚点、vision parser、server app 构造和 runtime session。 |
+| #53 | 安装后的桌面快捷方式没有显示 CZ 应用图标 | WiX 新增 `CoolzhuApplicationIcon`，开始菜单与桌面快捷方式显式绑定应用 ICO；安装态 `IconLocation` 已指向 MSI 提取的应用图标。 |
+| #54 | 桌宠退出时未默认关闭 COOLZHU Agent 及其子进程 | Web Console 的 `pet_exit_closes_console` 默认改为 true；Tauri 桌宠关闭、托盘退出和 `quit_app` 统一按 launcher 注入 PID 校验进程名后回收 web-console 进程树。 |
+| #55 | Windows 高 DPI/小尺寸下 CZ 图标资源缩放异常 | Tauri build.rs 显式声明 ICO/PNG 依赖，避免增量构建复用旧 PE 资源；包安全契约校验 16/24/32/48/64/128/256 全尺寸。 |
 
-所有问题均有 GitHub Issue；最终 PR 使用 `Fixes #35 #45 #46 #47 #48 #49 #50 #51 #52` 关联。
+所有问题均有 GitHub Issue；最终 PR 使用 `Fixes #35 #45 #46 #47 #48 #49 #50 #51 #52 #53 #54 #55` 关联。
 
 ## 5. 修复后的回归门槛
 
@@ -78,15 +81,17 @@
 
 ## 7. 最终安装包与交付闭环
 
-待最终代码提交、重建和真实安装生命周期完成后补记：
+最终代码提交、重建和真实安装生命周期已完成：
 
-- 源码提交：`PENDING`
-- MSI：`dist/CoolzhuAgent-0.2.5.msi`
-- 大小：`PENDING`
-- SHA-256：`PENDING`
-- staged launcher self-check：`PENDING`
-- 最终安装/启动：`PENDING`
-- 最终卸载根目录清理：`PENDING`
-- 再次安装/启动：`PENDING`
-- 最终安装态短屏 DOM 复核：`PENDING`
+- 源码提交：`5d39cd5794b03167c2d28e0e7cc1673390393a48`
+- MSI：`dist/CoolzhuAgent-0.2.5-20260821-000714.msi`
+- 大小：`194,836,260` bytes
+- SHA-256：`C6972BBAE51814E0410FA8033C148F55206C7148E66AFA725186AC9CA6C68B3B`
+- staged/installed launcher self-check：`ok=true`；安装态 PID 为 web-console `17368`、Tauri `6128`
+- 最终安装/启动：PASS；注册版本 `0.2.5`，CLI、3 个会话和 GLM-5.2 active 状态通过
+- 最终卸载根目录清理：PASS；卸载后 `C:\Program Files\CoolzhuAgent` 不存在，注册项和 8765 listener 均为 0
+- 再次安装/启动：PASS；安装态快捷方式存在，health、sessions、grounding/locate backend 检查通过
+- 桌面快捷方式图标：PASS；`IconLocation` 为 MSI 缓存的 `CoolzhuApplicationIcon`，文件 68,275 bytes，SHA 与应用 ICO 母版一致
+- 图标资源：PASS；Tauri PE 含 7 项 `GROUP_ICON` 尺寸，安装包 WiX 反编译确认两个快捷方式均绑定 `CoolzhuApplicationIcon`
+- 高 DPI/ShowUI：本机 250% 缩放下只完成资源/契约与安装态验证；无 NVIDIA/CUDA/ShowUI 时按授权跳过真实 grounding/闭环点击
 - Pull Request：`PENDING`
