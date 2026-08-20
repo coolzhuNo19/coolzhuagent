@@ -94,4 +94,4 @@
 - 桌面快捷方式图标：PASS；`IconLocation` 为 MSI 缓存的 `CoolzhuApplicationIcon`，文件 68,275 bytes，SHA 与应用 ICO 母版一致
 - 图标资源：PASS；Tauri PE 含 7 项 `GROUP_ICON` 尺寸，安装包 WiX 反编译确认两个快捷方式均绑定 `CoolzhuApplicationIcon`
 - 高 DPI/ShowUI：本机 250% 缩放下只完成资源/契约与安装态验证；无 NVIDIA/CUDA/ShowUI 时按授权跳过真实 grounding/闭环点击
-- Pull Request：`PENDING`
+- Pull Request：[#56](https://github.com/coolzhulike/coolzhuagent/pull/56)
