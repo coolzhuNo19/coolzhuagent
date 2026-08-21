@@ -61427,7 +61427,7 @@ attach: last_assistant
     fn web_frontend_confirms_chat_room_delete_with_impact_preview() {
         assert!(WEB_INDEX_HTML.contains("chat-room-delete"));
         assert!(WEB_INDEX_HTML.contains("chat-room-rename"));
-        assert!(WEB_INDEX_HTML.contains("message-delete-selected"));
+        assert!(!WEB_INDEX_HTML.contains("message-delete-selected"));
         assert!(WEB_INDEX_HTML.contains("memory-bead-list"));
         assert!(WEB_APP_JS.contains("deleteSelectedChatRoom"));
         assert!(WEB_APP_JS.contains("renameSelectedChatRoom"));
@@ -61445,9 +61445,9 @@ attach: last_assistant
     }
 
     #[test]
-    fn web_frontend_exposes_handoff_roster_drawer_and_manual_transfer() {
-        assert!(WEB_INDEX_HTML.contains("chat-handoff-toggle"));
-        assert!(WEB_INDEX_HTML.contains("chat-handoff-manual"));
+    fn web_frontend_keeps_handoff_state_internal_to_the_slim_chat_sidebar() {
+        assert!(!WEB_INDEX_HTML.contains("chat-handoff-toggle"));
+        assert!(!WEB_INDEX_HTML.contains("chat-handoff-manual"));
         assert!(WEB_INDEX_HTML.contains("data-role=\"chat-roster\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"handoff-drawer\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"handoff-list\""));
@@ -61533,9 +61533,30 @@ attach: last_assistant
     fn web_frontend_chat_context_controls_live_in_compact_left_sidebar() {
         assert!(WEB_INDEX_HTML.contains("class=\"chat-left-rail\""));
         assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"chat-actions\""));
-        assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"channel-models\""));
         assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"conversation-list\""));
         assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"recipient-targets\""));
+        assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"room-permissions\""));
+        assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"workspace-settings\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"chat-permission-save\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"chat-workspace-edit\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"chat-permission-select\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"chat-workspace-path\""));
+        assert!(WEB_APP_JS.contains("async function saveChatRoomPermission"));
+        assert!(WEB_APP_JS.contains("function setChatWorkspacePath"));
+        assert!(WEB_APP_JS.contains("beginWorkspaceEdit('[data-role=\"chat-workspace-path\"]')"));
+        assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"channel-models\" hidden"));
+        for removed_action in [
+            "chat-room-diagnostics",
+            "chat-handoff-toggle",
+            "chat-handoff-manual",
+            "message-load-older",
+            "message-delete-selected",
+        ] {
+            assert!(
+                !WEB_INDEX_HTML.contains(&format!("data-action=\"{removed_action}\"")),
+                "聊天室左栏不应暴露非核心快捷操作 {removed_action}"
+            );
+        }
         assert!(!WEB_INDEX_HTML.contains("data-sidebar-group=\"quick-filters\""));
         assert!(!WEB_INDEX_HTML.contains("class=\"chat-sidebar-group chat-quick-filters\""));
         assert!(!WEB_INDEX_HTML.contains("data-chat-filter="));
@@ -61544,20 +61565,24 @@ attach: last_assistant
         let chat_actions = WEB_INDEX_HTML
             .find("data-sidebar-group=\"chat-actions\"")
             .expect("chat actions group exists");
-        let channel_models = WEB_INDEX_HTML
-            .find("data-sidebar-group=\"channel-models\"")
-            .expect("channel/model group exists");
         let conversation_list = WEB_INDEX_HTML
             .find("data-sidebar-group=\"conversation-list\"")
             .expect("conversation list group exists");
         let recipients = WEB_INDEX_HTML
             .find("data-sidebar-group=\"recipient-targets\"")
             .expect("recipient group exists");
+        let permissions = WEB_INDEX_HTML
+            .find("data-sidebar-group=\"room-permissions\"")
+            .expect("permission group exists");
+        let workspace = WEB_INDEX_HTML
+            .find("data-sidebar-group=\"workspace-settings\"")
+            .expect("workspace group exists");
         assert!(
-            chat_actions < channel_models
-                && channel_models < conversation_list
-                && conversation_list < recipients,
-            "chat sidebar must match the approved session design order"
+            chat_actions < conversation_list
+                && conversation_list < recipients
+                && recipients < permissions
+                && permissions < workspace,
+            "chat sidebar must keep room management, recipients, permission and workspace order"
         );
         assert!(!WEB_STYLES_CSS.contains(".chat-compact-actions {\n  margin-top: auto;"));
         assert!(WEB_STYLES_CSS.contains("--top-region-ratio: 12%"));
@@ -63080,10 +63105,11 @@ attach: last_assistant
     }
 
     #[test]
-    fn web_frontend_has_functional_selfcheck_and_room_diagnostics_controls() {
+    fn web_frontend_has_functional_selfcheck_and_room_permission_controls() {
         assert!(WEB_INDEX_HTML.contains("data-action=\"diagnostics-functional\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"functional-selfcheck-output\""));
-        assert!(WEB_INDEX_HTML.contains("data-action=\"chat-room-diagnostics\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"chat-permission-save\""));
+        assert!(!WEB_INDEX_HTML.contains("data-action=\"chat-room-diagnostics\""));
         assert!(WEB_APP_JS.contains("data-diagnostics-field=\"real_llm_enabled\""));
         assert!(WEB_APP_JS.contains("data-diagnostics-field=\"computer_use_enabled\""));
         assert!(WEB_APP_JS.contains("full-access（双重确认 + 审批）"));
@@ -63525,7 +63551,7 @@ attach: last_assistant
     }
 
     #[test]
-    fn web_frontend_hides_completed_reasoning_cards_but_keeps_tool_results() {
+    fn web_frontend_keeps_completed_reasoning_cards_and_tool_results() {
         assert!(WEB_MAIN_RS.contains("let reasoning_id = format!(\"{assistant_id}-thinking\");"));
         assert!(WEB_MAIN_RS.contains("let mut assistant_started = false;"));
         assert!(WEB_MAIN_RS.contains("if !assistant_started"));
@@ -63535,7 +63561,10 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("function isGoalPhaseMessage"));
         assert!(WEB_APP_JS.contains("message.kind !== \"reasoning\""));
         assert!(WEB_APP_JS.contains("message.kind !== \"tool-call\""));
-        assert!(WEB_APP_JS.contains("function hideReasoningForAssistant"));
+        assert!(!WEB_APP_JS.contains("function hideReasoningForAssistant"));
+        assert!(!WEB_APP_JS.contains("hideReasoningForAssistant(data.id)"));
+        assert!(WEB_APP_JS.contains("if (data?.kind === \"reasoning\")"));
+        assert!(WEB_APP_JS.contains("upsertMessage(data, { streaming: false });"));
     }
 
     #[test]
@@ -64253,6 +64282,9 @@ attach: last_assistant
     fn web_frontend_refreshes_workspace_bound_state_after_workspace_switch() {
         assert!(WEB_APP_JS.contains("await refreshWorkspaceBoundState(result.workspace)"));
         assert!(WEB_APP_JS.contains("function resetWorkspaceBoundUiState"));
+        assert!(WEB_APP_JS.contains("taskFullAccessStatus = { full_access: false, permission_profile: \"workspace-write\" }"));
+        assert!(WEB_APP_JS.contains("setChatWorkspacePath(workspace)"));
+        assert!(WEB_APP_JS.contains("taskRenderFullAccessStatus(taskFullAccessStatus)"));
         assert!(WEB_APP_JS.contains("renderAgentOptions([], [])"));
         assert!(WEB_APP_JS
             .contains("messagePaging = { roomId: null, hasMore: false, nextBefore: null }"));
