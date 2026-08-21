@@ -1,7 +1,7 @@
 # Codex open-source harness 与 coolzhu agent 功能差异分析
 
-日期：2026-08-22（Asia/Shanghai）  
-分析对象：OpenAI Codex open-source harness 与当前 `coolzhu agent` 工程  
+日期：2026-08-22（Asia/Shanghai）
+分析对象：OpenAI Codex open-source harness 与当前 `coolzhu agent` 工程
 分析方式：源码静态盘点、接口/目录/测试数量对照；未把任一工程源码直接复制到另一工程。
 
 ## 1. 基线与来源
