@@ -3254,6 +3254,9 @@ impl ApiClient for DefaultRuntimeClient {
                         }
                         ContentBlockDelta::ThinkingDelta { thinking } => {
                             if !thinking.is_empty() {
+                                writeln!(out, "\n[reasoning] {thinking}")
+                                    .and_then(|()| out.flush())
+                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
                                 events.push(AssistantEvent::ReasoningDelta {
                                     text: thinking,
                                     redacted: false,
