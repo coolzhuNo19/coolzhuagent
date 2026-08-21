@@ -2115,8 +2115,15 @@ impl ApiClient for ProviderRuntimeClient {
                                 input.push_str(&partial_json);
                             }
                         }
-                        ContentBlockDelta::ThinkingDelta { .. }
-                        | ContentBlockDelta::SignatureDelta { .. } => {}
+                        ContentBlockDelta::ThinkingDelta { thinking } => {
+                            if !thinking.is_empty() {
+                                events.push(AssistantEvent::ReasoningDelta {
+                                    text: thinking,
+                                    redacted: false,
+                                });
+                            }
+                        }
+                        ContentBlockDelta::SignatureDelta { .. } => {}
                     },
                     ApiStreamEvent::ContentBlockStop(stop) => {
                         if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
@@ -2141,6 +2148,11 @@ impl ApiClient for ProviderRuntimeClient {
             if !saw_stop
                 && events.iter().any(|event| {
                     matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+                        || matches!(
+                            event,
+                            AssistantEvent::ReasoningDelta { text, redacted: false }
+                                if !text.is_empty()
+                        )
                         || matches!(event, AssistantEvent::ToolUse { .. })
                 })
             {
@@ -2262,7 +2274,20 @@ fn push_output_block(
             };
             pending_tools.insert(block_index, (id, name, initial_input));
         }
-        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
+        OutputContentBlock::Thinking { thinking, .. } => {
+            if !thinking.is_empty() {
+                events.push(AssistantEvent::ReasoningDelta {
+                    text: thinking,
+                    redacted: false,
+                });
+            }
+        }
+        OutputContentBlock::RedactedThinking { .. } => {
+            events.push(AssistantEvent::ReasoningDelta {
+                text: String::new(),
+                redacted: true,
+            });
+        }
     }
 }
 
@@ -3808,6 +3833,42 @@ mod tests {
                 "{\"pattern\":\"TODO\"}".to_string(),
             ))
         );
+    }
+
+    #[test]
+    fn provider_thinking_blocks_become_reasoning_events() {
+        let mut events = Vec::new();
+        let mut pending_tools = BTreeMap::new();
+
+        push_output_block(
+            OutputContentBlock::Thinking {
+                thinking: "检查工具输入".to_string(),
+                signature: None,
+            },
+            0,
+            &mut events,
+            &mut pending_tools,
+            true,
+        );
+        push_output_block(
+            OutputContentBlock::RedactedThinking {
+                data: json!({"sealed": true}),
+            },
+            1,
+            &mut events,
+            &mut pending_tools,
+            true,
+        );
+
+        assert!(matches!(
+            events.first(),
+            Some(AssistantEvent::ReasoningDelta { text, redacted: false })
+                if text == "检查工具输入"
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(AssistantEvent::ReasoningDelta { text, redacted: true }) if text.is_empty()
+        ));
     }
 
     #[test]

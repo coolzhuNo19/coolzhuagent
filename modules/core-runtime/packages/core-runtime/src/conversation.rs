@@ -19,6 +19,9 @@ pub struct ApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
     TextDelta(String),
+    /// 可展示的模型思考摘要增量。`redacted` 用于标记 provider 只提供了
+    /// 脱敏/加密思考块，调用方不应把它当作普通可见文本展示。
+    ReasoningDelta { text: String, redacted: bool },
     ToolUse {
         id: String,
         name: String,
@@ -86,6 +89,8 @@ pub struct TurnSummary {
     pub tool_results: Vec<ConversationMessage>,
     pub iterations: usize,
     pub usage: TokenUsage,
+    /// 本轮模型返回的 reasoning summary；不与最终 assistant 文本混合。
+    pub reasoning_text: String,
 }
 
 pub struct ConversationRuntime<C, T> {
@@ -162,6 +167,7 @@ where
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
         let mut iterations = 0;
+        let mut reasoning_text = String::new();
 
         loop {
             iterations += 1;
@@ -176,7 +182,8 @@ where
                 messages: self.session.messages.clone(),
             };
             let events = self.api_client.stream(request)?;
-            let (assistant_message, usage) = build_assistant_message(events)?;
+            let (assistant_message, usage, iteration_reasoning) = build_assistant_message(events)?;
+            reasoning_text.push_str(&iteration_reasoning);
             if let Some(usage) = usage {
                 self.usage_tracker.record(usage);
             }
@@ -259,6 +266,7 @@ where
             tool_results,
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
+            reasoning_text,
         })
     }
 
@@ -290,8 +298,9 @@ where
 
 fn build_assistant_message(
     events: Vec<AssistantEvent>,
-) -> Result<(ConversationMessage, Option<TokenUsage>), RuntimeError> {
+) -> Result<(ConversationMessage, Option<TokenUsage>, String), RuntimeError> {
     let mut text = String::new();
+    let mut reasoning_text = String::new();
     let mut blocks = Vec::new();
     let mut finished = false;
     let mut usage = None;
@@ -299,6 +308,11 @@ fn build_assistant_message(
     for event in events {
         match event {
             AssistantEvent::TextDelta(delta) => text.push_str(&delta),
+            AssistantEvent::ReasoningDelta { text, redacted } => {
+                if !redacted {
+                    reasoning_text.push_str(&text);
+                }
+            }
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
@@ -324,6 +338,7 @@ fn build_assistant_message(
     Ok((
         ConversationMessage::assistant_with_usage(blocks, usage),
         usage,
+        reasoning_text,
     ))
 }
 
@@ -519,6 +534,51 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn preserves_reasoning_summary_separately_from_final_answer() {
+        struct ReasoningApi;
+
+        impl ApiClient for ReasoningApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::ReasoningDelta {
+                        text: "先检查输入，再给出结论。".to_string(),
+                        redacted: false,
+                    },
+                    AssistantEvent::ReasoningDelta {
+                        text: "[provider redacted]".to_string(),
+                        redacted: true,
+                    },
+                    AssistantEvent::TextDelta("结论已就绪。".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ReasoningApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("请分析", None)
+            .expect("reasoning turn should succeed");
+
+        assert_eq!(summary.reasoning_text, "先检查输入，再给出结论。");
+        assert_eq!(
+            summary.assistant_messages[0].blocks,
+            vec![ContentBlock::Text {
+                text: "结论已就绪。".to_string()
+            }]
+        );
     }
 
     #[test]
