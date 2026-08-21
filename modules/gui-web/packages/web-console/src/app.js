@@ -7639,9 +7639,12 @@ function memoryWindowRenderContextPreview(response, fallback = "No context previ
   const budget = response.token_budget || {};
   const messages = Array.isArray(response.messages) ? response.messages.length : 0;
   const beads = Array.isArray(response.memory_beads) ? response.memory_beads.length : 0;
+  const memoryIds = Array.isArray(response.memory_bead_ids) ? response.memory_bead_ids : [];
   const systemSnippet = String(response.system_prompt || "").slice(0, 500);
   node.textContent = [
+    `snapshot=${response.context_snapshot_id || "-"} memory_revision=${response.memory_revision || "-"}`,
     `messages=${messages} history=${response.history_message_count ?? 0} memory_beads=${beads}`,
+    `loaded_memory_ids=${memoryIds.join(",") || "none"} history_floor=${response.history_floor_millis ?? "none"}`,
     `tokens total=${budget.total ?? 0}/${budget.budget ?? 0} system=${budget.system ?? 0} memory=${budget.memory ?? 0} history=${budget.history ?? 0} user=${budget.user ?? 0}`,
     `truncated=${Boolean(response.truncated)}`,
     systemSnippet ? `system:\n${systemSnippet}` : "",

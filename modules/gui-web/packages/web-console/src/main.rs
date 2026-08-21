@@ -948,6 +948,10 @@ fn app() -> Router {
             get(api_computer_use_browser_health),
         )
         .route(
+            "/api/computer-use/capabilities",
+            get(api_computer_use_capabilities),
+        )
+        .route(
             "/api/computer-use/browser/probe",
             get(api_computer_use_browser_probe),
         )
@@ -2320,9 +2324,47 @@ fn emit_realtime_session_event(kind: &str, session_id: Option<String>, payload: 
         kind: kind.to_string(),
         at_ms: now,
         session_id,
-        payload,
+        payload: realtime_event_envelope(kind, payload),
     };
     let _ = realtime_session_event_bus().send(event);
+}
+
+/// 在保留旧 `kind` 的同时提供一个稳定的事件 schema，便于 CLI、Web 和未来
+/// Realtime 客户端按事件类型消费，不必依赖历史实现中的字符串分支。
+fn realtime_event_envelope(kind: &str, payload: JsonValue) -> JsonValue {
+    let event_type = realtime_event_type(kind, &payload);
+    let mut object = match payload {
+        JsonValue::Object(object) => object,
+        value => {
+            let mut object = serde_json::Map::new();
+            object.insert("data".to_string(), value);
+            object
+        }
+    };
+    object
+        .entry("schema_version".to_string())
+        .or_insert_with(|| JsonValue::String("coolzhu.realtime.v1".to_string()));
+    object
+        .entry("event_type".to_string())
+        .or_insert_with(|| JsonValue::String(event_type));
+    JsonValue::Object(object)
+}
+
+fn realtime_event_type(kind: &str, payload: &JsonValue) -> String {
+    match kind {
+        "partial_transcript" => "input_transcript_delta".to_string(),
+        "final_transcript" => "input_transcript_done".to_string(),
+        "assistant_started" => "response_started".to_string(),
+        "assistant_text" => "output_text_delta".to_string(),
+        "assistant_done" => "response_done".to_string(),
+        "model_stream_delta" => match payload.get("delta_kind").and_then(JsonValue::as_str) {
+            Some("thinking") => "reasoning_delta".to_string(),
+            Some("tool_json") => "tool_call_delta".to_string(),
+            _ => "output_text_delta".to_string(),
+        },
+        "tts_chunk" | "tts_stream_chunk" | "tts_audio_chunk" => "output_audio_delta".to_string(),
+        _ => format!("coolzhu.{kind}"),
+    }
 }
 
 fn active_realtime_session_event_target() -> Option<String> {
@@ -24088,6 +24130,7 @@ fn build_context_assembly_with_roster(
     let max_prompt_tokens = options.max_prompt_tokens.max(1);
     let mut truncated = false;
     let mut memory_beads = select_context_memory_beads(agent, current_user_text, options);
+    let memory_revision = context_memory_revision(agent);
     let build_system_prompt = |beads: &[MemoryBeadDto]| {
         let mut prompt = build_agent_system_prompt_with_beads(agent, beads);
         if let Some(roster) = collaboration_roster {
@@ -24271,6 +24314,19 @@ fn build_context_assembly_with_roster(
         .saturating_add(history_tokens)
         .saturating_add(user_tokens);
     let budget = max_prompt_tokens;
+    let memory_bead_ids = memory_beads
+        .iter()
+        .map(|bead| bead.id.clone())
+        .collect::<Vec<_>>();
+    let context_snapshot_id = context_snapshot_id(
+        agent,
+        &memory_revision,
+        options.history_floor_millis,
+        &memory_bead_ids,
+        &selected_history,
+        &system_prompt,
+        &current_user_text_for_prompt,
+    );
 
     ctx_span.record("outcome", "ok");
     diagnostics::info(
@@ -24289,6 +24345,10 @@ fn build_context_assembly_with_roster(
         system_prompt,
         messages,
         memory_beads,
+        context_snapshot_id,
+        memory_revision,
+        memory_bead_ids,
+        history_floor_millis: options.history_floor_millis,
         history_message_count: selected_history.len(),
         token_budget: ContextTokenBudget {
             system: system_tokens,
@@ -24300,6 +24360,53 @@ fn build_context_assembly_with_roster(
         },
         truncated,
     }
+}
+
+fn context_memory_revision(agent: &AgentSessionDto) -> String {
+    let mut parts = Vec::with_capacity(agent.memory_beads.len());
+    for bead in &agent.memory_beads {
+        parts.push(format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:.4}\u{1f}{}",
+            bead.id,
+            bead.layer,
+            bead.kind,
+            bead.source,
+            bead.summary,
+            bead.pinned,
+            bead.confidence,
+            bead.created_at,
+        ));
+    }
+    format!("mem-{:016x}", hash_bytes(parts.join("\u{1e}").as_bytes()))
+}
+
+fn context_snapshot_id(
+    agent: &AgentSessionDto,
+    memory_revision: &str,
+    history_floor_millis: Option<u64>,
+    memory_bead_ids: &[String],
+    selected_history: &[PersistedChatMessage],
+    system_prompt: &str,
+    current_user_text: &str,
+) -> String {
+    let history_identity = selected_history
+        .iter()
+        .map(|message| format!("{}:{}:{}", message.id, message.created_at, message.kind))
+        .collect::<Vec<_>>()
+        .join("\u{1e}");
+    let input_hash = hash_bytes(current_user_text.as_bytes());
+    let prompt_hash = hash_bytes(system_prompt.as_bytes());
+    let seed = format!(
+        "{}|{}|{}|{}|{}|{:016x}|{:016x}",
+        agent.id,
+        memory_revision,
+        history_floor_millis.unwrap_or_default(),
+        memory_bead_ids.join(","),
+        history_identity,
+        prompt_hash,
+        input_hash,
+    );
+    format!("ctx-{:016x}", hash_bytes(seed.as_bytes()))
 }
 
 fn select_context_memory_beads(
@@ -26735,6 +26842,13 @@ struct ContextAssembly {
     system_prompt: String,
     messages: Vec<InputMessage>,
     memory_beads: Vec<MemoryBeadDto>,
+    /// 本次装配的稳定身份；前端可用它判断预览是否已经过期。
+    context_snapshot_id: String,
+    /// 由候选 memory beads 内容计算的 revision，不把完整记忆文本复制到状态栏。
+    memory_revision: String,
+    /// 实际注入 prompt 的 bead id，便于诊断“记忆已加载但未进入上下文”的差异。
+    memory_bead_ids: Vec<String>,
+    history_floor_millis: Option<u64>,
     history_message_count: usize,
     token_budget: ContextTokenBudget,
     truncated: bool,
@@ -43799,6 +43913,65 @@ struct ComputerUseProfileResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct ComputerUseCapabilitiesResponse {
+    status: String,
+    generated_at_ms: u64,
+    showui: ComputerUseBackendCapabilityDto,
+    surfaces: Vec<ComputerUseSurfaceCapabilityDto>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ComputerUseBackendCapabilityDto {
+    backend: String,
+    status: String,
+    available: bool,
+    requires_model: bool,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ComputerUseSurfaceCapabilityDto {
+    surface: String,
+    status: String,
+    available: bool,
+    reason: String,
+    actions: Vec<ComputerUseActionCapabilityDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct ComputerUseActionCapabilityDto {
+    action: String,
+    supported: bool,
+    requires_confirmation: bool,
+}
+
+fn computer_use_surface_capability(
+    surface: &str,
+    available: bool,
+    status: &str,
+    reason: &str,
+    actions: &[(&str, bool, bool)],
+) -> ComputerUseSurfaceCapabilityDto {
+    ComputerUseSurfaceCapabilityDto {
+        surface: surface.to_string(),
+        status: status.to_string(),
+        available,
+        reason: reason.to_string(),
+        actions: actions
+            .iter()
+            .map(
+                |(action, supported, requires_confirmation)| ComputerUseActionCapabilityDto {
+                    action: (*action).to_string(),
+                    supported: *supported,
+                    requires_confirmation: *requires_confirmation,
+                },
+            )
+            .collect(),
+    }
+}
+
+#[derive(Debug, Serialize)]
 struct TimedPhase {
     name: String,
     description: String,
@@ -47327,6 +47500,109 @@ async fn api_computer_use_browser_native(upgrade: WebSocketUpgrade) -> impl Into
 
 async fn api_computer_use_browser_health() -> Json<browser_bridge::BrowserBridgeHealth> {
     Json(browser_bridge::health())
+}
+
+async fn api_computer_use_capabilities() -> Json<ComputerUseCapabilitiesResponse> {
+    let showui_service = showui_service_status_with_message("ShowUI capability probe completed.");
+    let showui_port_reachable = local_port_listening(LOCAL_SHOWUI_PORT);
+    let showui_available =
+        showui_port_reachable && showui_service.enabled && !showui_service.disabled;
+    let browser_health = browser_bridge::health();
+    let desktop_available = cfg!(windows);
+    let desktop_status = if desktop_available {
+        "available"
+    } else {
+        "skipped"
+    };
+    let browser_status = if browser_health.connected {
+        "available"
+    } else {
+        "skipped"
+    };
+    let showui_status = if showui_available {
+        "available"
+    } else {
+        "skipped"
+    };
+    let mut notes = vec![
+        "execute=false 的 dry-run、截图和坐标映射不依赖 ShowUI；真实输入仍需安全闸门和人工确认。"
+            .to_string(),
+    ];
+    if !showui_available {
+        notes.push(
+            "本机未检测到可用 ShowUI 本地模型，已将视觉 grounding 标记为 skipped，不把它伪报为可用。"
+                .to_string(),
+        );
+    }
+    if !browser_health.connected {
+        notes
+            .push("浏览器扩展/native host 未连接，DOM computer-use 能力保持 skipped。".to_string());
+    }
+    Json(ComputerUseCapabilitiesResponse {
+        status: if showui_available || browser_health.connected || desktop_available {
+            "degraded"
+        } else {
+            "skipped"
+        }
+        .to_string(),
+        generated_at_ms: unix_timestamp_millis(),
+        showui: ComputerUseBackendCapabilityDto {
+            backend: "showui".to_string(),
+            status: showui_status.to_string(),
+            available: showui_available,
+            requires_model: true,
+            reason: if showui_available {
+                "ShowUI 本地服务端口可达".to_string()
+            } else {
+                format!(
+                    "ShowUI 服务不可用（port_reachable={}, service_running={}）",
+                    showui_port_reachable, showui_service.running
+                )
+            },
+        },
+        surfaces: vec![
+            computer_use_surface_capability(
+                "desktop",
+                desktop_available,
+                desktop_status,
+                if desktop_available {
+                    "Windows desktop input adapter is available; UIA/截图仍需运行时目标。"
+                } else {
+                    "当前构建目标不是 Windows，跳过本地桌面输入测试。"
+                },
+                &[
+                    ("click", desktop_available, true),
+                    ("double_click", desktop_available, true),
+                    ("text_input", desktop_available, true),
+                    ("scroll", desktop_available, true),
+                    ("key_combination", desktop_available, true),
+                ],
+            ),
+            computer_use_surface_capability(
+                "browser",
+                browser_health.connected,
+                browser_status,
+                if browser_health.connected {
+                    "Coolzhu browser extension/native host is connected."
+                } else {
+                    "浏览器扩展/native host 未连接，等待用户安装并连接扩展。"
+                },
+                &[
+                    ("click", browser_health.connected, true),
+                    ("text_input", browser_health.connected, true),
+                    ("select", browser_health.connected, true),
+                    ("check", browser_health.connected, true),
+                    ("submit", browser_health.connected, true),
+                    ("scroll", browser_health.connected, true),
+                    ("drag", browser_health.connected, true),
+                    ("slider_drag", browser_health.connected, true),
+                    ("key_combination", browser_health.connected, true),
+                    ("multiple_tabs", browser_health.connected, true),
+                ],
+            ),
+        ],
+        notes,
+    })
 }
 
 async fn api_computer_use_browser_probe() -> Json<browser_bridge::BrowserBridgeProbe> {
@@ -63064,6 +63340,9 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("/beads/prompt"));
         assert!(WEB_APP_JS.contains("/context-preview"));
         assert!(WEB_APP_JS.contains("function memoryWindowRefreshPreviews"));
+        assert!(WEB_APP_JS.contains("context_snapshot_id"));
+        assert!(WEB_APP_JS.contains("memory_revision"));
+        assert!(WEB_APP_JS.contains("loaded_memory_ids"));
         assert!(WEB_APP_JS.contains("memory-bead-pin-toggle"));
         assert!(WEB_APP_JS.contains("memory-bead-edit"));
         assert!(!WEB_APP_JS.contains("memoryWindowBeads = memoryWindowBeads.map"));
@@ -64879,6 +65158,33 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains(&tts_chunk));
         assert!(WEB_APP_JS.contains(&tts_playback_started));
         assert!(WEB_APP_JS.contains(&tts_playback_ended));
+    }
+
+    #[test]
+    fn realtime_events_include_canonical_schema_without_breaking_legacy_kind() {
+        let partial = super::realtime_event_envelope(
+            "partial_transcript",
+            serde_json::json!({"text": "你好"}),
+        );
+        assert_eq!(partial["schema_version"], "coolzhu.realtime.v1");
+        assert_eq!(partial["event_type"], "input_transcript_delta");
+        assert_eq!(partial["text"], "你好");
+
+        let thinking = super::realtime_event_envelope(
+            "model_stream_delta",
+            serde_json::json!({"delta_kind": "thinking", "delta": "inspect"}),
+        );
+        assert_eq!(thinking["event_type"], "reasoning_delta");
+        assert_eq!(thinking["delta"], "inspect");
+    }
+
+    #[test]
+    fn computer_use_capability_probe_is_exposed_and_honest_about_showui_skip() {
+        assert!(WEB_MAIN_RS.contains("/api/computer-use/capabilities"));
+        assert!(WEB_MAIN_RS.contains("async fn api_computer_use_capabilities"));
+        assert!(WEB_MAIN_RS.contains("requires_model: true"));
+        assert!(WEB_MAIN_RS.contains("标记为 skipped"));
+        assert!(WEB_MAIN_RS.contains("computer_use_surface_capability"));
     }
 
     #[test]
@@ -66833,6 +67139,10 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            context_snapshot_id: "ctx-test".to_string(),
+            memory_revision: "mem-test".to_string(),
+            memory_bead_ids: Vec::new(),
+            history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
                 system: 100,
@@ -66912,6 +67222,10 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            context_snapshot_id: "ctx-test".to_string(),
+            memory_revision: "mem-test".to_string(),
+            memory_bead_ids: Vec::new(),
+            history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
                 system: 100,
@@ -66953,6 +67267,10 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            context_snapshot_id: "ctx-test".to_string(),
+            memory_revision: "mem-test".to_string(),
+            memory_bead_ids: Vec::new(),
+            history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
                 system: 100,
@@ -66998,6 +67316,10 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            context_snapshot_id: "ctx-test".to_string(),
+            memory_revision: "mem-test".to_string(),
+            memory_bead_ids: Vec::new(),
+            history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
                 system: 1_000,

@@ -1,3 +1,4 @@
+mod agent_event;
 mod bash;
 mod bootstrap;
 mod compact;
@@ -21,6 +22,7 @@ mod session;
 mod tool;
 mod usage;
 
+pub use agent_event::{AgentEvent, AgentEventKind, ContextSnapshot, ItemId, ThreadId, TurnId};
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use compact::{

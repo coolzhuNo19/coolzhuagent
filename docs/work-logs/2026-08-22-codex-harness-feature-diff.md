@@ -371,3 +371,22 @@ POST /api/realtime/session/stop
 ### 8.8 本节结论
 
 四项中，当前最需要优先修复的不是重新引入某个 Codex UI，而是把已有能力接到一个可回放的公共运行时边界：先让 reasoning、工具、上下文、审批、Computer Use 和语音都拥有同一套 thread/turn/item/sequence；再让 UI、CLI 和桌面分别做 projection。保留现有中文 Windows、GLM-5.2/agnes、UIA/DOM、安全闸门和本地音频差异化能力，同时只在 provider capability probe 通过时打开原生截图 CUA 或 Realtime，能避免测试结果虚假和后续维护分叉。
+
+## 9. 本轮执行结果（2026-08-22）
+
+本轮已按 P0-1、P0-2、P0-3 的最小可交付范围落地并保留兼容路径：
+
+1. `core-runtime` 新增公共 `ThreadId`、`TurnId`、`ItemId`、`AgentEvent`、`ContextSnapshot` 契约。`ConversationRuntime::run_turn` 现在为每轮生成稳定 turn id、上下文 revision 和事件序列；reasoning summary、工具请求、消息完成和 turn 完成均进入 `TurnSummary.events`。redacted thinking 仍不会混入可见 reasoning 文本。
+2. Web Console 的 context preview 增加 `context_snapshot_id`、`memory_revision`、实际注入的 `memory_bead_ids` 和 `history_floor_millis`，记忆窗口会显示这些值，便于确认加载边界和识别过期预览。
+3. `/api/computer-use/capabilities` 新增只读能力探测：分别返回 ShowUI、Desktop、Browser 的 `available/status/reason` 和动作清单。未检测到本地 ShowUI 时只把视觉 grounding 标记为 `skipped`，并明确说明 dry-run/坐标映射不依赖 ShowUI；未连接浏览器扩展时 DOM 能力同样保持 `skipped`。
+4. Realtime SSE 保留历史 `kind`，同时在 payload 中加入 `schema_version=coolzhu.realtime.v1` 和 canonical `event_type`（transcript、reasoning、text、audio），为后续统一 reducer 和 JSONL/录制回放提供兼容入口。
+
+本轮本地验证记录：
+
+- `node --check modules/gui-web/packages/web-console/src/app.js`：通过。
+- `cargo metadata --no-deps --offline --format-version 1`：通过。
+- `git diff --check`：通过。
+- `rustfmt --edition 2021` 对本轮修改的 Rust 文件：通过；全仓 `cargo fmt --check` 仍被其他未改文件的既有格式差异阻塞。
+- `cargo test -p coolzhu-core-runtime --offline`、`cargo check -p coolzhu-web-console --offline`：已启动依赖编译，但本机 MSVC 工具链缺少 `link.exe`，在依赖 build script 阶段停止，未进入 crate 测试；这属于设备工具链阻塞，不是测试断言失败。
+
+因此，运行时 GLM-5.2/agnes、Browser extension/native host、ShowUI 本地模型和麦克风/TTS 的真机回放仍需在相应服务可用时执行；本轮代码不会把缺少这些设备依赖误报为成功。

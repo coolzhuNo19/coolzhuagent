@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
+use crate::agent_event::{AgentEvent, AgentEventKind, ContextSnapshot, ItemId, ThreadId, TurnId};
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
@@ -21,7 +22,10 @@ pub enum AssistantEvent {
     TextDelta(String),
     /// 可展示的模型思考摘要增量。`redacted` 用于标记 provider 只提供了
     /// 脱敏/加密思考块，调用方不应把它当作普通可见文本展示。
-    ReasoningDelta { text: String, redacted: bool },
+    ReasoningDelta {
+        text: String,
+        redacted: bool,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -85,6 +89,10 @@ impl std::error::Error for RuntimeError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnSummary {
+    pub thread_id: ThreadId,
+    pub turn_id: TurnId,
+    pub context_snapshot: ContextSnapshot,
+    pub events: Vec<AgentEvent>,
     pub assistant_messages: Vec<ConversationMessage>,
     pub tool_results: Vec<ConversationMessage>,
     pub iterations: usize,
@@ -102,6 +110,8 @@ pub struct ConversationRuntime<C, T> {
     max_iterations: usize,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
+    thread_id: ThreadId,
+    next_turn_number: u64,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -146,7 +156,15 @@ where
             max_iterations: usize::MAX,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(&feature_config),
+            thread_id: ThreadId::default(),
+            next_turn_number: 0,
         }
+    }
+
+    #[must_use]
+    pub fn with_thread_id(mut self, thread_id: impl Into<String>) -> Self {
+        self.thread_id = ThreadId::new(thread_id);
+        self
     }
 
     #[must_use]
@@ -163,6 +181,29 @@ where
         self.session
             .messages
             .push(ConversationMessage::user_text(user_input.into()));
+
+        self.next_turn_number = self.next_turn_number.saturating_add(1);
+        let turn_id = TurnId::new(format!("turn-{}", self.next_turn_number));
+        let context_snapshot = ContextSnapshot::from_session(&self.thread_id, &self.session);
+        let mut event_log = vec![
+            AgentEvent::new(
+                1,
+                self.thread_id.clone(),
+                turn_id.clone(),
+                None,
+                AgentEventKind::TurnStarted,
+                serde_json::json!({"user_message_count": context_snapshot.user_message_count}),
+            ),
+            AgentEvent::new(
+                2,
+                self.thread_id.clone(),
+                turn_id.clone(),
+                None,
+                AgentEventKind::ContextSnapshot,
+                context_snapshot.event_payload(),
+            ),
+        ];
+        let mut next_event_sequence = 3;
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -181,9 +222,43 @@ where
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
             };
-            let events = self.api_client.stream(request)?;
-            let (assistant_message, usage, iteration_reasoning) = build_assistant_message(events)?;
+            let stream_events = self.api_client.stream(request)?;
+            let (assistant_message, usage, iteration_reasoning) =
+                build_assistant_message(stream_events)?;
             reasoning_text.push_str(&iteration_reasoning);
+            if !iteration_reasoning.is_empty() {
+                event_log.push(AgentEvent::new(
+                    next_event_sequence,
+                    self.thread_id.clone(),
+                    turn_id.clone(),
+                    None,
+                    AgentEventKind::ReasoningDelta,
+                    serde_json::json!({"text": iteration_reasoning, "redacted": false}),
+                ));
+                next_event_sequence = next_event_sequence.saturating_add(1);
+            }
+            for block in &assistant_message.blocks {
+                if let ContentBlock::ToolUse { id, name, input } = block {
+                    event_log.push(AgentEvent::new(
+                        next_event_sequence,
+                        self.thread_id.clone(),
+                        turn_id.clone(),
+                        Some(ItemId::new(id.clone())),
+                        AgentEventKind::ToolCall,
+                        serde_json::json!({"name": name, "input": input}),
+                    ));
+                    next_event_sequence = next_event_sequence.saturating_add(1);
+                }
+            }
+            event_log.push(AgentEvent::new(
+                next_event_sequence,
+                self.thread_id.clone(),
+                turn_id.clone(),
+                None,
+                AgentEventKind::MessageDone,
+                serde_json::json!({"block_count": assistant_message.blocks.len()}),
+            ));
+            next_event_sequence = next_event_sequence.saturating_add(1);
             if let Some(usage) = usage {
                 self.usage_tracker.record(usage);
             }
@@ -261,7 +336,23 @@ where
             }
         }
 
+        event_log.push(AgentEvent::new(
+            next_event_sequence,
+            self.thread_id.clone(),
+            turn_id.clone(),
+            None,
+            AgentEventKind::TurnCompleted,
+            serde_json::json!({
+                "iterations": iterations,
+                "reasoning_chars": reasoning_text.chars().count(),
+            }),
+        ));
+
         Ok(TurnSummary {
+            thread_id: self.thread_id.clone(),
+            turn_id,
+            context_snapshot,
+            events: event_log,
             assistant_messages,
             tool_results,
             iterations,
@@ -578,6 +669,17 @@ mod tests {
             vec![ContentBlock::Text {
                 text: "结论已就绪。".to_string()
             }]
+        );
+        assert_eq!(summary.thread_id.as_str(), "thread-default");
+        assert_eq!(summary.turn_id.as_str(), "turn-1");
+        assert_eq!(summary.context_snapshot.user_message_count, 1);
+        assert!(summary
+            .events
+            .iter()
+            .any(|event| event.kind == crate::agent_event::AgentEventKind::ReasoningDelta));
+        assert_eq!(
+            summary.events.last().map(|event| event.kind),
+            Some(crate::agent_event::AgentEventKind::TurnCompleted)
         );
     }
 
