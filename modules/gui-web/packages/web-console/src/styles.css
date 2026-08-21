@@ -7672,6 +7672,68 @@ body.ui-3d [data-window-theme="communication-bay"] .chat-left-rail .chat-roster-
   max-height: 210px;
 }
 
+.chat-room-permissions .chat-permission-controls,
+.chat-workspace-settings .chat-workspace-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px;
+  align-items: center;
+}
+
+.chat-permission-select {
+  min-width: 0;
+  min-height: 28px;
+  padding: 3px 5px;
+  overflow: hidden;
+  color: #dbe9df;
+  text-overflow: ellipsis;
+  border: 1px solid rgba(112, 198, 132, 0.42);
+  border-radius: 6px;
+  background: rgba(7, 28, 29, 0.96);
+}
+
+.chat-permission-select:disabled {
+  opacity: 0.58;
+  cursor: not-allowed;
+}
+
+.chat-permission-status {
+  min-width: 0;
+  overflow: hidden;
+  color: #8fdca5;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-room-permissions small,
+.chat-workspace-settings small {
+  color: #8ba99a;
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.chat-workspace-path {
+  min-width: 0;
+  overflow: hidden;
+  color: #dbe9df;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-workspace-path input {
+  width: 100%;
+  min-width: 0;
+  min-height: 26px;
+  padding: 3px 5px;
+  color: #dbe9df;
+  border: 1px solid rgba(112, 198, 132, 0.42);
+  border-radius: 6px;
+  background: rgba(7, 28, 29, 0.96);
+  outline: none;
+}
+
 .chat-left-rail .handoff-drawer {
   position: static;
   flex: 0 0 auto;
@@ -9704,8 +9766,9 @@ body.ui-3d .chat-left-rail {
 
 body.ui-3d .chat-room-selector,
 body.ui-3d .chat-compact-actions,
-body.ui-3d .chat-sidebar-channels,
-body.ui-3d .chat-sidebar-recipients {
+body.ui-3d .chat-sidebar-recipients,
+body.ui-3d .chat-room-permissions,
+body.ui-3d .chat-workspace-settings {
   display: grid;
   gap: 5px;
   padding: 7px;
@@ -12314,6 +12377,10 @@ body.ui-3d .clawbot-window-panel .mini-button {
   .browser-bridge-diagnostic-body pre {
     grid-column: 1;
   }
+}
+
+body.ui-3d .chat-sidebar-channels[hidden] {
+  display: none;
 }
 
 /* high-dpi-short-overflow-reachability：短工作区中，复杂卡片必须交给单一父级滚动，
