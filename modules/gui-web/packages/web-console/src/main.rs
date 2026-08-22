@@ -45415,6 +45415,32 @@ fn realtime_segment_should_attempt_asr(
         && normalize_realtime_capability(asr_mode) != REALTIME_SEGMENT_ASR_OFF
 }
 
+fn invalid_realtime_audio_payload(path: &Path) -> Option<String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())?;
+    let bytes = std::fs::read(path).ok()?;
+    let valid = match extension.as_str() {
+        "webm" => bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]),
+        "ogg" | "opus" => bytes.starts_with(b"OggS"),
+        "wav" => {
+            bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE"
+        }
+        "flac" => bytes.starts_with(b"fLaC"),
+        "mp4" | "m4a" => bytes.len() >= 12 && &bytes[4..8] == b"ftyp",
+        "mp3" => bytes.starts_with(b"ID3") || (bytes.len() >= 2 && bytes[0] == 0xff),
+        _ => true,
+    };
+    if valid {
+        None
+    } else {
+        Some(format!(
+            "Invalid data: audio payload is not a valid {extension} container"
+        ))
+    }
+}
+
 async fn transcribe_realtime_final_audio_segment(
     payload_path: Option<&str>,
     final_segment: bool,
@@ -45430,6 +45456,14 @@ async fn transcribe_realtime_final_audio_segment(
     };
     let audio_path = PathBuf::from(path);
     let engine = audio::SttEngine::new(audio::SttConfig::default());
+    if let Some(error) = invalid_realtime_audio_payload(&audio_path) {
+        return RealtimeSegmentAsrOutcome {
+            attempted: true,
+            provider: Some(provider),
+            error: Some(format!("No STT backend available. Attempts: {}", error)),
+            ..Default::default()
+        };
+    }
     match engine.transcribe_file(&audio_path).await {
         Ok(result) => {
             let text = result.text.trim().chars().take(512).collect::<String>();

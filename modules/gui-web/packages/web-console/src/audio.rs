@@ -1099,11 +1099,11 @@ if ($result) {{ $result.Text }} else {{ Write-Error 'No recognition result' }}"#
         .map_err(|e| format!("Failed to run native STT: {}", e))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = super::decode_console_output(&output.stderr);
         return Err(format!("Native STT error: {}", stderr));
     }
 
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let text = super::decode_console_output(&output.stdout).trim().to_string();
     if text.is_empty() {
         return Err("Native STT produced no text".to_string());
     }
@@ -1175,7 +1175,7 @@ pub async fn play_audio_file(path: &PathBuf, _device: Option<&str>) -> Result<()
         if !output.status.success() {
             return Err(format!(
                 "Playback error: {}",
-                String::from_utf8_lossy(&output.stderr)
+                super::decode_console_output(&output.stderr)
             ));
         }
     }
