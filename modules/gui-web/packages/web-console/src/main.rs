@@ -24366,7 +24366,7 @@ fn context_memory_revision(agent: &AgentSessionDto) -> String {
     let mut parts = Vec::with_capacity(agent.memory_beads.len());
     for bead in &agent.memory_beads {
         parts.push(format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:.4}\u{1f}{}",
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:.4}\u{1f}{}",
             bead.id,
             bead.layer,
             bead.kind,
