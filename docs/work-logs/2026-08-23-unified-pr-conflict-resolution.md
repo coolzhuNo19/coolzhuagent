@@ -25,6 +25,14 @@
 - `cargo test -p coolzhu-uia-resolver --offline`：2 passed。
 - `cargo check -p coolzhu-tool-registry --offline`：通过。
 
+## 统一构建产物
+
+- release package report：`tmp/package-reports/unified-release-20260823.json`。
+- package safety：757 files，`safe: true`，0 findings。
+- MSI：`dist/CoolzhuAgent-0.2.5-20260823-184934.msi`，SHA-256 `E858A3DF0C9CD4176A0A8D0CA9DA8F2758F6BB2DE97A40F0B0605781FC30AF6A`。
+- 版本按最新主线 CLI 发布契约保持 `0.2.5`；旧 MSI 由脚本自动保留为时间戳备份。
+- 隔离运行时（`127.0.0.1:8799`）六个入口均 HTTP 200；`showui`/`local_vlm` 按设备能力标记 skipped，UIA、ocr_template、桌面输入和 manual_confirmation 可用，browser surface 因扩展未连接而 skipped。
+
 ## 后续发布操作
 
 将从该统一提交重新构建安装包并执行隔离运行时自检，然后把统一历史更新到现有发布 PR 分支，关闭重复的 reasoning/audio PR，确保 GitHub 上只保留一个待合并 PR。
