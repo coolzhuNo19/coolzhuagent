@@ -2877,6 +2877,38 @@ fn local_port_listening(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
 }
 
+fn local_vision_endpoint_reachable(base_url: &str) -> bool {
+    let without_scheme = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest);
+    let authority = without_scheme.split('/').next().unwrap_or_default();
+    let (host, port) = authority.rsplit_once(':').map_or_else(
+        || {
+            let default_port = if base_url.starts_with("https://") {
+                443
+            } else {
+                80
+            };
+            (authority, default_port)
+        },
+        |(host, port)| {
+            (
+                host.trim_matches(['[', ']']),
+                port.parse::<u16>().unwrap_or(0),
+            )
+        },
+    );
+    if port == 0 {
+        return false;
+    }
+    if matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        local_port_listening(port)
+    } else {
+        // 远端兼容端点不能用本机 TCP 探测判断；请求阶段仍会有真实健康/凭据错误。
+        true
+    }
+}
+
 fn local_gemma_ready(port: u16) -> bool {
     use std::io::Write as _;
 
@@ -4999,6 +5031,8 @@ struct ConfigVisionRouter {
     #[serde(default)]
     uia: UiaRouterConfig,
     #[serde(default)]
+    ocr_template: OcrTemplateRouterConfig,
+    #[serde(default)]
     local_vlm: LocalVlmRouterConfig,
     #[serde(default)]
     remote_vlm: RemoteVlmRouterConfig,
@@ -5011,6 +5045,7 @@ struct ConfigVisionRouter {
 fn default_router_pipeline() -> Vec<String> {
     vec![
         "uia".to_string(),
+        "ocr_template".to_string(),
         "local_vlm".to_string(),
         "remote_vlm".to_string(),
     ]
@@ -5034,6 +5069,7 @@ impl Default for ConfigVisionRouter {
             cross_verify_tolerance_px: default_cross_verify_tolerance(),
             timeout_ms: default_router_timeout_ms(),
             uia: UiaRouterConfig::default(),
+            ocr_template: OcrTemplateRouterConfig::default(),
             local_vlm: LocalVlmRouterConfig::default(),
             remote_vlm: RemoteVlmRouterConfig::default(),
             detection: ConfigVisionDetection::default(),
@@ -5143,6 +5179,23 @@ impl Default for UiaRouterConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct OcrTemplateRouterConfig {
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default = "default_template_confidence_floor")]
+    confidence_floor: f32,
+}
+
+impl Default for OcrTemplateRouterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            confidence_floor: default_template_confidence_floor(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalVlmRouterConfig {
     #[serde(default = "default_enabled")]
     enabled: bool,
@@ -5214,6 +5267,9 @@ fn default_sample_count() -> u8 {
 }
 fn default_local_confidence_floor() -> f32 {
     0.35
+}
+fn default_template_confidence_floor() -> f32 {
+    0.72
 }
 fn default_remote_confidence_floor() -> f32 {
     0.6
@@ -17959,47 +18015,31 @@ async fn run_grounding_router(
                 } else if let Some(target) = locate_system_control(&req.target) {
                     let t1 = std::time::Instant::now();
                     match uia_resolver::resolve_system_control(target) {
-                        Ok(hit) => {
-                            let status = if hit.confidence >= effective_min_confidence {
-                                vision::locate::AttemptStatus::Ok
-                            } else {
-                                vision::locate::AttemptStatus::LowConfidence
-                            };
-                            vision::locate::BackendAttempt {
-                                backend: vision::locate::BackendId::Uia,
-                                status,
-                                point: Some(vision::locate::PointPx {
-                                    x: hit.bounding_rect.x + hit.bounding_rect.width / 2,
-                                    y: hit.bounding_rect.y + hit.bounding_rect.height / 2,
-                                }),
-                                bbox: Some(hit.bounding_rect),
-                                confidence: Some(hit.confidence),
-                                raw_response: None,
-                                model: Some("windows-uiautomation".to_string()),
-                                base_url: None,
-                                elapsed_ms: t1.elapsed().as_millis() as u64,
-                                error: None,
-                            }
-                        }
-                        Err(e) => vision::locate::BackendAttempt {
-                            backend: vision::locate::BackendId::Uia,
-                            status: vision::locate::AttemptStatus::Failed,
-                            point: None,
-                            bbox: None,
-                            confidence: None,
-                            raw_response: None,
-                            model: None,
-                            base_url: None,
-                            elapsed_ms: 0,
-                            error: Some(e.to_string()),
-                        },
+                        Ok(hit) => uia_hit_to_attempt(t1, hit, effective_min_confidence),
+                        Err(e) => uia_error_to_attempt(t1, e),
+                    }
+                } else if matches!(&req.target, vision::locate::LocateTarget::Uia { .. }) {
+                    let t1 = std::time::Instant::now();
+                    match locate_uia_target(&req.target) {
+                        Ok(hit) => uia_hit_to_attempt(t1, hit, effective_min_confidence),
+                        Err(e) => uia_error_to_attempt(t1, e),
                     }
                 } else {
                     vision::locate::BackendAttempt::skipped(
                         *backend,
-                        "target is not a known system control",
+                        "target is neither a known system control nor a UIA query",
                     )
                 }
+            }
+            vision::locate::BackendId::OcrTemplate => {
+                template_locate_attempt(
+                    &req,
+                    &capture_path,
+                    screen_dimensions,
+                    &config,
+                    effective_min_confidence,
+                )
+                .await
             }
             vision::locate::BackendId::LocalVlm => {
                 local_vlm_locate_attempt(
@@ -18038,6 +18078,18 @@ async fn run_grounding_router(
     } else {
         Some("grounding router did not produce a verified high-confidence point; no hardcoded anchor fallback is used".to_string())
     };
+    let mut notes = vec![
+        "Grounding backend is separate from user-selectable vision understanding agents."
+            .to_string(),
+        "Real click execution consumes this locate result and does not fall back to taskbar anchors."
+            .to_string(),
+    ];
+    if status != vision::locate::LocateStatus::Ok {
+        notes.push(
+            "No automatic grounding result is available; keep the action as dry-run and request manual confirmation."
+                .to_string(),
+        );
+    }
 
     Ok(vision::locate::LocateResponse {
         status,
@@ -18051,15 +18103,21 @@ async fn run_grounding_router(
         screen,
         elapsed_ms: t0.elapsed().as_millis() as u64,
         degradation_reason,
-        notes: vec![
-            "Grounding backend is separate from user-selectable vision understanding agents.".to_string(),
-            "Real click execution consumes this locate result and does not fall back to taskbar anchors.".to_string(),
-        ],
+        notes,
     })
 }
 
 fn active_vision_router_config() -> ConfigVisionRouter {
     read_config(|config| config.vision.router.clone().unwrap_or_default())
+}
+
+fn configured_local_vlm_base_url(config: &ConfigVisionRouter) -> String {
+    config
+        .local_vlm
+        .base_url
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(authoritative_local_vision_base_url)
 }
 
 fn effective_locate_min_confidence(
@@ -18098,6 +18156,9 @@ fn locate_pipeline(
 fn parse_locate_backend_id(name: &str) -> Option<vision::locate::BackendId> {
     match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "uia" | "ui_automation" => Some(vision::locate::BackendId::Uia),
+        "ocr" | "ocr_template" | "template" | "template_match" => {
+            Some(vision::locate::BackendId::OcrTemplate)
+        }
         "local_vlm" | "local" | "showui" => Some(vision::locate::BackendId::LocalVlm),
         "remote_vlm" | "remote" => Some(vision::locate::BackendId::RemoteVlm),
         _ => None,
@@ -18438,16 +18499,202 @@ fn locate_target_text(target: &vision::locate::LocateTarget) -> String {
         vision::locate::LocateTarget::Natural { text } => text.clone(),
         vision::locate::LocateTarget::System { id } => format!("{id:?}"),
         vision::locate::LocateTarget::Uia {
+            process_id,
+            window_name,
             automation_id,
             class_name,
             name,
             control_type,
-        } => [automation_id, class_name, name, control_type]
-            .into_iter()
-            .filter_map(|value| value.as_deref())
-            .filter(|value| !value.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join(" "),
+        } => [
+            process_id.map(|id| id.to_string()),
+            window_name.clone(),
+            automation_id.clone(),
+            class_name.clone(),
+            name.clone(),
+            control_type.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" "),
+    }
+}
+
+fn uia_hit_to_attempt(
+    started: std::time::Instant,
+    hit: uia_resolver::UiaHit,
+    min_confidence: f32,
+) -> vision::locate::BackendAttempt {
+    let status = if hit.confidence >= min_confidence {
+        vision::locate::AttemptStatus::Ok
+    } else {
+        vision::locate::AttemptStatus::LowConfidence
+    };
+    vision::locate::BackendAttempt {
+        backend: vision::locate::BackendId::Uia,
+        status,
+        point: Some(vision::locate::PointPx {
+            x: hit.bounding_rect.x + hit.bounding_rect.width / 2,
+            y: hit.bounding_rect.y + hit.bounding_rect.height / 2,
+        }),
+        bbox: Some(hit.bounding_rect),
+        confidence: Some(hit.confidence),
+        raw_response: Some(format!(
+            "uia target name={:?} automation_id={:?} control_type={}",
+            hit.name, hit.automation_id, hit.control_type
+        )),
+        model: Some("windows-uiautomation".to_string()),
+        base_url: None,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        error: None,
+    }
+}
+
+fn uia_error_to_attempt(
+    started: std::time::Instant,
+    error: uia_resolver::UiaError,
+) -> vision::locate::BackendAttempt {
+    vision::locate::BackendAttempt {
+        backend: vision::locate::BackendId::Uia,
+        status: vision::locate::AttemptStatus::Failed,
+        point: None,
+        bbox: None,
+        confidence: None,
+        raw_response: None,
+        model: None,
+        base_url: None,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        error: Some(error.to_string()),
+    }
+}
+
+fn locate_uia_target(
+    target: &vision::locate::LocateTarget,
+) -> Result<uia_resolver::UiaHit, uia_resolver::UiaError> {
+    let vision::locate::LocateTarget::Uia {
+        process_id,
+        window_name,
+        automation_id,
+        class_name,
+        name,
+        control_type,
+    } = target
+    else {
+        return Err(uia_resolver::UiaError::ElementNotFound);
+    };
+
+    let snapshot = uia_resolver::snapshot_foreground_window(512)?;
+    let element = uia_resolver::resolve_query(
+        &snapshot,
+        &uia_resolver::UiaQuery {
+            process_id: *process_id,
+            window_name: window_name.clone(),
+            element_name: name.clone(),
+            automation_id: automation_id.clone(),
+            class_name: class_name.clone(),
+            control_type: control_type.clone(),
+        },
+    )?;
+
+    let mut confidence: f32 = 0.55;
+    if automation_id.is_some() {
+        confidence += 0.22;
+    }
+    if class_name.is_some() {
+        confidence += 0.08;
+    }
+    if name.is_some() {
+        confidence += 0.08;
+    }
+    if control_type.is_some() {
+        confidence += 0.05;
+    }
+    confidence = confidence.min(0.99);
+
+    Ok(uia_resolver::UiaHit {
+        automation_id: element.automation_id,
+        class_name: element.class_name,
+        name: element.name,
+        control_type: element.control_type,
+        bounding_rect: element.bounding_rect,
+        is_offscreen: element.is_offscreen,
+        is_enabled: element.is_enabled,
+        confidence,
+    })
+}
+
+async fn template_locate_attempt(
+    req: &vision::locate::LocateRequest,
+    capture_path: &Path,
+    screen: ScreenDimensions,
+    config: &ConfigVisionRouter,
+    min_confidence: f32,
+) -> vision::locate::BackendAttempt {
+    let backend = vision::locate::BackendId::OcrTemplate;
+    if !config.ocr_template.enabled {
+        return vision::locate::BackendAttempt::skipped(
+            backend,
+            "ocr/template backend disabled by config",
+        );
+    }
+    if !cfg!(windows) {
+        return vision::locate::BackendAttempt::skipped(
+            backend,
+            "ocr/template backend requires Windows screenshot tooling",
+        );
+    }
+
+    let target = locate_target_text(&req.target);
+    let Some(color_hint) = colored_button_hint(&target) else {
+        return vision::locate::BackendAttempt::skipped(
+            backend,
+            "no deterministic color/template hint; OCR provider is not configured",
+        );
+    };
+    let started = std::time::Instant::now();
+    let threshold = min_confidence.max(config.ocr_template.confidence_floor.clamp(0.0, 1.0));
+    match locate_colored_button_region(capture_path, color_hint, screen, None).await {
+        Some(region) => {
+            let confidence = 0.72;
+            let status = if confidence >= threshold {
+                vision::locate::AttemptStatus::Ok
+            } else {
+                vision::locate::AttemptStatus::LowConfidence
+            };
+            vision::locate::BackendAttempt {
+                backend,
+                status,
+                point: Some(region.point),
+                bbox: Some(region.bbox),
+                confidence: Some(confidence),
+                raw_response: Some(format!(
+                    "template color={} pixels={} bbox=({},{} {}x{})",
+                    color_hint.as_str(),
+                    region.pixel_count,
+                    region.bbox.x,
+                    region.bbox.y,
+                    region.bbox.width,
+                    region.bbox.height
+                )),
+                model: Some("system-drawing-color-template".to_string()),
+                base_url: None,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                error: None,
+            }
+        }
+        None => vision::locate::BackendAttempt {
+            backend,
+            status: vision::locate::AttemptStatus::Failed,
+            point: None,
+            bbox: None,
+            confidence: None,
+            raw_response: None,
+            model: Some("system-drawing-color-template".to_string()),
+            base_url: None,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            error: Some(format!("no {} template region found", color_hint.as_str())),
+        },
     }
 }
 
@@ -18464,12 +18711,13 @@ async fn local_vlm_locate_attempt(
             "local_vlm disabled by config",
         );
     }
-    let base_url = config
-        .local_vlm
-        .base_url
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(authoritative_local_vision_base_url);
+    let base_url = configured_local_vlm_base_url(config);
+    if !local_vision_endpoint_reachable(&base_url) {
+        return vision::locate::BackendAttempt::skipped(
+            vision::locate::BackendId::LocalVlm,
+            &format!("local VLM endpoint is not reachable: {base_url}"),
+        );
+    }
     let model = config
         .local_vlm
         .model
@@ -43917,6 +44165,7 @@ struct ComputerUseCapabilitiesResponse {
     status: String,
     generated_at_ms: u64,
     showui: ComputerUseBackendCapabilityDto,
+    observations: Vec<ComputerUseObservationCapabilityDto>,
     surfaces: Vec<ComputerUseSurfaceCapabilityDto>,
     notes: Vec<String>,
 }
@@ -43924,6 +44173,16 @@ struct ComputerUseCapabilitiesResponse {
 #[derive(Debug, Serialize)]
 struct ComputerUseBackendCapabilityDto {
     backend: String,
+    status: String,
+    available: bool,
+    requires_model: bool,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ComputerUseObservationCapabilityDto {
+    backend: String,
+    priority: u8,
     status: String,
     available: bool,
     requires_model: bool,
@@ -43968,6 +44227,28 @@ fn computer_use_surface_capability(
                 },
             )
             .collect(),
+    }
+}
+
+fn computer_use_observation_capability(
+    backend: vision::locate::BackendId,
+    available: bool,
+    status: &str,
+    reason: &str,
+) -> ComputerUseObservationCapabilityDto {
+    ComputerUseObservationCapabilityDto {
+        backend: match backend {
+            vision::locate::BackendId::Uia => "uia",
+            vision::locate::BackendId::OcrTemplate => "ocr_template",
+            vision::locate::BackendId::LocalVlm => "local_vlm",
+            vision::locate::BackendId::RemoteVlm => "remote_vlm",
+        }
+        .to_string(),
+        priority: backend.recommended_priority(),
+        status: status.to_string(),
+        available,
+        requires_model: backend.requires_model(),
+        reason: reason.to_string(),
     }
 }
 
@@ -47556,7 +47837,108 @@ async fn api_computer_use_capabilities() -> Json<ComputerUseCapabilitiesResponse
     } else {
         "skipped"
     };
+    let router_config = active_vision_router_config();
+    let local_vlm_base_url = configured_local_vlm_base_url(&router_config);
+    let local_vlm_available =
+        router_config.local_vlm.enabled && local_vision_endpoint_reachable(&local_vlm_base_url);
+    let remote_vlm_configured = router_config.remote_vlm.enabled
+        && router_config.remote_vlm.providers.iter().any(|provider| {
+            provider
+                .base_url
+                .as_deref()
+                .is_some_and(|url| !url.trim().is_empty())
+        });
+    let observations = vec![
+        ComputerUseObservationCapabilityDto {
+            backend: "browser_dom".to_string(),
+            priority: 0,
+            status: if browser_health.connected {
+                "available".to_string()
+            } else {
+                "skipped".to_string()
+            },
+            available: browser_health.connected,
+            requires_model: false,
+            reason: if browser_health.connected {
+                "浏览器扩展/native host 已连接，网页任务优先使用 DOM/CDP 语义引用".to_string()
+            } else {
+                "浏览器扩展/native host 未连接，网页任务等待连接或转人工确认".to_string()
+            },
+        },
+        computer_use_observation_capability(
+            vision::locate::BackendId::Uia,
+            desktop_available && router_config.uia.enabled,
+            if desktop_available && router_config.uia.enabled {
+                "available"
+            } else {
+                "skipped"
+            },
+            if !desktop_available {
+                "UIA 仅支持 Windows"
+            } else if !router_config.uia.enabled {
+                "UIA backend disabled by config"
+            } else {
+                "Windows UI Automation：按窗口、控件类型、Name、AutomationId 进行确定性定位"
+            },
+        ),
+        computer_use_observation_capability(
+            vision::locate::BackendId::OcrTemplate,
+            desktop_available && router_config.ocr_template.enabled,
+            if desktop_available && router_config.ocr_template.enabled {
+                "available"
+            } else {
+                "skipped"
+            },
+            if !desktop_available {
+                "模板扫描仅支持 Windows 截图工具"
+            } else if !router_config.ocr_template.enabled {
+                "OCR/template backend disabled by config"
+            } else {
+                "无模型模板后端已启用；当前支持颜色按钮模板，未识别文本时显式跳过 OCR"
+            },
+        ),
+        computer_use_observation_capability(
+            vision::locate::BackendId::LocalVlm,
+            local_vlm_available,
+            if local_vlm_available {
+                "available"
+            } else {
+                "skipped"
+            },
+            if local_vlm_available {
+                "本地视觉模型端点可达"
+            } else if !router_config.local_vlm.enabled {
+                "local_vlm backend disabled by config"
+            } else {
+                "本地视觉模型端点不可达；不因缺少 ShowUI 阻断 UIA/template"
+            },
+        ),
+        computer_use_observation_capability(
+            vision::locate::BackendId::RemoteVlm,
+            remote_vlm_configured,
+            if remote_vlm_configured {
+                "available"
+            } else {
+                "skipped"
+            },
+            if remote_vlm_configured {
+                "远程视觉 provider 已配置，调用时仍校验凭据和网络"
+            } else {
+                "未配置远程视觉 provider；可由 Agnes 会话按需提供视觉理解"
+            },
+        ),
+        ComputerUseObservationCapabilityDto {
+            backend: "manual_confirmation".to_string(),
+            priority: 90,
+            status: "available".to_string(),
+            available: true,
+            requires_model: false,
+            reason: "所有自动定位失败时返回 dry-run 计划并等待人工确认".to_string(),
+        },
+    ];
     let mut notes = vec![
+        "推荐定位链路：Browser DOM（独立 surface）→ UIA → OCR/template → 本地/远程视觉 → 人工确认。"
+            .to_string(),
         "execute=false 的 dry-run、截图和坐标映射不依赖 ShowUI；真实输入仍需安全闸门和人工确认。"
             .to_string(),
     ];
@@ -47592,6 +47974,7 @@ async fn api_computer_use_capabilities() -> Json<ComputerUseCapabilitiesResponse
                 )
             },
         },
+        observations,
         surfaces: vec![
             computer_use_surface_capability(
                 "desktop",
@@ -49330,11 +49713,14 @@ mod tests {
             router.pipeline,
             vec![
                 "uia".to_string(),
+                "ocr_template".to_string(),
                 "local_vlm".to_string(),
                 "remote_vlm".to_string()
             ]
         );
         assert!(router.uia.enabled);
+        assert!(router.ocr_template.enabled);
+        assert!(router.ocr_template.confidence_floor >= 0.72);
         assert!(router.local_vlm.enabled);
         assert!(router.remote_vlm.enabled);
         assert_eq!(router.timeout_ms, 15_000);
@@ -49384,6 +49770,44 @@ mod tests {
             locate_status_from_attempts(None, &attempts),
             vision::locate::LocateStatus::LowConfidence
         );
+    }
+
+    #[test]
+    fn locate_backend_parser_accepts_model_free_template_aliases() {
+        assert_eq!(
+            super::parse_locate_backend_id("ocr-template"),
+            Some(vision::locate::BackendId::OcrTemplate)
+        );
+        assert_eq!(
+            super::parse_locate_backend_id("template_match"),
+            Some(vision::locate::BackendId::OcrTemplate)
+        );
+    }
+
+    #[test]
+    fn local_vision_preflight_skips_unreachable_localhost_but_does_not_block_remote_url() {
+        assert!(!super::local_vision_endpoint_reachable(
+            "http://127.0.0.1:1/v1"
+        ));
+        assert!(super::local_vision_endpoint_reachable(
+            "https://vision.example.test/v1"
+        ));
+    }
+
+    #[test]
+    fn ui_a_target_text_includes_window_and_process_evidence() {
+        let target = vision::locate::LocateTarget::Uia {
+            process_id: Some(1200),
+            window_name: Some("记事本".to_string()),
+            automation_id: Some("TextEditor".to_string()),
+            class_name: Some("RichEditD2DPT".to_string()),
+            name: Some("文本编辑器".to_string()),
+            control_type: Some("Document".to_string()),
+        };
+        let text = super::locate_target_text(&target);
+        assert!(text.contains("1200"));
+        assert!(text.contains("记事本"));
+        assert!(text.contains("TextEditor"));
     }
 
     #[test]
@@ -65217,6 +65641,9 @@ attach: last_assistant
         assert!(WEB_MAIN_RS.contains("requires_model: true"));
         assert!(WEB_MAIN_RS.contains("标记为 skipped"));
         assert!(WEB_MAIN_RS.contains("computer_use_surface_capability"));
+        assert!(WEB_MAIN_RS.contains("browser_dom"));
+        assert!(WEB_MAIN_RS.contains("ocr_template"));
+        assert!(WEB_MAIN_RS.contains("manual_confirmation"));
     }
 
     #[test]

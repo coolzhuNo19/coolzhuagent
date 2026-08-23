@@ -1,5 +1,17 @@
 use vision::locate::{BBoxPx, SystemControlId};
 
+fn decode_console_output(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    let (cow, _, had_errors) = encoding_rs::GB18030.decode(bytes);
+    if had_errors {
+        String::from_utf8_lossy(bytes).to_string()
+    } else {
+        cow.to_string()
+    }
+}
+
 #[cfg(windows)]
 mod windows_impl;
 
@@ -9,6 +21,7 @@ pub struct UiaQuery {
     pub window_name: Option<String>,
     pub element_name: Option<String>,
     pub automation_id: Option<String>,
+    pub class_name: Option<String>,
     pub control_type: Option<String>,
 }
 
@@ -140,6 +153,12 @@ pub fn resolve_query(
             && query.automation_id.as_ref().is_none_or(|automation_id| {
                 element.automation_id.as_deref() == Some(automation_id.as_str())
             })
+            && query.class_name.as_ref().is_none_or(|class_name| {
+                element
+                    .class_name
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(class_name))
+            })
             && query
                 .control_type
                 .as_ref()
@@ -213,9 +232,9 @@ Write-Output "OK|$msg"
         .output()
         .map_err(|e| UiaError::ComInitFailed(e.to_string()))?;
 
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let text = decode_console_output(&output.stdout).trim().to_string();
     if !output.status.success() && text.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = decode_console_output(&output.stderr).trim().to_string();
         let detail = if stderr.is_empty() {
             format!("powershell exited with {}", output.status)
         } else {
@@ -303,6 +322,7 @@ mod tests {
             window_name: Some("无标题 - 记事本".into()),
             element_name: Some("文本编辑器".into()),
             automation_id: None,
+            class_name: Some("RichEditD2DPT".into()),
             control_type: Some("Document".into()),
         };
         let element = resolve_query(&query_snapshot(), &query).unwrap();
