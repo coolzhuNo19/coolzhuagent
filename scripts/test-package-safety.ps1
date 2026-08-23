@@ -334,6 +334,29 @@ foreach ($shortcutId in @('StartMenuShortcut', 'DesktopShortcut')) {
     }
 }
 
+# 桌面快捷方式最终执行的是 package launcher。除了 WiX Shortcut/Icon 表，
+# 启动器 PE 自身也必须嵌入同一份应用图标，避免 Windows 图标缓存失效或
+# 快捷方式被复制后回退成白色默认文件图标。
+$launcherCargoManifest = Get-Content -Raw -Encoding UTF8 -LiteralPath (
+    Join-Path $workspace 'packages\app-launcher\Cargo.toml'
+)
+if ($launcherCargoManifest -notmatch '(?m)^build\s*=\s*["'']build\.rs["'']\s*$') {
+    throw 'app-launcher Cargo.toml missing Windows icon build script contract'
+}
+$launcherBuildScript = Get-Content -Raw -Encoding UTF8 -LiteralPath (
+    Join-Path $workspace 'packages\app-launcher\build.rs'
+)
+foreach ($requiredLauncherIconContract in @(
+    'COOLZHU_APPLICATION_ICON',
+    'find_resource_compiler',
+    'cargo:rustc-link-arg-bin=COOLZHU-AGENT=',
+    'coolzhu-application-icon.ico'
+)) {
+    if ($launcherBuildScript.IndexOf($requiredLauncherIconContract, [System.StringComparison]::Ordinal) -lt 0) {
+        throw "app-launcher build.rs missing icon embedding contract: $requiredLauncherIconContract"
+    }
+}
+
 $buildMsiScript = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'scripts\build-msi.ps1')
 $buildMsiIconContracts = @(
     '$applicationIcon = Join-Path',
