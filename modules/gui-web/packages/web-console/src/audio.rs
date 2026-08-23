@@ -444,7 +444,8 @@ impl SttEngine {
         let tools_dir = resolve_tools_dir();
         let whisper_script = tools_dir.join("whisper_transcribe.py");
         if whisper_script.exists() {
-            return python_available().await;
+            return python_available().await
+                && resolve_audio_resource_path(&self.config.model_path).exists();
         }
         native_stt_available().await
     }
@@ -473,6 +474,27 @@ fn resolve_tools_dir() -> PathBuf {
     }
     debug!("Tools dir not found, using default");
     PathBuf::from("tools")
+}
+
+/// 解析随安装包复制到 `bin/models` 的相对音频模型路径。
+///
+/// 开发运行时的当前目录可能是 workspace 根目录，安装运行时则通常是
+/// `bin/coolzhu-web-console.exe` 旁边的 `bin` 目录；两者都不能假设为固定值。
+fn resolve_audio_resource_path(path: &PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path.clone();
+    }
+
+    let candidates = [
+        Some(path.clone()),
+        resolve_tools_dir().parent().map(|parent| parent.join(path)),
+        std::env::current_dir().ok().map(|dir| dir.join(path)),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| candidate.exists())
+        .unwrap_or_else(|| path.clone())
 }
 
 async fn python_available() -> bool {
@@ -619,6 +641,8 @@ async fn synthesize_piper(
     if !output_path.exists() {
         return Err("Piper output file not created".to_string());
     }
+
+    wav_audio_data_bytes(output_path).map_err(|error| format!("Piper output invalid: {error}"))?;
 
     Ok(parsed["duration_ms"].as_u64().unwrap_or(0))
 }
@@ -785,7 +809,9 @@ pub fn available_voices(config: &TtsConfig) -> Vec<VoiceSummary> {
             kind: voice.kind.clone(),
             model_path: Some(voice.model_path.clone()),
             reference_audio_path: voice.reference_audio_path.clone(),
-            available: voice.model_path.exists() || voice.kind.eq_ignore_ascii_case("builtin"),
+            available: resolve_audio_resource_path(&voice.model_path).exists()
+                || (voice.kind.eq_ignore_ascii_case("cloned")
+                    && config.index_tts.base_url.is_some()),
         })
         .collect();
     if let Some(default_voice) = config
@@ -895,6 +921,7 @@ impl TtsEngine {
 
         let voice = self.resolve_voice(voice_name);
         let backend = self.config.backend.trim().to_ascii_lowercase();
+        let mut backend_errors = Vec::new();
         let wants_index_tts = backend == "indextts"
             || backend == "index-tts"
             || voice
@@ -918,7 +945,10 @@ impl TtsEngine {
                     });
                 }
                 Err(e) if backend == "indextts" || backend == "index-tts" => return Err(e),
-                Err(e) => warn!("IndexTTS HTTP failed: {}", e),
+                Err(e) => {
+                    warn!("IndexTTS HTTP failed: {}", e);
+                    backend_errors.push(format!("IndexTTS: {e}"));
+                }
             }
         }
 
@@ -953,7 +983,10 @@ impl TtsEngine {
                         duration_ms,
                     });
                 }
-                Err(e) => warn!("Python piper failed: {}", e),
+                Err(e) => {
+                    warn!("Python piper failed: {}", e);
+                    backend_errors.push(format!("Piper: {e}"));
+                }
             }
         }
 
@@ -966,11 +999,21 @@ impl TtsEngine {
                         duration_ms: total_ms,
                     });
                 }
-                Err(e) => warn!("Native TTS failed: {}", e),
+                Err(e) => {
+                    warn!("Native TTS failed: {}", e);
+                    backend_errors.push(format!("Windows TTS: {e}"));
+                }
             }
         }
 
-        Err("No TTS backend available".to_string())
+        if backend_errors.is_empty() {
+            Err("No TTS backend available".to_string())
+        } else {
+            Err(format!(
+                "No TTS backend available: {}",
+                backend_errors.join("; ")
+            ))
+        }
     }
 
     pub async fn check_available(&self) -> bool {
@@ -982,11 +1025,54 @@ impl TtsEngine {
         }
         let tools_dir = resolve_tools_dir();
         let piper_script = tools_dir.join("piper_speak.py");
-        if piper_script.exists() && python_available().await {
+        if piper_script.exists()
+            && python_available().await
+            && (resolve_audio_resource_path(&self.config.model_path).exists()
+                || self
+                    .config
+                    .voice_configs
+                    .iter()
+                    .any(|voice| resolve_audio_resource_path(&voice.model_path).exists()))
+        {
             return true;
         }
         native_tts_available().await
     }
+}
+
+/// 返回 WAV `data` chunk 的字节数，并拒绝只有容器头、没有采样数据的“空音频”。
+///
+/// Windows `SpeechSynthesizer` 在没有适用语言语音时可能仍写出一个 46 字节的
+/// RIFF/WAVE 文件并以成功退出；仅检查文件存在会把该结果误报为 TTS 成功。
+fn wav_audio_data_bytes(path: &PathBuf) -> Result<u64, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("无法读取 WAV: {error}"))?;
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("不是有效的 RIFF/WAVE 文件".to_string());
+    }
+
+    let mut offset = 12usize;
+    while offset.saturating_add(8) <= bytes.len() {
+        let chunk_size = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]) as usize;
+        let data_start = offset.saturating_add(8);
+        let data_end = data_start.saturating_add(chunk_size);
+        if data_end > bytes.len() {
+            return Err("WAV chunk 超出文件长度".to_string());
+        }
+        if &bytes[offset..offset + 4] == b"data" {
+            if chunk_size == 0 {
+                return Err("WAV data chunk 为空，没有可播放采样".to_string());
+            }
+            return Ok(chunk_size as u64);
+        }
+        offset = data_end.saturating_add(chunk_size & 1);
+    }
+
+    Err("WAV 缺少 data chunk".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -997,7 +1083,12 @@ async fn native_tts_available() -> bool {
     #[cfg(windows)]
     {
         let mut cmd = Command::new("powershell");
-        cmd.args(["-Command", "Add-Type -AssemblyName System.Speech; exit 0"]);
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $n = $s.GetInstalledVoices().Count; $s.Dispose(); if ($n -gt 0) { exit 0 } else { exit 1 }",
+        ]);
         cmd.creation_flags(CREATE_NO_WINDOW);
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::null());
@@ -1046,6 +1137,9 @@ async fn native_tts_speak(text: &str, output_path: &PathBuf) -> Result<u64, Stri
         return Err("Native TTS output file not created".to_string());
     }
 
+    wav_audio_data_bytes(output_path)
+        .map_err(|error| format!("Native TTS output invalid: {error}"))?;
+
     Ok(start.elapsed().as_millis() as u64)
 }
 
@@ -1057,7 +1151,12 @@ async fn native_stt_available() -> bool {
     #[cfg(windows)]
     {
         let mut cmd = Command::new("powershell");
-        cmd.args(["-Command", "Add-Type -AssemblyName System.Speech; exit 0"]);
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Add-Type -AssemblyName System.Speech; $n = [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers().Count; if ($n -gt 0) { exit 0 } else { exit 1 }",
+        ]);
         cmd.creation_flags(CREATE_NO_WINDOW);
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::null());
@@ -1206,13 +1305,15 @@ pub async fn check_audio_status(stt_config: &SttConfig, tts_config: &TtsConfig) 
     AudioStatus {
         stt_available,
         tts_available,
-        stt_model: if stt_available {
-            Some(stt_config.model_path.clone())
+        stt_model: if stt_available && resolve_audio_resource_path(&stt_config.model_path).exists()
+        {
+            Some(resolve_audio_resource_path(&stt_config.model_path))
         } else {
             None
         },
-        tts_model: if tts_available {
-            Some(tts_config.model_path.clone())
+        tts_model: if tts_available && resolve_audio_resource_path(&tts_config.model_path).exists()
+        {
+            Some(resolve_audio_resource_path(&tts_config.model_path))
         } else {
             None
         },
@@ -1604,6 +1705,7 @@ fn uuid_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tempfile::NamedTempFile;
 
     // -------------------------------------------------------------------
@@ -1659,6 +1761,32 @@ mod tests {
             PathBuf::from("models/en_US-lessac-medium.onnx")
         );
         assert!(!config.voice_configs.is_empty());
+    }
+
+    #[test]
+    fn wav_audio_data_bytes_rejects_empty_data_chunk() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"RIFF&\0\0\0WAVEfmt \x12\0\0\0\x01\0\x01\0\x22\x56\0\0D\xac\0\0\x02\0\x10\0data\0\0\0\0")
+            .unwrap();
+
+        let error = wav_audio_data_bytes(&file.path().to_path_buf()).unwrap_err();
+        assert!(error.contains("data chunk"));
+    }
+
+    #[test]
+    fn wav_audio_data_bytes_accepts_pcm_samples() {
+        let mut file = NamedTempFile::new().unwrap();
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&40u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&[1, 0, 1, 0, 0x40, 0x1f, 0, 0, 0x80, 0x3e, 0, 0, 2, 0, 16, 0]);
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&4u32.to_le_bytes());
+        wav.extend_from_slice(&[0, 0, 1, 0]);
+        file.write_all(&wav).unwrap();
+
+        assert_eq!(wav_audio_data_bytes(&file.path().to_path_buf()).unwrap(), 4);
     }
 
     #[tokio::test]
