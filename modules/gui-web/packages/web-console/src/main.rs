@@ -653,6 +653,7 @@ fn app() -> Router {
             "/api/sessions/{session_id}/history",
             get(api_session_history),
         )
+        .route("/api/sessions/{session_id}/events", get(api_session_events))
         .route(
             "/api/sessions/{session_id}/beads",
             get(api_session_beads).post(api_session_add_bead),
@@ -10431,6 +10432,17 @@ async fn api_session_history(
         .lock()
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
     store.session_history(&session_id, query)
+}
+
+/// P1-3：将同一份 thread/turn/item history 投影为稳定 JSONL，供 CLI/headless/录放测试消费。
+async fn api_session_events(
+    AxumPath(session_id): AxumPath<String>,
+    Query(query): Query<SessionHistoryQuery>,
+) -> ApiResult<Response<Body>> {
+    let store = session_store()
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+    store.session_events(&session_id, query)
 }
 
 async fn api_session_beads(
@@ -36031,6 +36043,32 @@ impl SessionStore {
         )))
     }
 
+    fn session_events(
+        &self,
+        session_id: &str,
+        query: SessionHistoryQuery,
+    ) -> ApiResult<Response<Body>> {
+        let Some(session) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存"));
+        };
+        let history = session_history_response(session, self.is_active(session_id), query);
+        let body = session_agent_events_jsonl(&history);
+        let mut response = Response::new(Body::from(body));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+        );
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        Ok(response)
+    }
+
     fn append_chat_messages(
         &mut self,
         session_id: &str,
@@ -44379,10 +44417,109 @@ struct SessionHistoryResponse {
     next_before: Option<String>,
 }
 
+/// P1-3：可供 CLI/headless 回放的统一事件 envelope。
+/// `event_id` 由 thread/turn/item 稳定计算，同一页重放不会产生随机 id。
+#[derive(Debug, Clone, Serialize)]
+struct AgentEventEnvelope {
+    schema: String,
+    event_id: String,
+    event_type: String,
+    sequence: u64,
+    thread_id: String,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    created_at: u64,
+    payload: JsonValue,
+}
+
 #[derive(Debug, Clone)]
 struct SessionHistoryTurnBundle {
     turn: SessionHistoryTurnDto,
     items: Vec<SessionHistoryItemDto>,
+}
+
+fn agent_event_id(
+    thread_id: &str,
+    event_type: &str,
+    turn_id: Option<&str>,
+    item_id: Option<&str>,
+) -> String {
+    let key = format!(
+        "{thread_id}\u{1f}{event_type}\u{1f}{}\u{1f}{}",
+        turn_id.unwrap_or_default(),
+        item_id.unwrap_or_default()
+    );
+    format!("event-{:016x}", hash_bytes(key.as_bytes()))
+}
+
+fn session_agent_events_jsonl(history: &SessionHistoryResponse) -> String {
+    let thread_id = history.session.id.clone();
+    let mut lines = Vec::new();
+    let mut sequence = 0_u64;
+    let mut push_event = |event_type: &str,
+                          turn_id: Option<&str>,
+                          item_id: Option<&str>,
+                          created_at: u64,
+                          payload: JsonValue| {
+        let event = AgentEventEnvelope {
+            schema: "coolzhu.agent.event.v1".to_string(),
+            event_id: agent_event_id(&thread_id, event_type, turn_id, item_id),
+            event_type: event_type.to_string(),
+            sequence,
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.map(str::to_string),
+            item_id: item_id.map(str::to_string),
+            created_at,
+            payload,
+        };
+        sequence = sequence.saturating_add(1);
+        if let Ok(line) = serde_json::to_string(&event) {
+            lines.push(line);
+        }
+    };
+
+    push_event(
+        "thread.snapshot",
+        None,
+        None,
+        history.session.updated_at,
+        json!({
+            "session": &history.session,
+            "turn_count": history.turns.len(),
+            "item_count": history.items.len(),
+            "has_more": history.has_more,
+            "next_before": history.next_before.as_deref(),
+        }),
+    );
+    for turn in &history.turns {
+        push_event(
+            "turn.started",
+            Some(&turn.id),
+            None,
+            turn.started_at,
+            json!(turn),
+        );
+        for item in history.items.iter().filter(|item| item.turn_id == turn.id) {
+            push_event(
+                "item.completed",
+                Some(&turn.id),
+                Some(&item.id),
+                item.created_at,
+                json!(item),
+            );
+        }
+        push_event(
+            "turn.completed",
+            Some(&turn.id),
+            None,
+            turn.completed_at.unwrap_or(turn.started_at),
+            json!(turn),
+        );
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("{}\n", lines.join("\n"))
 }
 
 /// 将 history API 的游标解析为要保留的消息数量。
@@ -60985,6 +61122,56 @@ attach: last_assistant
     }
 
     #[test]
+    fn session_agent_events_jsonl_is_stable_and_typed() {
+        let mut session = super::seed_session();
+        session.id = "events-test".to_string();
+        session.updated_at = 99;
+        session.messages = vec![
+            persisted_role_message("u1", "user", "事件第一轮", 10),
+            persisted_role_message("a1", "assistant", "已完成", 20),
+        ];
+        session.memory_beads = vec![super::MemoryBeadDto {
+            id: "event-compaction".to_string(),
+            kind: "compaction".to_string(),
+            layer: "L2".to_string(),
+            source: "context:auto-compact".to_string(),
+            summary: "事件压缩摘要".to_string(),
+            created_at: 30,
+            ..super::MemoryBeadDto::default()
+        }];
+        let history = super::session_history_response(
+            &session,
+            true,
+            super::SessionHistoryQuery {
+                limit: Some(20),
+                before: None,
+            },
+        );
+        let first = super::session_agent_events_jsonl(&history);
+        let second = super::session_agent_events_jsonl(&history);
+        assert_eq!(first, second, "同一 history 重放必须生成稳定 JSONL");
+        let events = first
+            .lines()
+            .map(|line| serde_json::from_str::<super::JsonValue>(line).expect("valid JSONL"))
+            .collect::<Vec<_>>();
+        assert!(events.len() >= 5);
+        assert_eq!(events[0]["schema"], "coolzhu.agent.event.v1");
+        assert_eq!(events[0]["event_type"], "thread.snapshot");
+        assert!(events
+            .iter()
+            .any(|event| event["event_type"] == "item.completed"));
+        assert!(events
+            .iter()
+            .any(|event| event["payload"]["kind"] == "compaction"));
+        assert!(events.windows(2).all(|pair| {
+            pair[1]["sequence"].as_u64() == Some(pair[0]["sequence"].as_u64().unwrap() + 1)
+        }));
+        assert!(events.iter().all(
+            |event| event["thread_id"] == "events-test" && event["event_id"].as_str().is_some()
+        ));
+    }
+
+    #[test]
     fn local_active_mode_maps_running_services() {
         assert_eq!(super::local_active_mode(true, false), "chat");
         assert_eq!(super::local_active_mode(false, true), "vision");
@@ -66164,6 +66351,8 @@ attach: last_assistant
         assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-mode\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-jobs\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-history\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"memory-history-validate-events\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"memory-history-events-status\""));
         assert!(WEB_INDEX_HTML.contains("data-action=\"session-resume\""));
         assert!(WEB_INDEX_HTML.contains("data-action=\"session-fork\""));
         assert!(WEB_INDEX_HTML.contains("data-memory-job-type=\"extraction\""));
@@ -66171,6 +66360,9 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("/memory-mode"));
         assert!(WEB_APP_JS.contains("/memory/jobs"));
         assert!(WEB_APP_JS.contains("/history?limit=6"));
+        assert!(WEB_APP_JS.contains("/events?limit=6"));
+        assert!(WEB_APP_JS.contains("function memoryWindowValidateEvents"));
+        assert!(WEB_APP_JS.contains("coolzhu.agent.event.v1"));
         assert!(WEB_APP_JS.contains("memoryWindowStartJob"));
         assert!(WEB_APP_JS.contains("memoryWindowRenderJobs"));
         assert!(WEB_APP_JS.contains("memoryWindowRenderHistory"));

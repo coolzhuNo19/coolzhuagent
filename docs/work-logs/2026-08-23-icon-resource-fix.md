@@ -20,6 +20,8 @@
 - 从 MSI 反编译确认 Start Menu 与 Desktop 两个 Shortcut 都仍引用 `CoolzhuApplicationIcon`，目标为 `[INSTALLDIR]COOLZHU-AGENT.exe`。
 - 从 MSI staging 包中的启动器提取图标：`tmp/msi-staged-launcher-icon.png`。
 - Windows 文件资源管理器大图标实机截图显示两个快捷方式均为 CZ 图标：`tmp/icon-shortcut-evidence-20260823`（embedded PE icon 与 ICO fallback）。
+- 复核设备当前安装状态发现此前仍是两个 0.2.5 MSI 实例，目标 PE 提取出的确为旧蓝色默认图标；按两个已核验 ProductCode 完成卸载后，以 UAC 提权安装 `dist/CoolzhuAgent-0.2.7.msi` 成功。
+- 安装后产品登记为 0.2.7，公共桌面快捷方式目标为 `C:\Program Files\CoolzhuAgent\COOLZHU-AGENT.exe`，Shell IconLocation 指向 MSI 缓存的 `CoolzhuApplicationIcon`；重新提取目标 PE 得到 CZ 图标：`tmp/installed-shortcut-icon-fixed-round4.png`，完整结果记录于 `tmp/icon-install-round4-evidence.json`。
 
 ## 环境备注
 

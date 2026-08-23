@@ -379,6 +379,9 @@ document.addEventListener("DOMContentLoaded", () => {
   document.querySelector('[data-action="memory-history-refresh"]')?.addEventListener("click", (event) => {
     memoryWindowRefreshHistory(event.currentTarget);
   });
+  document.querySelector('[data-action="memory-history-validate-events"]')?.addEventListener("click", (event) => {
+    memoryWindowValidateEvents(event.currentTarget);
+  });
   document.querySelector('[data-role="memory-history-list"]')?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-history-action]");
     if (!button) {
@@ -7384,6 +7387,49 @@ async function memoryWindowRefreshHistory(button = null) {
     memoryWindowRenderHistory();
     addMessage({ author: "记忆窗口", text: `历史加载失败：${error.message}`, kind: "thought", icon: "error-log" });
     return memoryWindowHistory;
+  } finally {
+    if (button) {
+      setBusy(button, false);
+    }
+  }
+}
+
+async function memoryWindowValidateEvents(button = null) {
+  const endpoint = memoryWindowSessionEndpoint("/events?limit=6");
+  const status = document.querySelector('[data-role="memory-history-events-status"]');
+  if (!endpoint) {
+    if (status) {
+      status.textContent = "事件回放不可用：暂无会话";
+    }
+    return;
+  }
+  if (button) {
+    setBusy(button, true, "校验中");
+  }
+  try {
+    const response = await fetch(endpoint, { headers: { Accept: "application/x-ndjson" } });
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(text || `HTTP ${response.status}`);
+    }
+    const lines = text.split(/\r?\n/).filter((line) => line.trim());
+    const events = lines.map((line) => JSON.parse(line));
+    const schemaOk = events.every((event) => event.schema === "coolzhu.agent.event.v1");
+    const sequenceOk = events.every((event, index) => Number(event.sequence) === index);
+    const idsOk = events.every((event) => typeof event.event_id === "string" && event.event_id.length > 0);
+    if (!schemaOk || !sequenceOk || !idsOk) {
+      throw new Error("schema / sequence / event_id 校验失败");
+    }
+    if (status) {
+      status.textContent = `${events.length} events · coolzhu.agent.event.v1 · JSONL 有序`;
+    }
+    return events;
+  } catch (error) {
+    if (status) {
+      status.textContent = `JSONL 校验失败：${error.message}`;
+    }
+    addMessage({ author: "记忆窗口", text: `事件回放校验失败：${error.message}`, kind: "thought", icon: "error-log" });
+    return [];
   } finally {
     if (button) {
       setBusy(button, false);
