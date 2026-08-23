@@ -15738,6 +15738,8 @@ async fn api_chat_send_stream(
                 continue;
             }
             let task_id = format!("task-{}-{index}", unix_timestamp_millis());
+            // 流式路径没有包在 agent_chat_response 的 TURN_TRACE scope 中，显式生成并贯穿本轮。
+            let stream_turn_id = diagnostics::TraceIdType::generate().to_hex();
             let assistant_id = format!("msg-{}-{index}", unix_timestamp_millis());
             let reasoning_id = format!("{assistant_id}-thinking");
             let mut model_tool_calls: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
@@ -15807,6 +15809,7 @@ async fn api_chat_send_stream(
                     &result.image_urls,
                     &result.context_history,
                     result.context_rosters.get(&agent.id),
+                    &stream_turn_id,
                     Some(&result.chat_room_id),
                 )
                 .await {
@@ -16053,7 +16056,7 @@ async fn api_chat_send_stream(
                     parsed_tool_calls,
                     "[TOOL-LOOP-STREAM]",
                     Some(agent.id.clone()),
-                    result.messages.first().map(|message| message.id.clone()),
+                    Some(stream_turn_id.clone()),
                     Some(result.chat_room_id.clone()),
                 )
                 .await;
@@ -16279,7 +16282,7 @@ async fn api_chat_send_stream(
                         tool_requests.clone(),
                         "[TOOL-LOOP-STREAM]",
                         Some(agent.id.clone()),
-                        result.messages.first().map(|message| message.id.clone()),
+                        Some(stream_turn_id.clone()),
                         Some(result.chat_room_id.clone()),
                     )
                     .await;
@@ -16457,7 +16460,7 @@ async fn api_chat_send_stream(
                         &tool_use_id,
                         &tool_name,
                         &tool_input,
-                        None,
+                        Some(&stream_turn_id),
                         Some(&result.chat_room_id),
                     )
                     .await;
@@ -25715,6 +25718,8 @@ fn build_context_assembly_with_roster(
         system_prompt,
         messages,
         memory_beads,
+        // 当前运行时回合 ID；context-preview 等没有真实回合的调用保持 None。
+        turn_id: current_turn_trace(),
         context_snapshot_id,
         memory_revision,
         memory_bead_ids,
@@ -28399,6 +28404,8 @@ struct ContextAssembly {
     system_prompt: String,
     messages: Vec<InputMessage>,
     memory_beads: Vec<MemoryBeadDto>,
+    /// 生成该上下文的真实运行时回合；与 history projection 的派生 turn id 分开。
+    turn_id: Option<String>,
     /// 本次装配的稳定身份；前端可用它判断预览是否已经过期。
     context_snapshot_id: String,
     /// 由候选 memory beads 内容计算的 revision，不把完整记忆文本复制到状态栏。
@@ -28479,7 +28486,7 @@ fn context_usage_footer_for_snapshot(
         String::new()
     };
     format!(
-        "---\nContext usage: {}.{}% ({}/{} {token_label} tokens; source={source}). Local estimate: {} tokens; local prompt budget: {}/{} tokens; history truncated: {}.\nContext snapshot: {}; history source: {}; history loaded: {}; memory revision: {}{}",
+        "---\nContext usage: {}.{}% ({}/{} {token_label} tokens; source={source}). Local estimate: {} tokens; local prompt budget: {}/{} tokens; history truncated: {}.\nContext turn: {}; Context snapshot: {}; history source: {}; history loaded: {}; memory revision: {}{}",
         snapshot.percent_tenths / 10,
         snapshot.percent_tenths % 10,
         snapshot.used_tokens,
@@ -28488,6 +28495,7 @@ fn context_usage_footer_for_snapshot(
         assembly.token_budget.total,
         assembly.token_budget.budget,
         assembly.truncated,
+        assembly.turn_id.as_deref().unwrap_or("none"),
         assembly.context_snapshot_id,
         assembly.history_selection.source,
         assembly.history_selection.selected_ids.len(),
@@ -28685,9 +28693,10 @@ async fn stream_agent_model(
     image_urls: &[String],
     context_history: &[PersistedChatMessage],
     collaboration_roster: Option<&ChatRosterResponse>,
+    turn_id: &str,
     chat_room_id: Option<&str>,
 ) -> Result<(api::MessageStream, ContextAssembly), api::ApiError> {
-    let assembly = build_context_assembly_with_roster(
+    let mut assembly = build_context_assembly_with_roster(
         agent,
         context_history,
         prompt,
@@ -28699,6 +28708,8 @@ async fn stream_agent_model(
         ),
         collaboration_roster,
     );
+    // 流式入口不经过 agent_chat_response 的 TURN_TRACE scope，显式回填真实回合 ID。
+    assembly.turn_id = Some(turn_id.to_string());
     let request = agent_message_request_with_context_for_room(agent, true, &assembly, chat_room_id);
     let stream = provider_client_for_agent(agent)?
         .stream_message(&request)
@@ -44600,6 +44611,9 @@ struct SessionHistoryItemDto {
     /// 由 Context usage 尾部回填的上下文快照；旧消息没有该字段时保持空值。
     #[serde(skip_serializing_if = "Option::is_none")]
     context_snapshot_id: Option<String>,
+    /// 真实运行时回合 ID；与 history item 自身派生的 turn_id 分开。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_turn_id: Option<String>,
     /// ToolCall/ToolResult 的可重放元数据；普通消息和 compaction 不填充。
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
@@ -44644,6 +44658,8 @@ struct AgentEventEnvelope {
     /// item 若来自模型回复的 Context usage 尾部，则在 envelope 顶层复现同一快照 ID。
     #[serde(skip_serializing_if = "Option::is_none")]
     context_snapshot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_turn_id: Option<String>,
     created_at: u64,
     payload: JsonValue,
 }
@@ -44671,8 +44687,16 @@ fn agent_event_id(
 fn history_message_context_snapshot_id(message: &PersistedChatMessage) -> Option<String> {
     const MARKER: &str = "Context snapshot:";
     message.content.lines().find_map(|line| {
-        let value = line.trim().strip_prefix(MARKER)?.split(';').next()?.trim();
+        let value = line.split_once(MARKER)?.1.split(';').next()?.trim();
         (!value.is_empty() && value != "-").then(|| value.to_string())
+    })
+}
+
+fn history_message_context_turn_id(message: &PersistedChatMessage) -> Option<String> {
+    const MARKER: &str = "Context turn:";
+    message.content.lines().find_map(|line| {
+        let value = line.split_once(MARKER)?.1.split(';').next()?.trim();
+        (!value.is_empty() && value != "none" && value != "-").then(|| value.to_string())
     })
 }
 
@@ -44725,6 +44749,15 @@ fn session_agent_events_jsonl(history: &SessionHistoryResponse) -> String {
             })
             .and_then(JsonValue::as_str)
             .map(str::to_string);
+        let context_turn_id = payload
+            .get("context_turn_id")
+            .or_else(|| {
+                payload
+                    .get("item")
+                    .and_then(|item| item.get("context_turn_id"))
+            })
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
         let event = AgentEventEnvelope {
             schema: "coolzhu.agent.event.v1".to_string(),
             event_id: agent_event_id(&thread_id, event_type, turn_id, item_id),
@@ -44734,6 +44767,7 @@ fn session_agent_events_jsonl(history: &SessionHistoryResponse) -> String {
             turn_id: turn_id.map(str::to_string),
             item_id: item_id.map(str::to_string),
             context_snapshot_id,
+            context_turn_id,
             created_at,
             payload,
         };
@@ -44958,6 +44992,7 @@ fn session_history_response(
                     message_count: None,
                     token_count: Some(estimate_message_tokens(message)),
                     context_snapshot_id: history_message_context_snapshot_id(message),
+                    context_turn_id: history_message_context_turn_id(message),
                     tool_call_id,
                     tool_name,
                     tool_status,
@@ -45003,6 +45038,7 @@ fn session_history_response(
             message_count: None,
             token_count: bead.token_count,
             context_snapshot_id: None,
+            context_turn_id: None,
             tool_call_id: None,
             tool_name: None,
             tool_status: None,
@@ -48911,7 +48947,9 @@ async fn api_realtime_model_stream_probe(
         )));
     }
 
-    let stream_result = stream_agent_model(&agent, &prompt, &[], &[], None, None).await;
+    let stream_turn_id = diagnostics::TraceIdType::generate().to_hex();
+    let stream_result =
+        stream_agent_model(&agent, &prompt, &[], &[], None, &stream_turn_id, None).await;
     let Ok((mut model_stream, _assembly)) = stream_result else {
         return Ok(Json(error_response(format!(
             "Model stream probe failed to start: {}",
@@ -61479,7 +61517,7 @@ attach: last_assistant
                 author: "COOLZHU AGENT".to_string(),
                 role: "assistant".to_string(),
                 target: "聊天".to_string(),
-                content: "已完成\n\n---\nContext usage: 1.0% (100/10000 input tokens; source=remote). Local estimate: 80 tokens; local prompt budget: 9000 tokens; history truncated: false.\nContext snapshot: ctx-events; history source: chat_room.messages; history loaded: 1; memory revision: mem-events".to_string(),
+                content: "已完成\n\n---\nContext usage: 1.0% (100/10000 input tokens; source=remote). Local estimate: 80 tokens; local prompt budget: 9000 tokens; history truncated: false.\nContext turn: turn-runtime-events; Context snapshot: ctx-events; history source: chat_room.messages; history loaded: 1; memory revision: mem-events".to_string(),
                 kind: "assistant-reply".to_string(),
                 attachments: Vec::new(),
                 created_at: 20,
@@ -61530,6 +61568,11 @@ attach: last_assistant
             .expect("assistant item with context snapshot");
         assert_eq!(context_item["context_snapshot_id"], "ctx-events");
         assert_eq!(context_item["payload"]["context_snapshot_id"], "ctx-events");
+        assert_eq!(context_item["context_turn_id"], "turn-runtime-events");
+        assert_eq!(
+            context_item["payload"]["context_turn_id"],
+            "turn-runtime-events"
+        );
     }
 
     #[test]
@@ -67961,6 +68004,10 @@ attach: last_assistant
         assert!(normalized_source.contains(
             "agent_message_request_with_context_messages_for_room( agent, false, &loop_system_prompt,"
         ));
+        assert!(WEB_MAIN_RS
+            .contains("let stream_turn_id = diagnostics::TraceIdType::generate().to_hex();"));
+        assert!(WEB_MAIN_RS.contains("assembly.turn_id = Some(turn_id.to_string());"));
+        assert!(WEB_MAIN_RS.contains("Some(stream_turn_id.clone())"));
         assert!(!WEB_MAIN_RS.contains(
             "let round_messages = vec![\n                    InputMessage::user_text(result.user_content.clone())"
         ));
@@ -70933,6 +70980,7 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            turn_id: None,
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
@@ -70980,6 +71028,7 @@ attach: last_assistant
 
         let footer = super::context_usage_footer_for_assembly_with_usage(&agent, &assembly, None);
         assert!(footer.contains("Context usage:"));
+        assert!(footer.contains("Context turn: none"));
         assert!(footer.contains("Context snapshot: ctx-test"));
         assert!(footer.contains("history source: chat_room.messages"));
         assert!(footer.contains("history loaded: 0"));
@@ -71049,6 +71098,7 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            turn_id: None,
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
@@ -71123,6 +71173,7 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            turn_id: None,
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
@@ -71201,6 +71252,7 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            turn_id: None,
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
