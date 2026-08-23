@@ -962,6 +962,7 @@ name = "coolzhu-uia-resolver"
 version = "0.2.0"
 dependencies = [
  "coolzhu-vision-service",
+ "encoding_rs",
  "serde",
  "windows",
 ]

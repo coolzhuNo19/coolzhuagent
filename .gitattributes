@@ -1,0 +1,3 @@
+# web-console 将前端资源以内嵌字符串编译进 Rust，契约测试按 LF 匹配多行片段。
+/modules/gui-web/packages/web-console/src/app.js text eol=lf
+/modules/gui-web/packages/web-console/src/styles.css text eol=lf

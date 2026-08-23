@@ -599,38 +599,52 @@
             <div class="window-panel chat-window-panel">
               <aside class="chat-left-rail" aria-label="聊天上下文侧栏">
                 <section class="chat-compact-actions" data-sidebar-group="chat-actions">
-                  <header><strong>会话操作</strong><span data-bind="chat.selected">0 条已选</span></header>
+                  <header><strong>聊天室操作</strong><span data-bind="chat.selected">0 条已选历史</span></header>
                   <div class="chat-sidebar-actions">
                     <button class="link-button" data-action="chat-room-new" type="button">新建</button>
                     <button class="link-button" data-action="chat-room-rename" type="button">重命名</button>
                     <button class="link-button" data-action="chat-room-delete" type="button">删除</button>
-                    <button class="link-button" data-action="chat-room-diagnostics" type="button">诊断设置</button>
-                    <button class="link-button" data-action="chat-handoff-toggle" type="button">任务链</button>
-                    <button class="link-button" data-action="chat-handoff-manual" type="button">转交</button>
-                    <button class="link-button" data-action="message-load-older" type="button">更早</button>
-                    <button class="link-button" data-action="message-delete-selected" type="button">删除所选</button>
                   </div>
                 </section>
-                <section class="chat-sidebar-group chat-sidebar-channels" data-sidebar-group="channel-models">
+                <section class="chat-sidebar-group chat-sidebar-channels" data-sidebar-group="channel-models" hidden aria-hidden="true">
                   <header><strong>频道 / 模型</strong></header>
                   <div class="chat-roster-strip" data-role="chat-roster" aria-live="polite"></div>
                 </section>
-                <section class="chat-sidebar-group chat-room-selector" data-sidebar-group="conversation-list" aria-label="会话列表">
-                  <header><strong>会话</strong></header>
+                <section class="chat-sidebar-group chat-room-selector" data-sidebar-group="conversation-list" aria-label="聊天室切换">
+                  <header><strong>聊天室切换</strong></header>
                   <div class="chat-room-select-wrap">
                     <button class="link-button chat-room-trigger" data-role="chat-room-trigger" type="button">主聊天室</button>
                     <span class="chat-room-dropdown" data-role="chat-room-list" role="listbox"></span>
                   </div>
                 </section>
                 <section class="chat-sidebar-group chat-sidebar-recipients" data-sidebar-group="recipient-targets">
-                  <header><strong>当前接收者</strong></header>
+                  <header><strong>发送 / 接收者</strong></header>
                   <div class="agent-dropdown-wrap" data-role="agent-targets-wrap">
                     <div class="agent-dropdown-trigger" data-role="agent-trigger">选择发送对象</div>
                     <div class="agent-dropdown-list" data-role="agent-targets"></div>
                   </div>
                 </section>
+                <section class="chat-sidebar-group chat-room-permissions" data-sidebar-group="room-permissions" aria-label="聊天室权限">
+                  <header><strong>聊天室权限</strong><span class="chat-permission-status" data-role="chat-permission-status">workspace-write</span></header>
+                  <div class="chat-permission-controls">
+                    <select class="chat-permission-select" data-role="chat-permission-select" aria-label="选择聊天室权限">
+                      <option value="workspace-write">workspace-write（默认）</option>
+                      <option value="full-access">full-access（双重确认）</option>
+                    </select>
+                    <button class="mini-button" data-action="chat-permission-save" type="button">应用</button>
+                  </div>
+                  <small data-role="chat-permission-hint">权限只对当前聊天室生效；full-access 仍需要双重确认。</small>
+                </section>
+                <section class="chat-sidebar-group chat-workspace-settings" data-sidebar-group="workspace-settings" aria-label="聊天室工作目录">
+                  <header><strong>聊天室工作目录</strong></header>
+                  <div class="chat-workspace-control">
+                    <span class="chat-workspace-path" data-role="chat-workspace-path" title="当前工作目录">—</span>
+                    <button class="mini-button" data-action="chat-workspace-edit" type="button">设置</button>
+                  </div>
+                  <small>发送、工具调用和授权默认作用于此目录。</small>
+                </section>
                 <details class="chat-sidebar-group chat-session-auth" data-sidebar-group="session-auth">
-                  <summary><strong>会话授权</strong><span class="auth-tier-status" data-bind="tasks.fullAccessStatus">Off</span></summary>
+                  <summary><strong>授权详情</strong><span class="auth-tier-status" data-bind="tasks.fullAccessStatus">Off · workspace</span></summary>
                   <div class="chat-session-auth-body">
                     <header class="authorization-config-head">
                       <div>

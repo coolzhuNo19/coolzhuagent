@@ -31,6 +31,10 @@ pub enum LocateTarget {
     #[serde(rename = "uia")]
     Uia {
         #[serde(default)]
+        process_id: Option<u32>,
+        #[serde(default)]
+        window_name: Option<String>,
+        #[serde(default)]
         automation_id: Option<String>,
         #[serde(default)]
         class_name: Option<String>,
@@ -83,9 +87,33 @@ pub enum RegionAnchorKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendId {
+    #[serde(alias = "ui_automation")]
     Uia,
+    #[serde(alias = "ocr_template", alias = "ocr", alias = "template")]
+    OcrTemplate,
+    #[serde(alias = "local_vlm", alias = "local", alias = "showui")]
     LocalVlm,
+    #[serde(alias = "remote_vlm", alias = "remote")]
     RemoteVlm,
+}
+
+impl BackendId {
+    /// 推荐的无 ShowUI 定位顺序：结构化 UIA 优先，其次是无需模型的模板，
+    /// 最后才调用本地/远程视觉模型。
+    #[must_use]
+    pub const fn recommended_priority(self) -> u8 {
+        match self {
+            Self::Uia => 10,
+            Self::OcrTemplate => 20,
+            Self::LocalVlm => 30,
+            Self::RemoteVlm => 40,
+        }
+    }
+
+    #[must_use]
+    pub const fn requires_model(self) -> bool {
+        matches!(self, Self::LocalVlm | Self::RemoteVlm)
+    }
 }
 
 fn default_min_confidence() -> f32 {
@@ -220,14 +248,18 @@ mod tests {
 
     #[test]
     fn locate_request_uia_serde() {
-        let json = r#"{"target":{"kind":"uia","automation_id":"SearchApp","class_name":"TextBox"},"min_confidence":0.7}"#;
+        let json = r#"{"target":{"kind":"uia","process_id":1200,"window_name":"记事本","automation_id":"SearchApp","class_name":"TextBox"},"min_confidence":0.7}"#;
         let req: LocateRequest = serde_json::from_str(json).expect("parse");
         match &req.target {
             LocateTarget::Uia {
+                process_id,
+                window_name,
                 automation_id,
                 class_name,
                 ..
             } => {
+                assert_eq!(*process_id, Some(1200));
+                assert_eq!(window_name.as_deref(), Some("记事本"));
                 assert_eq!(automation_id.as_deref(), Some("SearchApp"));
                 assert_eq!(class_name.as_deref(), Some("TextBox"));
             }
@@ -327,5 +359,16 @@ mod tests {
         let a = BackendAttempt::skipped(BackendId::LocalVlm, "model not loaded");
         assert_eq!(a.status, AttemptStatus::Skipped);
         assert_eq!(a.error.as_deref(), Some("model not loaded"));
+    }
+
+    #[test]
+    fn ocr_template_backend_is_model_free_and_ordered_before_vlm() {
+        assert!(!BackendId::OcrTemplate.requires_model());
+        assert!(
+            BackendId::OcrTemplate.recommended_priority()
+                < BackendId::LocalVlm.recommended_priority()
+        );
+        let json = serde_json::to_string(&BackendId::OcrTemplate).expect("serialize");
+        assert_eq!(json, "\"ocr-template\"");
     }
 }
