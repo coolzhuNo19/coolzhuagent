@@ -201,13 +201,28 @@ Write-Output "OK|$msg"
 
     let tmp = std::env::temp_dir().join("uia-locate.ps1");
     std::fs::write(&tmp, script_body).map_err(|e| UiaError::ComInitFailed(e.to_string()))?;
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-File"])
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
         .arg(&tmp)
         .output()
         .map_err(|e| UiaError::ComInitFailed(e.to_string()))?;
 
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() && text.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("powershell exited with {}", output.status)
+        } else {
+            format!("powershell exited with {}: {stderr}", output.status)
+        };
+        return Err(UiaError::QueryError(detail));
+    }
     if text.starts_with("NF") {
         return Err(UiaError::ElementNotFound);
     }

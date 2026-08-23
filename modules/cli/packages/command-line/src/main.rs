@@ -5347,7 +5347,7 @@ mod tests {
     }
 
     #[test]
-    fn response_to_events_ignores_thinking_blocks() {
+    fn response_to_events_renders_thinking_blocks() {
         let mut out = Vec::new();
         let events = response_to_events(
             MessageResponse {
@@ -5380,8 +5380,15 @@ mod tests {
 
         assert!(matches!(
             &events[0],
+            AssistantEvent::ReasoningDelta { text, redacted: false }
+                if text == "step 1"
+        ));
+        assert!(matches!(
+            &events[1],
             AssistantEvent::TextDelta(text) if text == "Final answer"
         ));
-        assert!(!String::from_utf8(out).expect("utf8").contains("step 1"));
+        assert!(String::from_utf8(out)
+            .expect("utf8")
+            .contains("[reasoning] step 1"));
     }
 }

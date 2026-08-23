@@ -1103,7 +1103,9 @@ if ($result) {{ $result.Text }} else {{ Write-Error 'No recognition result' }}"#
         return Err(format!("Native STT error: {}", stderr));
     }
 
-    let text = super::decode_console_output(&output.stdout).trim().to_string();
+    let text = super::decode_console_output(&output.stdout)
+        .trim()
+        .to_string();
     if text.is_empty() {
         return Err("Native STT produced no text".to_string());
     }

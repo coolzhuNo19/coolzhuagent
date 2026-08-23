@@ -45424,9 +45424,7 @@ fn invalid_realtime_audio_payload(path: &Path) -> Option<String> {
     let valid = match extension.as_str() {
         "webm" => bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]),
         "ogg" | "opus" => bytes.starts_with(b"OggS"),
-        "wav" => {
-            bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE"
-        }
+        "wav" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
         "flac" => bytes.starts_with(b"fLaC"),
         "mp4" | "m4a" => bytes.len() >= 12 && &bytes[4..8] == b"ftyp",
         "mp3" => bytes.starts_with(b"ID3") || (bytes.len() >= 2 && bytes[0] == 0xff),
