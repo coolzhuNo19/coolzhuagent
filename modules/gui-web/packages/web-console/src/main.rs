@@ -25565,6 +25565,28 @@ fn build_context_assembly_with_roster(
         selected_history.push(message_for_context);
     }
     selected_history.reverse();
+    let history_candidate_ids = room_history
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    let history_selected_ids = selected_history
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    let history_selected_id_set = history_selected_ids.iter().cloned().collect::<HashSet<_>>();
+    let history_excluded_ids = history_candidate_ids
+        .iter()
+        .filter(|id| !history_selected_id_set.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
+    // 模型上下文的历史权威来源固定为聊天室消息；session messages 仍可用于持久化/回放，
+    // 但不会因为写入 session store 就自动进入下一轮模型输入。
+    let history_selection = ContextHistorySelectionEvidence {
+        source: "chat_room.messages".to_string(),
+        candidate_ids: history_candidate_ids,
+        selected_ids: history_selected_ids,
+        excluded_ids: history_excluded_ids,
+    };
     // dropped_history 是新→旧顺序，摘要时转回时间正序并注入 system_prompt（计入 system_tokens）。
     if !dropped_history.is_empty() {
         dropped_history.reverse();
@@ -25697,6 +25719,7 @@ fn build_context_assembly_with_roster(
         memory_revision,
         memory_bead_ids,
         memory_selection,
+        history_selection,
         compaction_item,
         runtime_snapshot,
         history_floor_millis: options.history_floor_millis,
@@ -28360,6 +28383,18 @@ struct ContextMemorySelectionEvidence {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct ContextHistorySelectionEvidence {
+    /// 模型上下文的权威历史来源；当前固定为聊天室消息投影。
+    source: String,
+    /// 进入历史选择器前的聊天室消息 ID。
+    candidate_ids: Vec<String>,
+    /// 本轮真正转换成 InputMessage 并发送给模型的历史消息 ID。
+    selected_ids: Vec<String>,
+    /// 候选中未进入本轮模型输入的消息 ID（重置边界、临时消息、预算等原因）。
+    excluded_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ContextAssembly {
     system_prompt: String,
     messages: Vec<InputMessage>,
@@ -28372,6 +28407,8 @@ struct ContextAssembly {
     memory_bead_ids: Vec<String>,
     /// 记忆召回、过滤和 token 预算证据，供预览/回放诊断。
     memory_selection: ContextMemorySelectionEvidence,
+    /// 历史来源与实际注入边界证据；session messages 不属于本字段的模型输入来源。
+    history_selection: ContextHistorySelectionEvidence,
     /// 历史被预算裁剪时生成的 typed compaction item；与原始消息分开，便于回放和恢复。
     compaction_item: Option<ContextCompactionItem>,
     /// 本轮固定的 workspace/聊天室/权限/模型/工具目录作用域。
@@ -54222,6 +54259,10 @@ mod tests {
             vec!["bead-alpha"]
         );
         assert_eq!(assembly.history_message_count, 2);
+        assert_eq!(assembly.history_selection.source, "chat_room.messages");
+        assert_eq!(assembly.history_selection.candidate_ids, vec!["h1", "h2"]);
+        assert_eq!(assembly.history_selection.selected_ids, vec!["h1", "h2"]);
+        assert!(assembly.history_selection.excluded_ids.is_empty());
         assert!(!assembly.truncated);
         assert!(assembly.token_budget.total <= assembly.token_budget.budget);
         assert_eq!(
@@ -54384,6 +54425,9 @@ mod tests {
         assert!(joined.contains("new task context"));
         assert!(joined.contains("continue from the new task"));
         assert_eq!(assembly.history_message_count, 1);
+        assert_eq!(assembly.history_selection.source, "chat_room.messages");
+        assert_eq!(assembly.history_selection.selected_ids, vec!["h-new"]);
+        assert_eq!(assembly.history_selection.excluded_ids, vec!["h-old"]);
     }
 
     #[test]
@@ -66732,6 +66776,9 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("memoryWindowUpdateMode"));
         assert!(WEB_APP_JS.contains("memory_mode"));
         assert!(WEB_APP_JS.contains("loaded_memory_ids"));
+        assert!(WEB_APP_JS.contains("history_selection"));
+        assert!(WEB_APP_JS.contains("history_source"));
+        assert!(WEB_APP_JS.contains("historyExcluded"));
         assert!(WEB_APP_JS.contains("memory-bead-pin-toggle"));
         assert!(WEB_APP_JS.contains("memory-bead-edit"));
         assert!(!WEB_APP_JS.contains("memoryWindowBeads = memoryWindowBeads.map"));
@@ -70854,6 +70901,12 @@ attach: last_assistant
                 used_tokens: 0,
                 token_budget: 0,
             },
+            history_selection: super::ContextHistorySelectionEvidence {
+                source: "chat_room.messages".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                excluded_ids: Vec::new(),
+            },
             compaction_item: None,
             runtime_snapshot: super::ContextRuntimeSnapshot {
                 snapshot_id: "ctx-test".to_string(),
@@ -70960,6 +71013,12 @@ attach: last_assistant
                 used_tokens: 0,
                 token_budget: 0,
             },
+            history_selection: super::ContextHistorySelectionEvidence {
+                source: "chat_room.messages".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                excluded_ids: Vec::new(),
+            },
             compaction_item: None,
             runtime_snapshot: super::ContextRuntimeSnapshot {
                 snapshot_id: "ctx-test".to_string(),
@@ -71027,6 +71086,12 @@ attach: last_assistant
                 budget_skipped_ids: Vec::new(),
                 used_tokens: 0,
                 token_budget: 0,
+            },
+            history_selection: super::ContextHistorySelectionEvidence {
+                source: "chat_room.messages".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                excluded_ids: Vec::new(),
             },
             compaction_item: None,
             runtime_snapshot: super::ContextRuntimeSnapshot {
@@ -71099,6 +71164,12 @@ attach: last_assistant
                 budget_skipped_ids: Vec::new(),
                 used_tokens: 0,
                 token_budget: 0,
+            },
+            history_selection: super::ContextHistorySelectionEvidence {
+                source: "chat_room.messages".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                excluded_ids: Vec::new(),
             },
             compaction_item: None,
             runtime_snapshot: super::ContextRuntimeSnapshot {

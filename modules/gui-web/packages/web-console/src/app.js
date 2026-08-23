@@ -8003,6 +8003,10 @@ function memoryWindowRenderContextPreview(response, fallback = "No context previ
   const memorySelection = response.memory_selection || {};
   const memoryCandidates = Array.isArray(memorySelection.candidate_ids) ? memorySelection.candidate_ids : [];
   const memorySelected = Array.isArray(memorySelection.selected_ids) ? memorySelection.selected_ids : [];
+  const historySelection = response.history_selection || {};
+  const historyCandidates = Array.isArray(historySelection.candidate_ids) ? historySelection.candidate_ids : [];
+  const historySelected = Array.isArray(historySelection.selected_ids) ? historySelection.selected_ids : [];
+  const historyExcluded = Array.isArray(historySelection.excluded_ids) ? historySelection.excluded_ids : [];
   const runtime = response.runtime_snapshot || {};
   const compaction = response.compaction_item || null;
   const systemSnippet = String(response.system_prompt || "").slice(0, 500);
@@ -8014,6 +8018,7 @@ function memoryWindowRenderContextPreview(response, fallback = "No context previ
     `runtime_model=${runtime.model || "-"} provider=${runtime.provider || "-"} tools=${runtime.tool_catalog_revision || "-"}`,
     `messages=${messages} history=${response.history_message_count ?? 0} memory_beads=${beads}`,
     `loaded_memory_ids=${memoryIds.join(",") || "none"} history_floor=${response.history_floor_millis ?? "none"}`,
+    `history_source=${historySelection.source || "unknown"} candidates=${historyCandidates.join(",") || "none"} loaded=${historySelected.join(",") || "none"} excluded=${historyExcluded.join(",") || "none"}`,
     `tokens total=${budget.total ?? 0}/${budget.budget ?? 0} system=${budget.system ?? 0} memory=${budget.memory ?? 0} history=${budget.history ?? 0} user=${budget.user ?? 0}`,
     `truncated=${Boolean(response.truncated)}`,
     compaction
