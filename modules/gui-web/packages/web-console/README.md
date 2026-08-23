@@ -32,6 +32,23 @@ bind_addr = "127.0.0.1:8877"
 - `GET /api/stability/matrix`：返回多分辨率锚点映射矩阵。
 - `POST /api/stability/run`：执行键鼠视觉操作稳定性 dry-run，不执行真实点击。
 - `POST /api/computer-use/closed-loop`：执行视觉操作闭环，包含执行前截图、锚点定位、ROI 区域、可选真实输入、执行后截图和画面变化校验。
+- `GET /api/computer-use/capabilities`：分别报告 Browser DOM、UIA、无模型模板、本地/远程视觉和人工确认的观察能力；ShowUI 不可用时不会阻断 UIA/template dry-run。
+- `POST /api/vision/locate`：按 `uia → ocr_template → local_vlm → remote_vlm` 顺序定位；`ocr_template` 当前支持颜色按钮模板，无法确定目标时返回 `skipped/unavailable` 并要求人工确认。
+
+### 无 ShowUI 时的 Computer Use 降级
+
+默认 grounding 路由优先使用结构化 UIA（AutomationId、Name、ClassName、ControlType），其次使用无需模型的颜色/几何模板，再尝试本地或远程视觉模型。浏览器任务应优先使用已连接扩展提供的 DOM 引用。真实输入前必须保留最新截图/UIA 证据并经过权限闸门；所有自动定位失败的请求只返回 dry-run 计划，不执行盲目坐标点击。
+
+可在 `coolzhu.toml` 的 `[vision.router]` 中显式调整顺序：
+
+```toml
+[vision.router]
+pipeline = ["uia", "ocr_template", "local_vlm", "remote_vlm"]
+
+[vision.router.ocr_template]
+enabled = true
+confidence_floor = 0.72
+```
 
 ## 实时视觉语音验收
 

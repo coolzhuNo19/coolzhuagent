@@ -249,9 +249,8 @@ document.addEventListener("DOMContentLoaded", () => {
   actionButtons.get("chat-room-new")?.addEventListener("click", createChatRoom);
   actionButtons.get("chat-room-rename")?.addEventListener("click", renameSelectedChatRoom);
   actionButtons.get("chat-room-delete")?.addEventListener("click", deleteSelectedChatRoom);
-  actionButtons.get("chat-room-diagnostics")?.addEventListener("click", openChatRoomDiagnosticsSettings);
-  actionButtons.get("chat-handoff-toggle")?.addEventListener("click", toggleHandoffDrawer);
-  actionButtons.get("chat-handoff-manual")?.addEventListener("click", manualHandoffSelectedMessages);
+  actionButtons.get("chat-permission-save")?.addEventListener("click", saveChatRoomPermission);
+  actionButtons.get("chat-workspace-edit")?.addEventListener("click", () => beginWorkspaceEdit('[data-role="chat-workspace-path"]'));
   actionButtons.get("project-refresh")?.addEventListener("click", () => loadProjectTree());
   actionButtons.get("project-save")?.addEventListener("click", () => saveActiveIdeFile());
   actionButtons.get("project-new-file")?.addEventListener("click", () => createProjectEntry("file"));
@@ -4399,7 +4398,23 @@ async function refreshFullAccessStatus() {
 
 function taskRenderFullAccessStatus(status = {}) {
   const active = Boolean(status.full_access || status.permission_profile === "full-access");
+  const permissionProfile = status.permission_profile || (active ? "full-access" : "workspace-write");
   setBindText("tasks.fullAccessStatus", active ? "On · room" : "Off · workspace");
+  const permissionSelect = document.querySelector('[data-role="chat-permission-select"]');
+  const permissionStatus = document.querySelector('[data-role="chat-permission-status"]');
+  const permissionHint = document.querySelector('[data-role="chat-permission-hint"]');
+  if (permissionSelect) {
+    permissionSelect.value = permissionProfile;
+    permissionSelect.disabled = !activeChatRoomId;
+  }
+  if (permissionStatus) {
+    permissionStatus.textContent = permissionProfile;
+  }
+  if (permissionHint) {
+    permissionHint.textContent = permissionProfile === "full-access"
+      ? "当前聊天室已启用 full-access；撤销或切换权限需要经过安全确认。"
+      : "权限只对当前聊天室生效；full-access 仍需要双重确认。";
+  }
   const roomName = status.room_name || chatRoomRegistry.rooms?.find((item) => item.id === activeChatRoomId)?.name;
   const roomEl = document.querySelector('[data-role="authorization-selected-room"]');
   const scopeEl = document.querySelector('[data-role="authorization-scope"]');
@@ -4417,6 +4432,50 @@ function taskRenderFullAccessStatus(status = {}) {
   const revoke = actionButtons.get("full-access-revoke");
   if (revoke) {
     revoke.disabled = !active;
+  }
+}
+
+async function saveChatRoomPermission(event) {
+  const button = event?.currentTarget || actionButtons.get("chat-permission-save");
+  const select = document.querySelector('[data-role="chat-permission-select"]');
+  if (!activeChatRoomId || !select) {
+    return;
+  }
+  const selectedProfile = select.value === "full-access" ? "full-access" : "workspace-write";
+  const currentProfile = taskFullAccessStatus.permission_profile || "workspace-write";
+  if (selectedProfile === currentProfile) {
+    taskRenderFullAccessStatus(taskFullAccessStatus);
+    return;
+  }
+  let riskAcknowledged = false;
+  let confirmedTwice = false;
+  if (selectedProfile === "full-access") {
+    riskAcknowledged = window.confirm("确认将当前聊天室权限提升为 full-access？这会允许更广泛的文件/命令操作。");
+    confirmedTwice = riskAcknowledged && window.confirm("再次确认：full-access 仍受工具审批和安全策略约束，是否继续？");
+    if (!riskAcknowledged || !confirmedTwice) {
+      select.value = currentProfile;
+      return;
+    }
+  }
+  setBusy(button, true, "保存中");
+  try {
+    taskFullAccessStatus = await requestJson(`/api/chat/rooms/${encodeURIComponent(activeChatRoomId)}/permissions`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        permission_profile: selectedProfile,
+        risk_acknowledged: riskAcknowledged,
+        confirmed_twice: confirmedTwice,
+      }),
+    });
+    taskRenderFullAccessStatus(taskFullAccessStatus);
+    await refreshToolAudit();
+  } catch (error) {
+    select.value = currentProfile;
+    taskRenderFullAccessStatus(taskFullAccessStatus);
+    addMessage({ author: "聊天室权限", text: `权限保存失败：${error.message}`, kind: "thought", icon: "error-log" });
+  } finally {
+    setBusy(button, false);
   }
 }
 
@@ -6356,6 +6415,7 @@ async function refreshState() {
     setText("overview.chatRoomCount", String(state.overview?.chat_room_count ?? 0));
     activeWorkspaceKey = composerDraftWorkspaceKey(state.workspace);
     setText("project.path", state.workspace);
+    setChatWorkspacePath(state.workspace);
     setText("config.provider", state.models.reasoning);
     setText("config.model", state.models.vision);
     setVisionPreview(state.latest_capture);
@@ -6532,8 +6592,8 @@ function renderVisionAgentSelect(activeVisionAgent) {
   });
 }
 
-function beginWorkspaceEdit() {
-  const node = document.querySelector('[data-bind="project.path"]');
+function beginWorkspaceEdit(target = '[data-bind="project.path"]') {
+  const node = typeof target === "string" ? document.querySelector(target) : target;
   if (!node || node.querySelector("input")) {
     return;
   }
@@ -6545,19 +6605,30 @@ function beginWorkspaceEdit() {
   node.replaceChildren(input);
   input.focus();
   input.select();
+  let finalized = false;
+  const restore = () => {
+    const value = current || "未设置";
+    if (node.dataset.role === "chat-workspace-path") {
+      setChatWorkspacePath(value);
+    } else {
+      setText("project.path", current);
+    }
+  };
   input.addEventListener("keydown", async (event) => {
     if (event.key === "Escape") {
-      setText("project.path", current);
+      finalized = true;
+      restore();
       return;
     }
     if (event.key === "Enter") {
       event.preventDefault();
+      finalized = true;
       await saveWorkspacePath(input.value, current);
     }
   });
   input.addEventListener("blur", () => {
-    if (document.activeElement !== input) {
-      setText("project.path", current);
+    if (!finalized && document.activeElement !== input) {
+      restore();
     }
   });
 }
@@ -6566,6 +6637,7 @@ async function saveWorkspacePath(path, fallbackPath) {
   const trimmed = String(path || "").trim();
   if (!trimmed) {
     setText("project.path", fallbackPath);
+    setChatWorkspacePath(fallbackPath);
     return;
   }
   try {
@@ -6575,6 +6647,7 @@ async function saveWorkspacePath(path, fallbackPath) {
       body: JSON.stringify({ path: trimmed }),
     });
     setText("project.path", result.workspace);
+    setChatWorkspacePath(result.workspace);
     await refreshWorkspaceBoundState(result.workspace);
     addMessage({
       author: "工程目录",
@@ -6584,6 +6657,7 @@ async function saveWorkspacePath(path, fallbackPath) {
     });
   } catch (error) {
     setText("project.path", fallbackPath);
+    setChatWorkspacePath(fallbackPath);
     addMessage({
       author: "工程目录",
       text: `路径切换失败：${error.message}`,
@@ -6591,6 +6665,17 @@ async function saveWorkspacePath(path, fallbackPath) {
       icon: "error-log",
     });
   }
+}
+
+function setChatWorkspacePath(workspace) {
+  const node = document.querySelector('[data-role="chat-workspace-path"]');
+  if (!node) {
+    return;
+  }
+  const full = String(workspace || "").trim();
+  node.replaceChildren();
+  node.textContent = full || "未设置";
+  node.title = full || "工作目录未就绪";
 }
 
 async function refreshWorkspaceBoundState(workspace) {
@@ -6636,6 +6721,7 @@ function resetWorkspaceBoundUiState(workspace) {
   activeSessionId = null;
   activeChatRoomId = null;
   activeOverviewVisionAgent = null;
+  taskFullAccessStatus = { full_access: false, permission_profile: "workspace-write" };
   selectedProjectPath = "";
   projectTreeRoot = null;
   expandedProjectPaths.clear();
@@ -6657,6 +6743,8 @@ function resetWorkspaceBoundUiState(workspace) {
   setSessionForm(null);
   updateSessionTrigger("暂无会话");
   updateChatRoomTrigger("主聊天室");
+  setChatWorkspacePath(workspace);
+  taskRenderFullAccessStatus(taskFullAccessStatus);
   setText("session.active", "加载中");
   setText("chat.current", "加载中");
   clearChatMessagesUi();
@@ -7551,9 +7639,12 @@ function memoryWindowRenderContextPreview(response, fallback = "No context previ
   const budget = response.token_budget || {};
   const messages = Array.isArray(response.messages) ? response.messages.length : 0;
   const beads = Array.isArray(response.memory_beads) ? response.memory_beads.length : 0;
+  const memoryIds = Array.isArray(response.memory_bead_ids) ? response.memory_bead_ids : [];
   const systemSnippet = String(response.system_prompt || "").slice(0, 500);
   node.textContent = [
+    `snapshot=${response.context_snapshot_id || "-"} memory_revision=${response.memory_revision || "-"}`,
     `messages=${messages} history=${response.history_message_count ?? 0} memory_beads=${beads}`,
+    `loaded_memory_ids=${memoryIds.join(",") || "none"} history_floor=${response.history_floor_millis ?? "none"}`,
     `tokens total=${budget.total ?? 0}/${budget.budget ?? 0} system=${budget.system ?? 0} memory=${budget.memory ?? 0} history=${budget.history ?? 0} user=${budget.user ?? 0}`,
     `truncated=${Boolean(response.truncated)}`,
     systemSnippet ? `system:\n${systemSnippet}` : "",
@@ -10441,10 +10532,13 @@ function handleChatStreamEvent({ event, data }) {
     return data;
   }
   if (event === "message_done") {
+    if (data?.kind === "reasoning") {
+      upsertMessage(data, { streaming: false });
+      return data;
+    }
     if (!shouldRenderCompletedMessage(data)) {
       return data;
     }
-    hideReasoningForAssistant(data.id);
     upsertMessage(data, { streaming: false });
     flushRealtimeAssistantSpeech(data);
     maybeAutoSpeakRealtimeReply(data);
@@ -10609,15 +10703,6 @@ function isGoalPhaseMessage(message) {
     || kind === "goal-phase"
     || author.includes("goal phase")
     || target.includes("goal phase");
-}
-
-function hideReasoningForAssistant(assistantId) {
-  const list = chatMessageList();
-  if (!list || !assistantId) {
-    return;
-  }
-  const reasoningId = `${assistantId}-thinking`;
-  list.querySelector(`[data-message-id="${CSS.escape(reasoningId)}"]`)?.remove();
 }
 
 function showToolExecButtons() {
@@ -12981,6 +13066,7 @@ async function loadProjectTree(path = "") {
     const response = await requestJson(url);
     projectTreeRoot = response.root;
     setText("project.path", response.workspace);
+    setChatWorkspacePath(response.workspace);
     renderProjectApiTree([response.root], response.warnings || []);
     if (Array.isArray(response.warnings) && response.warnings.length) {
       ideSetOperationStatus(

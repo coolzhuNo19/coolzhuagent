@@ -948,6 +948,10 @@ fn app() -> Router {
             get(api_computer_use_browser_health),
         )
         .route(
+            "/api/computer-use/capabilities",
+            get(api_computer_use_capabilities),
+        )
+        .route(
             "/api/computer-use/browser/probe",
             get(api_computer_use_browser_probe),
         )
@@ -2320,9 +2324,47 @@ fn emit_realtime_session_event(kind: &str, session_id: Option<String>, payload: 
         kind: kind.to_string(),
         at_ms: now,
         session_id,
-        payload,
+        payload: realtime_event_envelope(kind, payload),
     };
     let _ = realtime_session_event_bus().send(event);
+}
+
+/// 在保留旧 `kind` 的同时提供一个稳定的事件 schema，便于 CLI、Web 和未来
+/// Realtime 客户端按事件类型消费，不必依赖历史实现中的字符串分支。
+fn realtime_event_envelope(kind: &str, payload: JsonValue) -> JsonValue {
+    let event_type = realtime_event_type(kind, &payload);
+    let mut object = match payload {
+        JsonValue::Object(object) => object,
+        value => {
+            let mut object = serde_json::Map::new();
+            object.insert("data".to_string(), value);
+            object
+        }
+    };
+    object
+        .entry("schema_version".to_string())
+        .or_insert_with(|| JsonValue::String("coolzhu.realtime.v1".to_string()));
+    object
+        .entry("event_type".to_string())
+        .or_insert_with(|| JsonValue::String(event_type));
+    JsonValue::Object(object)
+}
+
+fn realtime_event_type(kind: &str, payload: &JsonValue) -> String {
+    match kind {
+        "partial_transcript" => "input_transcript_delta".to_string(),
+        "final_transcript" => "input_transcript_done".to_string(),
+        "assistant_started" => "response_started".to_string(),
+        "assistant_text" => "output_text_delta".to_string(),
+        "assistant_done" => "response_done".to_string(),
+        "model_stream_delta" => match payload.get("delta_kind").and_then(JsonValue::as_str) {
+            Some("thinking") => "reasoning_delta".to_string(),
+            Some("tool_json") => "tool_call_delta".to_string(),
+            _ => "output_text_delta".to_string(),
+        },
+        "tts_chunk" | "tts_stream_chunk" | "tts_audio_chunk" => "output_audio_delta".to_string(),
+        _ => format!("coolzhu.{kind}"),
+    }
 }
 
 fn active_realtime_session_event_target() -> Option<String> {
@@ -2833,6 +2875,38 @@ fn local_active_mode(gemma: bool, vision: bool) -> &'static str {
 fn local_port_listening(port: u16) -> bool {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
+}
+
+fn local_vision_endpoint_reachable(base_url: &str) -> bool {
+    let without_scheme = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest);
+    let authority = without_scheme.split('/').next().unwrap_or_default();
+    let (host, port) = authority.rsplit_once(':').map_or_else(
+        || {
+            let default_port = if base_url.starts_with("https://") {
+                443
+            } else {
+                80
+            };
+            (authority, default_port)
+        },
+        |(host, port)| {
+            (
+                host.trim_matches(['[', ']']),
+                port.parse::<u16>().unwrap_or(0),
+            )
+        },
+    );
+    if port == 0 {
+        return false;
+    }
+    if matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        local_port_listening(port)
+    } else {
+        // 远端兼容端点不能用本机 TCP 探测判断；请求阶段仍会有真实健康/凭据错误。
+        true
+    }
 }
 
 fn local_gemma_ready(port: u16) -> bool {
@@ -4957,6 +5031,8 @@ struct ConfigVisionRouter {
     #[serde(default)]
     uia: UiaRouterConfig,
     #[serde(default)]
+    ocr_template: OcrTemplateRouterConfig,
+    #[serde(default)]
     local_vlm: LocalVlmRouterConfig,
     #[serde(default)]
     remote_vlm: RemoteVlmRouterConfig,
@@ -4969,6 +5045,7 @@ struct ConfigVisionRouter {
 fn default_router_pipeline() -> Vec<String> {
     vec![
         "uia".to_string(),
+        "ocr_template".to_string(),
         "local_vlm".to_string(),
         "remote_vlm".to_string(),
     ]
@@ -4992,6 +5069,7 @@ impl Default for ConfigVisionRouter {
             cross_verify_tolerance_px: default_cross_verify_tolerance(),
             timeout_ms: default_router_timeout_ms(),
             uia: UiaRouterConfig::default(),
+            ocr_template: OcrTemplateRouterConfig::default(),
             local_vlm: LocalVlmRouterConfig::default(),
             remote_vlm: RemoteVlmRouterConfig::default(),
             detection: ConfigVisionDetection::default(),
@@ -5101,6 +5179,23 @@ impl Default for UiaRouterConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct OcrTemplateRouterConfig {
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default = "default_template_confidence_floor")]
+    confidence_floor: f32,
+}
+
+impl Default for OcrTemplateRouterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            confidence_floor: default_template_confidence_floor(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalVlmRouterConfig {
     #[serde(default = "default_enabled")]
     enabled: bool,
@@ -5172,6 +5267,9 @@ fn default_sample_count() -> u8 {
 }
 fn default_local_confidence_floor() -> f32 {
     0.35
+}
+fn default_template_confidence_floor() -> f32 {
+    0.72
 }
 fn default_remote_confidence_floor() -> f32 {
     0.6
@@ -17965,47 +18063,31 @@ async fn run_grounding_router(
                 } else if let Some(target) = locate_system_control(&req.target) {
                     let t1 = std::time::Instant::now();
                     match uia_resolver::resolve_system_control(target) {
-                        Ok(hit) => {
-                            let status = if hit.confidence >= effective_min_confidence {
-                                vision::locate::AttemptStatus::Ok
-                            } else {
-                                vision::locate::AttemptStatus::LowConfidence
-                            };
-                            vision::locate::BackendAttempt {
-                                backend: vision::locate::BackendId::Uia,
-                                status,
-                                point: Some(vision::locate::PointPx {
-                                    x: hit.bounding_rect.x + hit.bounding_rect.width / 2,
-                                    y: hit.bounding_rect.y + hit.bounding_rect.height / 2,
-                                }),
-                                bbox: Some(hit.bounding_rect),
-                                confidence: Some(hit.confidence),
-                                raw_response: None,
-                                model: Some("windows-uiautomation".to_string()),
-                                base_url: None,
-                                elapsed_ms: t1.elapsed().as_millis() as u64,
-                                error: None,
-                            }
-                        }
-                        Err(e) => vision::locate::BackendAttempt {
-                            backend: vision::locate::BackendId::Uia,
-                            status: vision::locate::AttemptStatus::Failed,
-                            point: None,
-                            bbox: None,
-                            confidence: None,
-                            raw_response: None,
-                            model: None,
-                            base_url: None,
-                            elapsed_ms: 0,
-                            error: Some(e.to_string()),
-                        },
+                        Ok(hit) => uia_hit_to_attempt(t1, hit, effective_min_confidence),
+                        Err(e) => uia_error_to_attempt(t1, e),
+                    }
+                } else if matches!(&req.target, vision::locate::LocateTarget::Uia { .. }) {
+                    let t1 = std::time::Instant::now();
+                    match locate_uia_target(&req.target) {
+                        Ok(hit) => uia_hit_to_attempt(t1, hit, effective_min_confidence),
+                        Err(e) => uia_error_to_attempt(t1, e),
                     }
                 } else {
                     vision::locate::BackendAttempt::skipped(
                         *backend,
-                        "target is not a known system control",
+                        "target is neither a known system control nor a UIA query",
                     )
                 }
+            }
+            vision::locate::BackendId::OcrTemplate => {
+                template_locate_attempt(
+                    &req,
+                    &capture_path,
+                    screen_dimensions,
+                    &config,
+                    effective_min_confidence,
+                )
+                .await
             }
             vision::locate::BackendId::LocalVlm => {
                 local_vlm_locate_attempt(
@@ -18044,6 +18126,18 @@ async fn run_grounding_router(
     } else {
         Some("grounding router did not produce a verified high-confidence point; no hardcoded anchor fallback is used".to_string())
     };
+    let mut notes = vec![
+        "Grounding backend is separate from user-selectable vision understanding agents."
+            .to_string(),
+        "Real click execution consumes this locate result and does not fall back to taskbar anchors."
+            .to_string(),
+    ];
+    if status != vision::locate::LocateStatus::Ok {
+        notes.push(
+            "No automatic grounding result is available; keep the action as dry-run and request manual confirmation."
+                .to_string(),
+        );
+    }
 
     Ok(vision::locate::LocateResponse {
         status,
@@ -18057,15 +18151,21 @@ async fn run_grounding_router(
         screen,
         elapsed_ms: t0.elapsed().as_millis() as u64,
         degradation_reason,
-        notes: vec![
-            "Grounding backend is separate from user-selectable vision understanding agents.".to_string(),
-            "Real click execution consumes this locate result and does not fall back to taskbar anchors.".to_string(),
-        ],
+        notes,
     })
 }
 
 fn active_vision_router_config() -> ConfigVisionRouter {
     read_config(|config| config.vision.router.clone().unwrap_or_default())
+}
+
+fn configured_local_vlm_base_url(config: &ConfigVisionRouter) -> String {
+    config
+        .local_vlm
+        .base_url
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(authoritative_local_vision_base_url)
 }
 
 fn effective_locate_min_confidence(
@@ -18104,6 +18204,9 @@ fn locate_pipeline(
 fn parse_locate_backend_id(name: &str) -> Option<vision::locate::BackendId> {
     match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "uia" | "ui_automation" => Some(vision::locate::BackendId::Uia),
+        "ocr" | "ocr_template" | "template" | "template_match" => {
+            Some(vision::locate::BackendId::OcrTemplate)
+        }
         "local_vlm" | "local" | "showui" => Some(vision::locate::BackendId::LocalVlm),
         "remote_vlm" | "remote" => Some(vision::locate::BackendId::RemoteVlm),
         _ => None,
@@ -18444,16 +18547,202 @@ fn locate_target_text(target: &vision::locate::LocateTarget) -> String {
         vision::locate::LocateTarget::Natural { text } => text.clone(),
         vision::locate::LocateTarget::System { id } => format!("{id:?}"),
         vision::locate::LocateTarget::Uia {
+            process_id,
+            window_name,
             automation_id,
             class_name,
             name,
             control_type,
-        } => [automation_id, class_name, name, control_type]
-            .into_iter()
-            .filter_map(|value| value.as_deref())
-            .filter(|value| !value.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join(" "),
+        } => [
+            process_id.map(|id| id.to_string()),
+            window_name.clone(),
+            automation_id.clone(),
+            class_name.clone(),
+            name.clone(),
+            control_type.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" "),
+    }
+}
+
+fn uia_hit_to_attempt(
+    started: std::time::Instant,
+    hit: uia_resolver::UiaHit,
+    min_confidence: f32,
+) -> vision::locate::BackendAttempt {
+    let status = if hit.confidence >= min_confidence {
+        vision::locate::AttemptStatus::Ok
+    } else {
+        vision::locate::AttemptStatus::LowConfidence
+    };
+    vision::locate::BackendAttempt {
+        backend: vision::locate::BackendId::Uia,
+        status,
+        point: Some(vision::locate::PointPx {
+            x: hit.bounding_rect.x + hit.bounding_rect.width / 2,
+            y: hit.bounding_rect.y + hit.bounding_rect.height / 2,
+        }),
+        bbox: Some(hit.bounding_rect),
+        confidence: Some(hit.confidence),
+        raw_response: Some(format!(
+            "uia target name={:?} automation_id={:?} control_type={}",
+            hit.name, hit.automation_id, hit.control_type
+        )),
+        model: Some("windows-uiautomation".to_string()),
+        base_url: None,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        error: None,
+    }
+}
+
+fn uia_error_to_attempt(
+    started: std::time::Instant,
+    error: uia_resolver::UiaError,
+) -> vision::locate::BackendAttempt {
+    vision::locate::BackendAttempt {
+        backend: vision::locate::BackendId::Uia,
+        status: vision::locate::AttemptStatus::Failed,
+        point: None,
+        bbox: None,
+        confidence: None,
+        raw_response: None,
+        model: None,
+        base_url: None,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        error: Some(error.to_string()),
+    }
+}
+
+fn locate_uia_target(
+    target: &vision::locate::LocateTarget,
+) -> Result<uia_resolver::UiaHit, uia_resolver::UiaError> {
+    let vision::locate::LocateTarget::Uia {
+        process_id,
+        window_name,
+        automation_id,
+        class_name,
+        name,
+        control_type,
+    } = target
+    else {
+        return Err(uia_resolver::UiaError::ElementNotFound);
+    };
+
+    let snapshot = uia_resolver::snapshot_foreground_window(512)?;
+    let element = uia_resolver::resolve_query(
+        &snapshot,
+        &uia_resolver::UiaQuery {
+            process_id: *process_id,
+            window_name: window_name.clone(),
+            element_name: name.clone(),
+            automation_id: automation_id.clone(),
+            class_name: class_name.clone(),
+            control_type: control_type.clone(),
+        },
+    )?;
+
+    let mut confidence: f32 = 0.55;
+    if automation_id.is_some() {
+        confidence += 0.22;
+    }
+    if class_name.is_some() {
+        confidence += 0.08;
+    }
+    if name.is_some() {
+        confidence += 0.08;
+    }
+    if control_type.is_some() {
+        confidence += 0.05;
+    }
+    confidence = confidence.min(0.99);
+
+    Ok(uia_resolver::UiaHit {
+        automation_id: element.automation_id,
+        class_name: element.class_name,
+        name: element.name,
+        control_type: element.control_type,
+        bounding_rect: element.bounding_rect,
+        is_offscreen: element.is_offscreen,
+        is_enabled: element.is_enabled,
+        confidence,
+    })
+}
+
+async fn template_locate_attempt(
+    req: &vision::locate::LocateRequest,
+    capture_path: &Path,
+    screen: ScreenDimensions,
+    config: &ConfigVisionRouter,
+    min_confidence: f32,
+) -> vision::locate::BackendAttempt {
+    let backend = vision::locate::BackendId::OcrTemplate;
+    if !config.ocr_template.enabled {
+        return vision::locate::BackendAttempt::skipped(
+            backend,
+            "ocr/template backend disabled by config",
+        );
+    }
+    if !cfg!(windows) {
+        return vision::locate::BackendAttempt::skipped(
+            backend,
+            "ocr/template backend requires Windows screenshot tooling",
+        );
+    }
+
+    let target = locate_target_text(&req.target);
+    let Some(color_hint) = colored_button_hint(&target) else {
+        return vision::locate::BackendAttempt::skipped(
+            backend,
+            "no deterministic color/template hint; OCR provider is not configured",
+        );
+    };
+    let started = std::time::Instant::now();
+    let threshold = min_confidence.max(config.ocr_template.confidence_floor.clamp(0.0, 1.0));
+    match locate_colored_button_region(capture_path, color_hint, screen, None).await {
+        Some(region) => {
+            let confidence = 0.72;
+            let status = if confidence >= threshold {
+                vision::locate::AttemptStatus::Ok
+            } else {
+                vision::locate::AttemptStatus::LowConfidence
+            };
+            vision::locate::BackendAttempt {
+                backend,
+                status,
+                point: Some(region.point),
+                bbox: Some(region.bbox),
+                confidence: Some(confidence),
+                raw_response: Some(format!(
+                    "template color={} pixels={} bbox=({},{} {}x{})",
+                    color_hint.as_str(),
+                    region.pixel_count,
+                    region.bbox.x,
+                    region.bbox.y,
+                    region.bbox.width,
+                    region.bbox.height
+                )),
+                model: Some("system-drawing-color-template".to_string()),
+                base_url: None,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                error: None,
+            }
+        }
+        None => vision::locate::BackendAttempt {
+            backend,
+            status: vision::locate::AttemptStatus::Failed,
+            point: None,
+            bbox: None,
+            confidence: None,
+            raw_response: None,
+            model: Some("system-drawing-color-template".to_string()),
+            base_url: None,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            error: Some(format!("no {} template region found", color_hint.as_str())),
+        },
     }
 }
 
@@ -18470,12 +18759,13 @@ async fn local_vlm_locate_attempt(
             "local_vlm disabled by config",
         );
     }
-    let base_url = config
-        .local_vlm
-        .base_url
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(authoritative_local_vision_base_url);
+    let base_url = configured_local_vlm_base_url(config);
+    if !local_vision_endpoint_reachable(&base_url) {
+        return vision::locate::BackendAttempt::skipped(
+            vision::locate::BackendId::LocalVlm,
+            &format!("local VLM endpoint is not reachable: {base_url}"),
+        );
+    }
     let model = config
         .local_vlm
         .model
@@ -24630,6 +24920,7 @@ fn build_context_assembly_with_roster(
     let max_prompt_tokens = options.max_prompt_tokens.max(1);
     let mut truncated = false;
     let mut memory_beads = select_context_memory_beads(agent, current_user_text, options);
+    let memory_revision = context_memory_revision(agent);
     let build_system_prompt = |beads: &[MemoryBeadDto]| {
         let mut prompt = build_agent_system_prompt_with_beads(agent, beads);
         if let Some(roster) = collaboration_roster {
@@ -24813,6 +25104,19 @@ fn build_context_assembly_with_roster(
         .saturating_add(history_tokens)
         .saturating_add(user_tokens);
     let budget = max_prompt_tokens;
+    let memory_bead_ids = memory_beads
+        .iter()
+        .map(|bead| bead.id.clone())
+        .collect::<Vec<_>>();
+    let context_snapshot_id = context_snapshot_id(
+        agent,
+        &memory_revision,
+        options.history_floor_millis,
+        &memory_bead_ids,
+        &selected_history,
+        &system_prompt,
+        &current_user_text_for_prompt,
+    );
 
     ctx_span.record("outcome", "ok");
     diagnostics::info(
@@ -24831,6 +25135,10 @@ fn build_context_assembly_with_roster(
         system_prompt,
         messages,
         memory_beads,
+        context_snapshot_id,
+        memory_revision,
+        memory_bead_ids,
+        history_floor_millis: options.history_floor_millis,
         history_message_count: selected_history.len(),
         token_budget: ContextTokenBudget {
             system: system_tokens,
@@ -24842,6 +25150,53 @@ fn build_context_assembly_with_roster(
         },
         truncated,
     }
+}
+
+fn context_memory_revision(agent: &AgentSessionDto) -> String {
+    let mut parts = Vec::with_capacity(agent.memory_beads.len());
+    for bead in &agent.memory_beads {
+        parts.push(format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:.4}\u{1f}{}",
+            bead.id,
+            bead.layer,
+            bead.kind,
+            bead.source,
+            bead.summary,
+            bead.pinned,
+            bead.confidence,
+            bead.created_at,
+        ));
+    }
+    format!("mem-{:016x}", hash_bytes(parts.join("\u{1e}").as_bytes()))
+}
+
+fn context_snapshot_id(
+    agent: &AgentSessionDto,
+    memory_revision: &str,
+    history_floor_millis: Option<u64>,
+    memory_bead_ids: &[String],
+    selected_history: &[PersistedChatMessage],
+    system_prompt: &str,
+    current_user_text: &str,
+) -> String {
+    let history_identity = selected_history
+        .iter()
+        .map(|message| format!("{}:{}:{}", message.id, message.created_at, message.kind))
+        .collect::<Vec<_>>()
+        .join("\u{1e}");
+    let input_hash = hash_bytes(current_user_text.as_bytes());
+    let prompt_hash = hash_bytes(system_prompt.as_bytes());
+    let seed = format!(
+        "{}|{}|{}|{}|{}|{:016x}|{:016x}",
+        agent.id,
+        memory_revision,
+        history_floor_millis.unwrap_or_default(),
+        memory_bead_ids.join(","),
+        history_identity,
+        prompt_hash,
+        input_hash,
+    );
+    format!("ctx-{:016x}", hash_bytes(seed.as_bytes()))
 }
 
 fn select_context_memory_beads(
@@ -27277,6 +27632,13 @@ struct ContextAssembly {
     system_prompt: String,
     messages: Vec<InputMessage>,
     memory_beads: Vec<MemoryBeadDto>,
+    /// 本次装配的稳定身份；前端可用它判断预览是否已经过期。
+    context_snapshot_id: String,
+    /// 由候选 memory beads 内容计算的 revision，不把完整记忆文本复制到状态栏。
+    memory_revision: String,
+    /// 实际注入 prompt 的 bead id，便于诊断“记忆已加载但未进入上下文”的差异。
+    memory_bead_ids: Vec<String>,
+    history_floor_millis: Option<u64>,
     history_message_count: usize,
     token_budget: ContextTokenBudget,
     truncated: bool,
@@ -44344,6 +44706,98 @@ struct ComputerUseProfileResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct ComputerUseCapabilitiesResponse {
+    status: String,
+    generated_at_ms: u64,
+    showui: ComputerUseBackendCapabilityDto,
+    observations: Vec<ComputerUseObservationCapabilityDto>,
+    surfaces: Vec<ComputerUseSurfaceCapabilityDto>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ComputerUseBackendCapabilityDto {
+    backend: String,
+    status: String,
+    available: bool,
+    requires_model: bool,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ComputerUseObservationCapabilityDto {
+    backend: String,
+    priority: u8,
+    status: String,
+    available: bool,
+    requires_model: bool,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ComputerUseSurfaceCapabilityDto {
+    surface: String,
+    status: String,
+    available: bool,
+    reason: String,
+    actions: Vec<ComputerUseActionCapabilityDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct ComputerUseActionCapabilityDto {
+    action: String,
+    supported: bool,
+    requires_confirmation: bool,
+}
+
+fn computer_use_surface_capability(
+    surface: &str,
+    available: bool,
+    status: &str,
+    reason: &str,
+    actions: &[(&str, bool, bool)],
+) -> ComputerUseSurfaceCapabilityDto {
+    ComputerUseSurfaceCapabilityDto {
+        surface: surface.to_string(),
+        status: status.to_string(),
+        available,
+        reason: reason.to_string(),
+        actions: actions
+            .iter()
+            .map(
+                |(action, supported, requires_confirmation)| ComputerUseActionCapabilityDto {
+                    action: (*action).to_string(),
+                    supported: *supported,
+                    requires_confirmation: *requires_confirmation,
+                },
+            )
+            .collect(),
+    }
+}
+
+fn computer_use_observation_capability(
+    backend: vision::locate::BackendId,
+    available: bool,
+    status: &str,
+    reason: &str,
+) -> ComputerUseObservationCapabilityDto {
+    ComputerUseObservationCapabilityDto {
+        backend: match backend {
+            vision::locate::BackendId::Uia => "uia",
+            vision::locate::BackendId::OcrTemplate => "ocr_template",
+            vision::locate::BackendId::LocalVlm => "local_vlm",
+            vision::locate::BackendId::RemoteVlm => "remote_vlm",
+        }
+        .to_string(),
+        priority: backend.recommended_priority(),
+        status: status.to_string(),
+        available,
+        requires_model: backend.requires_model(),
+        reason: reason.to_string(),
+    }
+}
+
+#[derive(Debug, Serialize)]
 struct TimedPhase {
     name: String,
     description: String,
@@ -45787,6 +46241,30 @@ fn realtime_segment_should_attempt_asr(
         && normalize_realtime_capability(asr_mode) != REALTIME_SEGMENT_ASR_OFF
 }
 
+fn invalid_realtime_audio_payload(path: &Path) -> Option<String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())?;
+    let bytes = std::fs::read(path).ok()?;
+    let valid = match extension.as_str() {
+        "webm" => bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]),
+        "ogg" | "opus" => bytes.starts_with(b"OggS"),
+        "wav" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "flac" => bytes.starts_with(b"fLaC"),
+        "mp4" | "m4a" => bytes.len() >= 12 && &bytes[4..8] == b"ftyp",
+        "mp3" => bytes.starts_with(b"ID3") || (bytes.len() >= 2 && bytes[0] == 0xff),
+        _ => true,
+    };
+    if valid {
+        None
+    } else {
+        Some(format!(
+            "Invalid data: audio payload is not a valid {extension} container"
+        ))
+    }
+}
+
 async fn transcribe_realtime_final_audio_segment(
     payload_path: Option<&str>,
     final_segment: bool,
@@ -45802,6 +46280,14 @@ async fn transcribe_realtime_final_audio_segment(
     };
     let audio_path = PathBuf::from(path);
     let engine = audio::SttEngine::new(audio::SttConfig::default());
+    if let Some(error) = invalid_realtime_audio_payload(&audio_path) {
+        return RealtimeSegmentAsrOutcome {
+            attempted: true,
+            provider: Some(provider),
+            error: Some(format!("No STT backend available. Attempts: {}", error)),
+            ..Default::default()
+        };
+    }
     match engine.transcribe_file(&audio_path).await {
         Ok(result) => {
             let text = result.text.trim().chars().take(512).collect::<String>();
@@ -47874,6 +48360,211 @@ async fn api_computer_use_browser_health() -> Json<browser_bridge::BrowserBridge
     Json(browser_bridge::health())
 }
 
+async fn api_computer_use_capabilities() -> Json<ComputerUseCapabilitiesResponse> {
+    let showui_service = showui_service_status_with_message("ShowUI capability probe completed.");
+    let showui_port_reachable = local_port_listening(LOCAL_SHOWUI_PORT);
+    let showui_available =
+        showui_port_reachable && showui_service.enabled && !showui_service.disabled;
+    let browser_health = browser_bridge::health();
+    let desktop_available = cfg!(windows);
+    let desktop_status = if desktop_available {
+        "available"
+    } else {
+        "skipped"
+    };
+    let browser_status = if browser_health.connected {
+        "available"
+    } else {
+        "skipped"
+    };
+    let showui_status = if showui_available {
+        "available"
+    } else {
+        "skipped"
+    };
+    let router_config = active_vision_router_config();
+    let local_vlm_base_url = configured_local_vlm_base_url(&router_config);
+    let local_vlm_available =
+        router_config.local_vlm.enabled && local_vision_endpoint_reachable(&local_vlm_base_url);
+    let remote_vlm_configured = router_config.remote_vlm.enabled
+        && router_config.remote_vlm.providers.iter().any(|provider| {
+            provider
+                .base_url
+                .as_deref()
+                .is_some_and(|url| !url.trim().is_empty())
+        });
+    let observations = vec![
+        ComputerUseObservationCapabilityDto {
+            backend: "browser_dom".to_string(),
+            priority: 0,
+            status: if browser_health.connected {
+                "available".to_string()
+            } else {
+                "skipped".to_string()
+            },
+            available: browser_health.connected,
+            requires_model: false,
+            reason: if browser_health.connected {
+                "浏览器扩展/native host 已连接，网页任务优先使用 DOM/CDP 语义引用".to_string()
+            } else {
+                "浏览器扩展/native host 未连接，网页任务等待连接或转人工确认".to_string()
+            },
+        },
+        computer_use_observation_capability(
+            vision::locate::BackendId::Uia,
+            desktop_available && router_config.uia.enabled,
+            if desktop_available && router_config.uia.enabled {
+                "available"
+            } else {
+                "skipped"
+            },
+            if !desktop_available {
+                "UIA 仅支持 Windows"
+            } else if !router_config.uia.enabled {
+                "UIA backend disabled by config"
+            } else {
+                "Windows UI Automation：按窗口、控件类型、Name、AutomationId 进行确定性定位"
+            },
+        ),
+        computer_use_observation_capability(
+            vision::locate::BackendId::OcrTemplate,
+            desktop_available && router_config.ocr_template.enabled,
+            if desktop_available && router_config.ocr_template.enabled {
+                "available"
+            } else {
+                "skipped"
+            },
+            if !desktop_available {
+                "模板扫描仅支持 Windows 截图工具"
+            } else if !router_config.ocr_template.enabled {
+                "OCR/template backend disabled by config"
+            } else {
+                "无模型模板后端已启用；当前支持颜色按钮模板，未识别文本时显式跳过 OCR"
+            },
+        ),
+        computer_use_observation_capability(
+            vision::locate::BackendId::LocalVlm,
+            local_vlm_available,
+            if local_vlm_available {
+                "available"
+            } else {
+                "skipped"
+            },
+            if local_vlm_available {
+                "本地视觉模型端点可达"
+            } else if !router_config.local_vlm.enabled {
+                "local_vlm backend disabled by config"
+            } else {
+                "本地视觉模型端点不可达；不因缺少 ShowUI 阻断 UIA/template"
+            },
+        ),
+        computer_use_observation_capability(
+            vision::locate::BackendId::RemoteVlm,
+            remote_vlm_configured,
+            if remote_vlm_configured {
+                "available"
+            } else {
+                "skipped"
+            },
+            if remote_vlm_configured {
+                "远程视觉 provider 已配置，调用时仍校验凭据和网络"
+            } else {
+                "未配置远程视觉 provider；可由 Agnes 会话按需提供视觉理解"
+            },
+        ),
+        ComputerUseObservationCapabilityDto {
+            backend: "manual_confirmation".to_string(),
+            priority: 90,
+            status: "available".to_string(),
+            available: true,
+            requires_model: false,
+            reason: "所有自动定位失败时返回 dry-run 计划并等待人工确认".to_string(),
+        },
+    ];
+    let mut notes = vec![
+        "推荐定位链路：Browser DOM（独立 surface）→ UIA → OCR/template → 本地/远程视觉 → 人工确认。"
+            .to_string(),
+        "execute=false 的 dry-run、截图和坐标映射不依赖 ShowUI；真实输入仍需安全闸门和人工确认。"
+            .to_string(),
+    ];
+    if !showui_available {
+        notes.push(
+            "本机未检测到可用 ShowUI 本地模型，已将视觉 grounding 标记为 skipped，不把它伪报为可用。"
+                .to_string(),
+        );
+    }
+    if !browser_health.connected {
+        notes
+            .push("浏览器扩展/native host 未连接，DOM computer-use 能力保持 skipped。".to_string());
+    }
+    Json(ComputerUseCapabilitiesResponse {
+        status: if showui_available || browser_health.connected || desktop_available {
+            "degraded"
+        } else {
+            "skipped"
+        }
+        .to_string(),
+        generated_at_ms: unix_timestamp_millis(),
+        showui: ComputerUseBackendCapabilityDto {
+            backend: "showui".to_string(),
+            status: showui_status.to_string(),
+            available: showui_available,
+            requires_model: true,
+            reason: if showui_available {
+                "ShowUI 本地服务端口可达".to_string()
+            } else {
+                format!(
+                    "ShowUI 服务不可用（port_reachable={}, service_running={}）",
+                    showui_port_reachable, showui_service.running
+                )
+            },
+        },
+        observations,
+        surfaces: vec![
+            computer_use_surface_capability(
+                "desktop",
+                desktop_available,
+                desktop_status,
+                if desktop_available {
+                    "Windows desktop input adapter is available; UIA/截图仍需运行时目标。"
+                } else {
+                    "当前构建目标不是 Windows，跳过本地桌面输入测试。"
+                },
+                &[
+                    ("click", desktop_available, true),
+                    ("double_click", desktop_available, true),
+                    ("text_input", desktop_available, true),
+                    ("scroll", desktop_available, true),
+                    ("key_combination", desktop_available, true),
+                ],
+            ),
+            computer_use_surface_capability(
+                "browser",
+                browser_health.connected,
+                browser_status,
+                if browser_health.connected {
+                    "Coolzhu browser extension/native host is connected."
+                } else {
+                    "浏览器扩展/native host 未连接，等待用户安装并连接扩展。"
+                },
+                &[
+                    ("click", browser_health.connected, true),
+                    ("text_input", browser_health.connected, true),
+                    ("select", browser_health.connected, true),
+                    ("check", browser_health.connected, true),
+                    ("submit", browser_health.connected, true),
+                    ("scroll", browser_health.connected, true),
+                    ("drag", browser_health.connected, true),
+                    ("slider_drag", browser_health.connected, true),
+                    ("key_combination", browser_health.connected, true),
+                    ("multiple_tabs", browser_health.connected, true),
+                ],
+            ),
+        ],
+        notes,
+    })
+}
+
 async fn api_computer_use_browser_probe() -> Json<browser_bridge::BrowserBridgeProbe> {
     Json(browser_bridge::probe_snapshot())
 }
@@ -49588,11 +50279,14 @@ mod tests {
             router.pipeline,
             vec![
                 "uia".to_string(),
+                "ocr_template".to_string(),
                 "local_vlm".to_string(),
                 "remote_vlm".to_string()
             ]
         );
         assert!(router.uia.enabled);
+        assert!(router.ocr_template.enabled);
+        assert!(router.ocr_template.confidence_floor >= 0.72);
         assert!(router.local_vlm.enabled);
         assert!(router.remote_vlm.enabled);
         assert_eq!(router.timeout_ms, 15_000);
@@ -49642,6 +50336,44 @@ mod tests {
             locate_status_from_attempts(None, &attempts),
             vision::locate::LocateStatus::LowConfidence
         );
+    }
+
+    #[test]
+    fn locate_backend_parser_accepts_model_free_template_aliases() {
+        assert_eq!(
+            super::parse_locate_backend_id("ocr-template"),
+            Some(vision::locate::BackendId::OcrTemplate)
+        );
+        assert_eq!(
+            super::parse_locate_backend_id("template_match"),
+            Some(vision::locate::BackendId::OcrTemplate)
+        );
+    }
+
+    #[test]
+    fn local_vision_preflight_skips_unreachable_localhost_but_does_not_block_remote_url() {
+        assert!(!super::local_vision_endpoint_reachable(
+            "http://127.0.0.1:1/v1"
+        ));
+        assert!(super::local_vision_endpoint_reachable(
+            "https://vision.example.test/v1"
+        ));
+    }
+
+    #[test]
+    fn ui_a_target_text_includes_window_and_process_evidence() {
+        let target = vision::locate::LocateTarget::Uia {
+            process_id: Some(1200),
+            window_name: Some("记事本".to_string()),
+            automation_id: Some("TextEditor".to_string()),
+            class_name: Some("RichEditD2DPT".to_string()),
+            name: Some("文本编辑器".to_string()),
+            control_type: Some("Document".to_string()),
+        };
+        let text = super::locate_target_text(&target);
+        assert!(text.contains("1200"));
+        assert!(text.contains("记事本"));
+        assert!(text.contains("TextEditor"));
     }
 
     #[test]
@@ -62064,7 +62796,7 @@ attach: last_assistant
     fn web_frontend_confirms_chat_room_delete_with_impact_preview() {
         assert!(WEB_INDEX_HTML.contains("chat-room-delete"));
         assert!(WEB_INDEX_HTML.contains("chat-room-rename"));
-        assert!(WEB_INDEX_HTML.contains("message-delete-selected"));
+        assert!(!WEB_INDEX_HTML.contains("message-delete-selected"));
         assert!(WEB_INDEX_HTML.contains("memory-bead-list"));
         assert!(WEB_APP_JS.contains("deleteSelectedChatRoom"));
         assert!(WEB_APP_JS.contains("renameSelectedChatRoom"));
@@ -62082,9 +62814,9 @@ attach: last_assistant
     }
 
     #[test]
-    fn web_frontend_exposes_handoff_roster_drawer_and_manual_transfer() {
-        assert!(WEB_INDEX_HTML.contains("chat-handoff-toggle"));
-        assert!(WEB_INDEX_HTML.contains("chat-handoff-manual"));
+    fn web_frontend_keeps_handoff_state_internal_to_the_slim_chat_sidebar() {
+        assert!(!WEB_INDEX_HTML.contains("chat-handoff-toggle"));
+        assert!(!WEB_INDEX_HTML.contains("chat-handoff-manual"));
         assert!(WEB_INDEX_HTML.contains("data-role=\"chat-roster\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"handoff-drawer\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"handoff-list\""));
@@ -62170,9 +62902,30 @@ attach: last_assistant
     fn web_frontend_chat_context_controls_live_in_compact_left_sidebar() {
         assert!(WEB_INDEX_HTML.contains("class=\"chat-left-rail\""));
         assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"chat-actions\""));
-        assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"channel-models\""));
         assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"conversation-list\""));
         assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"recipient-targets\""));
+        assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"room-permissions\""));
+        assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"workspace-settings\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"chat-permission-save\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"chat-workspace-edit\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"chat-permission-select\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"chat-workspace-path\""));
+        assert!(WEB_APP_JS.contains("async function saveChatRoomPermission"));
+        assert!(WEB_APP_JS.contains("function setChatWorkspacePath"));
+        assert!(WEB_APP_JS.contains("beginWorkspaceEdit('[data-role=\"chat-workspace-path\"]')"));
+        assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"channel-models\" hidden"));
+        for removed_action in [
+            "chat-room-diagnostics",
+            "chat-handoff-toggle",
+            "chat-handoff-manual",
+            "message-load-older",
+            "message-delete-selected",
+        ] {
+            assert!(
+                !WEB_INDEX_HTML.contains(&format!("data-action=\"{removed_action}\"")),
+                "聊天室左栏不应暴露非核心快捷操作 {removed_action}"
+            );
+        }
         assert!(!WEB_INDEX_HTML.contains("data-sidebar-group=\"quick-filters\""));
         assert!(!WEB_INDEX_HTML.contains("class=\"chat-sidebar-group chat-quick-filters\""));
         assert!(!WEB_INDEX_HTML.contains("data-chat-filter="));
@@ -62181,20 +62934,24 @@ attach: last_assistant
         let chat_actions = WEB_INDEX_HTML
             .find("data-sidebar-group=\"chat-actions\"")
             .expect("chat actions group exists");
-        let channel_models = WEB_INDEX_HTML
-            .find("data-sidebar-group=\"channel-models\"")
-            .expect("channel/model group exists");
         let conversation_list = WEB_INDEX_HTML
             .find("data-sidebar-group=\"conversation-list\"")
             .expect("conversation list group exists");
         let recipients = WEB_INDEX_HTML
             .find("data-sidebar-group=\"recipient-targets\"")
             .expect("recipient group exists");
+        let permissions = WEB_INDEX_HTML
+            .find("data-sidebar-group=\"room-permissions\"")
+            .expect("permission group exists");
+        let workspace = WEB_INDEX_HTML
+            .find("data-sidebar-group=\"workspace-settings\"")
+            .expect("workspace group exists");
         assert!(
-            chat_actions < channel_models
-                && channel_models < conversation_list
-                && conversation_list < recipients,
-            "chat sidebar must match the approved session design order"
+            chat_actions < conversation_list
+                && conversation_list < recipients
+                && recipients < permissions
+                && permissions < workspace,
+            "chat sidebar must keep room management, recipients, permission and workspace order"
         );
         assert!(!WEB_STYLES_CSS.contains(".chat-compact-actions {\n  margin-top: auto;"));
         assert!(WEB_STYLES_CSS.contains("--top-region-ratio: 12%"));
@@ -63699,6 +64456,9 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("/beads/prompt"));
         assert!(WEB_APP_JS.contains("/context-preview"));
         assert!(WEB_APP_JS.contains("function memoryWindowRefreshPreviews"));
+        assert!(WEB_APP_JS.contains("context_snapshot_id"));
+        assert!(WEB_APP_JS.contains("memory_revision"));
+        assert!(WEB_APP_JS.contains("loaded_memory_ids"));
         assert!(WEB_APP_JS.contains("memory-bead-pin-toggle"));
         assert!(WEB_APP_JS.contains("memory-bead-edit"));
         assert!(!WEB_APP_JS.contains("memoryWindowBeads = memoryWindowBeads.map"));
@@ -63740,10 +64500,11 @@ attach: last_assistant
     }
 
     #[test]
-    fn web_frontend_has_functional_selfcheck_and_room_diagnostics_controls() {
+    fn web_frontend_has_functional_selfcheck_and_room_permission_controls() {
         assert!(WEB_INDEX_HTML.contains("data-action=\"diagnostics-functional\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"functional-selfcheck-output\""));
-        assert!(WEB_INDEX_HTML.contains("data-action=\"chat-room-diagnostics\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"chat-permission-save\""));
+        assert!(!WEB_INDEX_HTML.contains("data-action=\"chat-room-diagnostics\""));
         assert!(WEB_APP_JS.contains("data-diagnostics-field=\"real_llm_enabled\""));
         assert!(WEB_APP_JS.contains("data-diagnostics-field=\"computer_use_enabled\""));
         assert!(WEB_APP_JS.contains("full-access（双重确认 + 审批）"));
@@ -64494,7 +65255,7 @@ attach: last_assistant
     }
 
     #[test]
-    fn web_frontend_hides_completed_reasoning_cards_but_keeps_tool_results() {
+    fn web_frontend_keeps_completed_reasoning_cards_and_tool_results() {
         assert!(WEB_MAIN_RS.contains("let reasoning_id = format!(\"{assistant_id}-thinking\");"));
         assert!(WEB_MAIN_RS.contains("let mut assistant_started = false;"));
         assert!(WEB_MAIN_RS.contains("if !assistant_started"));
@@ -64504,7 +65265,10 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("function isGoalPhaseMessage"));
         assert!(WEB_APP_JS.contains("message.kind !== \"reasoning\""));
         assert!(WEB_APP_JS.contains("message.kind !== \"tool-call\""));
-        assert!(WEB_APP_JS.contains("function hideReasoningForAssistant"));
+        assert!(!WEB_APP_JS.contains("function hideReasoningForAssistant"));
+        assert!(!WEB_APP_JS.contains("hideReasoningForAssistant(data.id)"));
+        assert!(WEB_APP_JS.contains("if (data?.kind === \"reasoning\")"));
+        assert!(WEB_APP_JS.contains("upsertMessage(data, { streaming: false });"));
     }
 
     #[test]
@@ -65222,6 +65986,9 @@ attach: last_assistant
     fn web_frontend_refreshes_workspace_bound_state_after_workspace_switch() {
         assert!(WEB_APP_JS.contains("await refreshWorkspaceBoundState(result.workspace)"));
         assert!(WEB_APP_JS.contains("function resetWorkspaceBoundUiState"));
+        assert!(WEB_APP_JS.contains("taskFullAccessStatus = { full_access: false, permission_profile: \"workspace-write\" }"));
+        assert!(WEB_APP_JS.contains("setChatWorkspacePath(workspace)"));
+        assert!(WEB_APP_JS.contains("taskRenderFullAccessStatus(taskFullAccessStatus)"));
         assert!(WEB_APP_JS.contains("renderAgentOptions([], [])"));
         assert!(WEB_APP_JS
             .contains("messagePaging = { roomId: null, hasMore: false, nextBefore: null }"));
@@ -65816,6 +66583,36 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains(&tts_chunk));
         assert!(WEB_APP_JS.contains(&tts_playback_started));
         assert!(WEB_APP_JS.contains(&tts_playback_ended));
+    }
+
+    #[test]
+    fn realtime_events_include_canonical_schema_without_breaking_legacy_kind() {
+        let partial = super::realtime_event_envelope(
+            "partial_transcript",
+            serde_json::json!({"text": "你好"}),
+        );
+        assert_eq!(partial["schema_version"], "coolzhu.realtime.v1");
+        assert_eq!(partial["event_type"], "input_transcript_delta");
+        assert_eq!(partial["text"], "你好");
+
+        let thinking = super::realtime_event_envelope(
+            "model_stream_delta",
+            serde_json::json!({"delta_kind": "thinking", "delta": "inspect"}),
+        );
+        assert_eq!(thinking["event_type"], "reasoning_delta");
+        assert_eq!(thinking["delta"], "inspect");
+    }
+
+    #[test]
+    fn computer_use_capability_probe_is_exposed_and_honest_about_showui_skip() {
+        assert!(WEB_MAIN_RS.contains("/api/computer-use/capabilities"));
+        assert!(WEB_MAIN_RS.contains("async fn api_computer_use_capabilities"));
+        assert!(WEB_MAIN_RS.contains("requires_model: true"));
+        assert!(WEB_MAIN_RS.contains("标记为 skipped"));
+        assert!(WEB_MAIN_RS.contains("computer_use_surface_capability"));
+        assert!(WEB_MAIN_RS.contains("browser_dom"));
+        assert!(WEB_MAIN_RS.contains("ocr_template"));
+        assert!(WEB_MAIN_RS.contains("manual_confirmation"));
     }
 
     #[test]
@@ -67769,6 +68566,10 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            context_snapshot_id: "ctx-test".to_string(),
+            memory_revision: "mem-test".to_string(),
+            memory_bead_ids: Vec::new(),
+            history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
                 system: 100,
@@ -67848,6 +68649,10 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            context_snapshot_id: "ctx-test".to_string(),
+            memory_revision: "mem-test".to_string(),
+            memory_bead_ids: Vec::new(),
+            history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
                 system: 100,
@@ -67889,6 +68694,10 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            context_snapshot_id: "ctx-test".to_string(),
+            memory_revision: "mem-test".to_string(),
+            memory_bead_ids: Vec::new(),
+            history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
                 system: 100,
@@ -67934,6 +68743,10 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            context_snapshot_id: "ctx-test".to_string(),
+            memory_revision: "mem-test".to_string(),
+            memory_bead_ids: Vec::new(),
+            history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
                 system: 1_000,
