@@ -59,6 +59,7 @@ const WUXIA_ICON_ALIASES = new Map([
   ["folder", "folder"],
   ["file", "file"],
   ["collapse", "chevron"],
+  ["route-plan", "route-plan"],
 ]);
 // 仅保留源码资源目录中真实存在、且当前界面仍会使用的旧 PNG。
 // 未登记的动态名称统一回退到已打包 SVG，避免拼出不存在的 /assets/icons/*.png。
@@ -241,6 +242,8 @@ document.addEventListener("DOMContentLoaded", () => {
   actionButtons.get("diagnostics-functional")?.addEventListener("click", runFunctionalDiagnostics);
   actionButtons.get("session-new")?.addEventListener("click", createSession);
   actionButtons.get("session-save")?.addEventListener("click", saveSelectedSession);
+  actionButtons.get("session-resume")?.addEventListener("click", () => resumeSelectedSession());
+  actionButtons.get("session-fork")?.addEventListener("click", () => forkSelectedSession());
   actionButtons.get("session-reset")?.addEventListener("click", resetSelectedSession);
   actionButtons.get("session-delete")?.addEventListener("click", deleteSelectedSession);
   actionButtons.get("session-avatar-toggle")?.addEventListener("click", toggleAvatarPicker);
@@ -375,6 +378,18 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   document.querySelector('[data-action="memory-history-refresh"]')?.addEventListener("click", (event) => {
     memoryWindowRefreshHistory(event.currentTarget);
+  });
+  document.querySelector('[data-role="memory-history-list"]')?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-history-action]");
+    if (!button) {
+      return;
+    }
+    const cursor = button.dataset.historyCursor || "";
+    if (button.dataset.historyAction === "fork") {
+      void forkSelectedSession(cursor);
+    } else if (button.dataset.historyAction === "rollback") {
+      void rollbackSelectedSession(cursor);
+    }
   });
   document.querySelector('[data-role="memory-job-list"]')?.addEventListener("click", (event) => {
     const button = event.target.closest('[data-action="memory-job-retry"]');
@@ -7317,6 +7332,29 @@ function memoryWindowRenderHistory() {
       .map((item) => `${item.kind}: ${String(item.content || "").replace(/\s+/g, " ").slice(0, 120)}`)
       .join(" | ");
     row.append(preview);
+    if (turn.status !== "compacted") {
+      const actions = document.createElement("span");
+      actions.className = "memory-window-history-actions";
+      const fork = document.createElement("button");
+      fork.type = "button";
+      fork.className = "mini-button";
+      fork.dataset.historyAction = "fork";
+      fork.dataset.historyCursor = turn.id;
+      fork.textContent = "分叉";
+      fork.title = "从该 turn 创建独立会话分支";
+      actions.append(fork);
+      if (turn.status === "completed") {
+        const rollback = document.createElement("button");
+        rollback.type = "button";
+        rollback.className = "mini-button danger";
+        rollback.dataset.historyAction = "rollback";
+        rollback.dataset.historyCursor = turn.id;
+        rollback.textContent = "回滚";
+        rollback.title = "移除该 turn 之后的消息与自动压缩记忆";
+        actions.append(rollback);
+      }
+      row.append(actions);
+    }
     list.append(row);
   });
 }
@@ -10013,6 +10051,101 @@ async function saveSelectedSession() {
   } finally {
     setWorkbenchMotionState("settings", WORKBENCH_MOTION_STATES.settings, false);
     setBusy(button, false);
+  }
+}
+
+async function resumeSelectedSession() {
+  const sessionId = selectedSessionId();
+  if (!sessionId) {
+    return;
+  }
+  const button = actionButtons.get("session-resume");
+  setBusy(button, true, "继续中");
+  try {
+    const result = await requestJson(`/api/sessions/${encodeURIComponent(sessionId)}/resume`, { method: "POST" });
+    activeSessionId = result.session.id;
+    renderSessionList(sessionRegistry.sessions, activeSessionId);
+    setSessionForm(result.session);
+    await loadSessions();
+    await loadAgents();
+    await memoryWindowRefresh();
+    syncActiveSessionSummary(result.session);
+    addMessage({
+      author: "会话管理",
+      text: `${result.session.display_name} 已恢复，载入 ${result.history?.turns?.length || 0} 个历史 turn。`,
+      kind: "tool-summary",
+      icon: "refresh",
+    });
+  } catch (error) {
+    addMessage({ author: "会话管理", text: `恢复失败：${error.message}`, kind: "thought", icon: "error-log" });
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function forkSelectedSession(cursor = null) {
+  const sessionId = selectedSessionId();
+  if (!sessionId) {
+    return;
+  }
+  const session = sessionRegistry.sessions?.find((candidate) => candidate.id === sessionId);
+  const label = session?.display_name || session?.name || sessionId;
+  const suffix = cursor ? "（按选中的历史 turn 分叉）" : "（复制完整历史）";
+  const name = window.prompt(`请输入 ${label} 的分叉会话名称${suffix}`, `${session?.name || label} 分叉`);
+  if (name === null) {
+    return;
+  }
+  const button = actionButtons.get("session-fork");
+  setBusy(button, true, "分叉中");
+  try {
+    const result = await requestJson(`/api/sessions/${encodeURIComponent(sessionId)}/fork`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, before: cursor || null }),
+    });
+    await loadSessions();
+    await loadAgents();
+    await memoryWindowRefresh();
+    addMessage({
+      author: "会话管理",
+      text: `已从 ${label} 分叉为 ${result.session.display_name}：复制 ${result.copied_messages} 条消息、${result.copied_memory_beads} 条记忆。`,
+      kind: "tool-summary",
+      icon: "route-plan",
+    });
+  } catch (error) {
+    addMessage({ author: "会话管理", text: `分叉失败：${error.message}`, kind: "thought", icon: "error-log" });
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function rollbackSelectedSession(cursor) {
+  const sessionId = selectedSessionId();
+  if (!sessionId || !cursor) {
+    return;
+  }
+  const session = sessionRegistry.sessions?.find((candidate) => candidate.id === sessionId);
+  const label = session?.display_name || session?.name || sessionId;
+  if (!window.confirm(`确认将 ${label} 回滚到该历史 turn？后续消息及其自动压缩记忆会被移除。`)) {
+    return;
+  }
+  try {
+    const result = await requestJson(`/api/sessions/${encodeURIComponent(sessionId)}/rollback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ before: cursor, reason: "用户从 Thread history 发起回滚" }),
+    });
+    await loadSessions();
+    await loadAgents();
+    await memoryWindowRefresh();
+    addMessage({
+      author: "会话管理",
+      text: `${label} 已回滚：保留 ${result.kept_messages} 条消息，移除 ${result.removed_messages} 条消息和 ${result.removed_memory_beads} 条记忆。`,
+      kind: "tool-summary",
+      icon: "refresh",
+    });
+  } catch (error) {
+    addMessage({ author: "会话管理", text: `回滚失败：${error.message}`, kind: "thought", icon: "error-log" });
   }
 }
 

@@ -6174,6 +6174,22 @@ body.ui-3d .avatar-picker.is-portal {
   background: rgba(3, 12, 18, 0.34);
 }
 
+.memory-workbench-window .memory-window-history-row > small {
+  flex: 1 1 auto;
+}
+
+.memory-workbench-window .memory-window-history-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+}
+
+.memory-workbench-window .memory-window-history-actions .mini-button {
+  min-height: 22px;
+  padding: 0 6px;
+  font-size: 10px;
+}
+
 .memory-workbench-window .memory-window-history-row.is-compacted {
   border-color: rgba(255, 197, 38, 0.46);
 }

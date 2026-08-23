@@ -635,6 +635,15 @@ fn app() -> Router {
             "/api/sessions/{session_id}/activate",
             post(api_activate_session),
         )
+        .route(
+            "/api/sessions/{session_id}/resume",
+            post(api_resume_session),
+        )
+        .route("/api/sessions/{session_id}/fork", post(api_fork_session))
+        .route(
+            "/api/sessions/{session_id}/rollback",
+            post(api_rollback_session),
+        )
         .route("/api/sessions/{session_id}/reset", post(api_reset_session))
         .route(
             "/api/sessions/{session_id}/messages",
@@ -10314,6 +10323,39 @@ async fn api_activate_session(
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
     let session = store.activate_session(&session_id)?;
     Ok(Json(SessionMutationResponse { session }))
+}
+
+/// P1-2：恢复一个已持久化会话，统一返回最近一页 thread/turn/item 历史，
+/// 让网页、CLI 和重启后的宿主使用同一份可重放快照。
+async fn api_resume_session(
+    AxumPath(session_id): AxumPath<String>,
+) -> ApiResult<Json<SessionResumeResponse>> {
+    let mut store = session_store()
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+    Ok(Json(store.resume_session(&session_id)?))
+}
+
+/// P1-2：从指定历史游标创建一个独立会话分支。
+async fn api_fork_session(
+    AxumPath(session_id): AxumPath<String>,
+    Json(payload): Json<SessionForkRequest>,
+) -> ApiResult<Json<SessionForkResponse>> {
+    let mut store = session_store()
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+    Ok(Json(store.fork_session(&session_id, payload)?))
+}
+
+/// P1-2：将会话回滚到一个已完成 turn 或 message item，后续内容不再进入上下文。
+async fn api_rollback_session(
+    AxumPath(session_id): AxumPath<String>,
+    Json(payload): Json<SessionRollbackRequest>,
+) -> ApiResult<Json<SessionRollbackResponse>> {
+    let mut store = session_store()
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+    Ok(Json(store.rollback_session(&session_id, payload)?))
 }
 
 async fn api_config_vision_agent() -> ApiResult<Json<VisionAgentConfigResponse>> {
@@ -35750,6 +35792,184 @@ impl SessionStore {
         Ok(self.state.sessions[position].summary(true))
     }
 
+    fn resume_session(&mut self, session_id: &str) -> ApiResult<SessionResumeResponse> {
+        let Some(position) = self
+            .state
+            .sessions
+            .iter()
+            .position(|session| session.id == session_id)
+        else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存"));
+        };
+        let already_active = self.state.active_session_id.as_deref() == Some(session_id);
+        self.state.active_session_id = Some(session_id.to_string());
+        let session = &self.state.sessions[position];
+        let history = session_history_response(
+            session,
+            true,
+            SessionHistoryQuery {
+                limit: Some(20),
+                before: None,
+            },
+        );
+        let response = SessionResumeResponse {
+            session: session.summary(true),
+            resumed: !already_active,
+            history,
+        };
+        if !already_active {
+            self.save()?;
+        }
+        Ok(response)
+    }
+
+    fn fork_session(
+        &mut self,
+        session_id: &str,
+        payload: SessionForkRequest,
+    ) -> ApiResult<SessionForkResponse> {
+        if self.state.sessions.len() >= MAX_USER_SESSIONS {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "最多只能保留 10 个自定义会话，请先删除不再使用的会话",
+            ));
+        }
+        let source = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "会话不存"))?;
+        let cursor = payload
+            .before
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let keep_messages = match cursor {
+            Some(cursor) => session_history_message_end(&source, cursor).ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "分叉游标不存在，请使用 history 返回的 turn 或 item id",
+                )
+            })?,
+            None => source.messages.len(),
+        };
+        let boundary = source
+            .messages
+            .get(keep_messages.saturating_sub(1))
+            .map(|message| message.created_at);
+        let now = unix_timestamp_millis();
+        let base_id = format!("session-fork-{now}");
+        let mut fork_id = base_id.clone();
+        let mut suffix = 2_u32;
+        while self
+            .state
+            .sessions
+            .iter()
+            .any(|session| session.id == fork_id)
+        {
+            fork_id = format!("{base_id}-{suffix}");
+            suffix = suffix.saturating_add(1);
+        }
+        let default_name = format!("{} 分叉", source.name);
+        let name = payload
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(default_name.as_str());
+        let mut fork = source.clone();
+        fork.id = fork_id.clone();
+        fork.name = normalize_session_name(Some(name), self.state.sessions.len() + 1);
+        fork.created_at = now;
+        fork.updated_at = now;
+        fork.messages.truncate(keep_messages);
+        if let Some(boundary) = boundary {
+            fork.memory_beads.retain(|bead| {
+                bead.pinned || bead.created_at <= boundary || bead.source == "session-config"
+            });
+        }
+        fork.prune_memory_beads();
+        let copied_memory_beads = fork.memory_beads.len();
+        let summary = fork.summary(true);
+        self.state.active_session_id = Some(fork.id.clone());
+        self.state.sessions.push(fork);
+        self.save()?;
+        Ok(SessionForkResponse {
+            source_session_id: source.id,
+            source_cursor: cursor.map(str::to_string),
+            session: summary,
+            copied_messages: keep_messages,
+            copied_memory_beads,
+        })
+    }
+
+    fn rollback_session(
+        &mut self,
+        session_id: &str,
+        payload: SessionRollbackRequest,
+    ) -> ApiResult<SessionRollbackResponse> {
+        let cursor = payload.before.trim();
+        if cursor.is_empty() {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "回滚必须提供 history 返回的 turn 或 item id",
+            ));
+        }
+        let source = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "会话不存"))?;
+        let keep_messages = session_history_message_end(&source, cursor).ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "回滚游标不存在，请使用 history 返回的 turn 或 item id",
+            )
+        })?;
+        let boundary = source
+            .messages
+            .get(keep_messages.saturating_sub(1))
+            .map(|message| message.created_at)
+            .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "回滚目标不能早于首条消息"))?;
+        let active = self.is_active(session_id);
+        let (summary, old_message_count, removed_memory_beads) = {
+            let Some(session) = self
+                .state
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == session_id)
+            else {
+                return Err(api_error(StatusCode::NOT_FOUND, "会话不存"));
+            };
+            let old_message_count = session.messages.len();
+            let old_bead_count = session.memory_beads.len();
+            session.messages.truncate(keep_messages);
+            session.memory_beads.retain(|bead| {
+                bead.pinned || bead.created_at <= boundary || bead.source == "session-config"
+            });
+            session.context_reset_at = boundary;
+            session.updated_at = unix_timestamp_millis();
+            let removed_memory_beads = old_bead_count.saturating_sub(session.memory_beads.len());
+            (
+                session.summary(active),
+                old_message_count,
+                removed_memory_beads,
+            )
+        };
+        self.save()?;
+        Ok(SessionRollbackResponse {
+            session: summary,
+            target: cursor.to_string(),
+            kept_messages: keep_messages,
+            removed_messages: old_message_count.saturating_sub(keep_messages),
+            removed_memory_beads,
+            reason: payload.reason.filter(|reason| !reason.trim().is_empty()),
+        })
+    }
+
     fn session_messages(
         &self,
         session_id: &str,
@@ -44076,6 +44296,46 @@ struct SessionMutationResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct SessionResumeResponse {
+    session: SessionSummaryDto,
+    resumed: bool,
+    history: SessionHistoryResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionForkRequest {
+    /// 可选：history 返回的 turn id 或 item id；省略时复制完整会话。
+    before: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionForkResponse {
+    source_session_id: String,
+    source_cursor: Option<String>,
+    session: SessionSummaryDto,
+    copied_messages: usize,
+    copied_memory_beads: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionRollbackRequest {
+    /// history 返回的 turn id 或 item id；回滚保留该目标及其之前的消息。
+    before: String,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionRollbackResponse {
+    session: SessionSummaryDto,
+    target: String,
+    kept_messages: usize,
+    removed_messages: usize,
+    removed_memory_beads: usize,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct SessionMessagesResponse {
     session: SessionSummaryDto,
     messages: Vec<PersistedChatMessage>,
@@ -44123,6 +44383,41 @@ struct SessionHistoryResponse {
 struct SessionHistoryTurnBundle {
     turn: SessionHistoryTurnDto,
     items: Vec<SessionHistoryItemDto>,
+}
+
+/// 将 history API 的游标解析为要保留的消息数量。
+/// 压缩条目不是原始消息，不能作为 rollback/fork 的截断边界，避免把摘要
+/// 当成普通对话消息后产生不可重放的上下文。
+fn session_history_message_end(session: &PersistedSession, cursor: &str) -> Option<usize> {
+    let cursor = cursor.trim();
+    if cursor.is_empty() {
+        return None;
+    }
+    if let Some(index) = session
+        .messages
+        .iter()
+        .position(|message| message.id == cursor)
+    {
+        return Some(index + 1);
+    }
+    let mut ranges = Vec::new();
+    let mut range_start = None;
+    for (index, message) in session.messages.iter().enumerate() {
+        if message.role.eq_ignore_ascii_case("user") {
+            if let Some(start) = range_start.replace(index) {
+                ranges.push((start, index));
+            }
+        } else if range_start.is_none() {
+            range_start = Some(index);
+        }
+    }
+    if let Some(start) = range_start {
+        ranges.push((start, session.messages.len()));
+    }
+    ranges.into_iter().find_map(|(start, end)| {
+        let first = session.messages.get(start)?;
+        (history_turn_id(&session.id, &first.id) == cursor).then_some(end)
+    })
 }
 
 fn history_message_item_kind(message: &PersistedChatMessage) -> String {
@@ -60605,6 +60900,91 @@ attach: last_assistant
     }
 
     #[test]
+    fn session_resume_fork_and_rollback_round_trip_history_cursor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut source = super::seed_session();
+        source.id = "lifecycle-source".to_string();
+        source.name = "生命周期源会话".to_string();
+        source.messages = vec![
+            persisted_role_message("u1", "user", "第一轮", 10),
+            persisted_role_message("a1", "assistant", "第一轮完成", 20),
+            persisted_role_message("u2", "user", "第二轮", 30),
+            persisted_role_message("a2", "assistant", "第二轮完成", 40),
+        ];
+        source.memory_beads = vec![super::MemoryBeadDto {
+            id: "compact-after-second".to_string(),
+            kind: "compaction".to_string(),
+            layer: "L2".to_string(),
+            source: "context:auto-compact".to_string(),
+            summary: "第二轮之后的摘要".to_string(),
+            created_at: 50,
+            ..super::MemoryBeadDto::default()
+        }];
+        let mut store = super::SessionStore {
+            path: tmp.path().join("lifecycle.sqlite3"),
+            legacy_json_path: tmp.path().join("lifecycle.json"),
+            capacity: super::SessionStoreCapacity::default(),
+            state: super::PersistedSessionState {
+                sessions: vec![source],
+                active_session_id: Some("lifecycle-source".to_string()),
+                active_vision_session_id: None,
+                chat_rooms: Vec::new(),
+                active_chat_room_id: None,
+            },
+        };
+
+        let resumed = store.resume_session("lifecycle-source").expect("resume");
+        assert!(!resumed.resumed, "已活动会话恢复应是幂等操作");
+        assert_eq!(resumed.history.turns.len(), 3);
+
+        let first_turn = super::history_turn_id("lifecycle-source", "u1");
+        let fork = store
+            .fork_session(
+                "lifecycle-source",
+                super::SessionForkRequest {
+                    before: Some(first_turn.clone()),
+                    name: Some("第一轮分支".to_string()),
+                },
+            )
+            .expect("fork");
+        assert_eq!(fork.copied_messages, 2);
+        assert_eq!(fork.copied_memory_beads, 0);
+        let forked = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == fork.session.id)
+            .expect("forked session");
+        assert_eq!(forked.messages.len(), 2);
+        assert_eq!(
+            store.state.active_session_id.as_deref(),
+            Some(fork.session.id.as_str())
+        );
+
+        let rolled = store
+            .rollback_session(
+                "lifecycle-source",
+                super::SessionRollbackRequest {
+                    before: first_turn,
+                    reason: Some("测试回滚".to_string()),
+                },
+            )
+            .expect("rollback");
+        assert_eq!(rolled.kept_messages, 2);
+        assert_eq!(rolled.removed_messages, 2);
+        assert_eq!(rolled.removed_memory_beads, 1);
+        let source_after = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == "lifecycle-source")
+            .expect("source after rollback");
+        assert_eq!(source_after.messages.len(), 2);
+        assert_eq!(source_after.context_reset_at, 20);
+        assert!(source_after.memory_beads.is_empty());
+    }
+
+    #[test]
     fn local_active_mode_maps_running_services() {
         assert_eq!(super::local_active_mode(true, false), "chat");
         assert_eq!(super::local_active_mode(false, true), "vision");
@@ -65784,6 +66164,8 @@ attach: last_assistant
         assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-mode\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-jobs\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-history\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"session-resume\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"session-fork\""));
         assert!(WEB_INDEX_HTML.contains("data-memory-job-type=\"extraction\""));
         assert!(WEB_INDEX_HTML.contains("data-memory-job-type=\"consolidation\""));
         assert!(WEB_APP_JS.contains("/memory-mode"));
@@ -65792,6 +66174,13 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("memoryWindowStartJob"));
         assert!(WEB_APP_JS.contains("memoryWindowRenderJobs"));
         assert!(WEB_APP_JS.contains("memoryWindowRenderHistory"));
+        assert!(WEB_APP_JS.contains("/resume"));
+        assert!(WEB_APP_JS.contains("/fork"));
+        assert!(WEB_APP_JS.contains("/rollback"));
+        assert!(WEB_APP_JS.contains("function resumeSelectedSession"));
+        assert!(WEB_APP_JS.contains("function forkSelectedSession"));
+        assert!(WEB_APP_JS.contains("function rollbackSelectedSession"));
+        assert!(WEB_APP_JS.contains("data-history-action"));
         assert!(WEB_APP_JS.contains("memoryWindowUpdateMode"));
         assert!(WEB_APP_JS.contains("memory_mode"));
         assert!(WEB_APP_JS.contains("loaded_memory_ids"));
