@@ -153,6 +153,7 @@ let memoryWindowSelectedBeadId = null;
 let memoryWindowSummary = null;
 let memoryWindowPromptPreview = null;
 let memoryWindowContextPreview = null;
+let memoryWindowJobs = [];
 let memoryWindowPreviewTimer = null;
 let memoryWindowMode = "enabled";
 const DEFAULT_BROWSER_SEARCH_ENGINE_URL = "https://www.baidu.com/s?wd={query}";
@@ -365,6 +366,18 @@ document.addEventListener("DOMContentLoaded", () => {
   document.querySelector('[data-role="memory-window-filters"]')?.addEventListener("input", memoryWindowApplyFilters);
   document.querySelector('[data-role="memory-window-filters"]')?.addEventListener("change", memoryWindowApplyFilters);
   document.querySelector('[data-role="memory-window-mode"]')?.addEventListener("change", memoryWindowUpdateMode);
+  document.querySelectorAll('[data-action="memory-job-start"]').forEach((node) => {
+    node.addEventListener("click", (event) => memoryWindowStartJob(event.currentTarget));
+  });
+  document.querySelector('[data-action="memory-jobs-refresh"]')?.addEventListener("click", (event) => {
+    memoryWindowRefreshJobs(event.currentTarget);
+  });
+  document.querySelector('[data-role="memory-job-list"]')?.addEventListener("click", (event) => {
+    const button = event.target.closest('[data-action="memory-job-retry"]');
+    if (button) {
+      memoryWindowStartJob(button, true);
+    }
+  });
   actionButtons.get("memory-window-refresh")?.addEventListener("click", async () => {
     const button = actionButtons.get("memory-window-refresh");
     setBusy(button, true, "刷新中");
@@ -7148,7 +7161,133 @@ async function loadSessionBeads(sessionId = memoryWindowSessionId()) {
 async function memoryWindowRefresh() {
   const beads = await loadSessionBeads();
   await memoryWindowRefreshPreviews();
+  await memoryWindowRefreshJobs();
   return beads;
+}
+
+function memoryJobTypeLabel(type) {
+  return {
+    extraction: "提取",
+    edges: "关联图",
+    consolidation: "巩固",
+  }[String(type || "")] || String(type || "作业");
+}
+
+function memoryJobStatusLabel(status) {
+  return {
+    queued: "排队中",
+    running: "执行中",
+    succeeded: "已完成",
+    failed: "失败",
+  }[String(status || "")] || String(status || "未知");
+}
+
+function memoryWindowRenderJobs() {
+  const list = document.querySelector('[data-role="memory-job-list"]');
+  const status = document.querySelector('[data-role="memory-job-status"]');
+  if (!list) {
+    return;
+  }
+  list.replaceChildren();
+  const active = memoryWindowJobs.filter((job) => ["queued", "running"].includes(job.status));
+  if (status) {
+    status.textContent = active.length
+      ? `${active.length} 个执行中`
+      : (memoryWindowJobs.length ? `最近：${memoryJobStatusLabel(memoryWindowJobs[0].status)}` : "暂无作业");
+  }
+  if (!memoryWindowJobs.length) {
+    const empty = document.createElement("span");
+    empty.className = "memory-window-job-empty";
+    empty.textContent = "暂无生命周期作业。";
+    list.append(empty);
+    return;
+  }
+  memoryWindowJobs.slice(0, 6).forEach((job) => {
+    const row = document.createElement("div");
+    row.className = `memory-window-job-row is-${job.status || "unknown"}`;
+    const meta = document.createElement("span");
+    meta.className = "memory-window-job-meta";
+    meta.textContent = `${memoryJobTypeLabel(job.job_type)} · ${memoryJobStatusLabel(job.status)} · ${Number(job.progress || 0)}%`;
+    row.append(meta);
+    if (job.result_count !== null && job.result_count !== undefined) {
+      const result = document.createElement("small");
+      result.textContent = `结果 ${job.result_count}`;
+      row.append(result);
+    }
+    if (job.error) {
+      const error = document.createElement("small");
+      error.className = "memory-window-job-error";
+      error.title = job.error;
+      error.textContent = job.error;
+      row.append(error);
+    }
+    if (job.status === "failed") {
+      const retry = document.createElement("button");
+      retry.className = "mini-button";
+      retry.dataset.action = "memory-job-retry";
+      retry.dataset.memoryJobType = job.job_type || "";
+      retry.type = "button";
+      retry.textContent = "重试";
+      row.append(retry);
+    }
+    list.append(row);
+  });
+}
+
+async function memoryWindowRefreshJobs(button = null) {
+  const endpoint = memoryWindowSessionEndpoint("/memory/jobs");
+  if (!endpoint) {
+    memoryWindowJobs = [];
+    memoryWindowRenderJobs();
+    return [];
+  }
+  if (button) {
+    setBusy(button, true, "刷新中");
+  }
+  try {
+    const response = await requestJson(endpoint);
+    memoryWindowJobs = Array.isArray(response.jobs) ? response.jobs : [];
+    memoryWindowRenderJobs();
+    if (memoryWindowJobs.some((job) => ["queued", "running"].includes(job.status))) {
+      window.setTimeout(() => memoryWindowRefreshJobs(), 900);
+    }
+    return memoryWindowJobs;
+  } catch (error) {
+    memoryWindowJobs = [];
+    memoryWindowRenderJobs();
+    addMessage({ author: "记忆窗口", text: `作业状态加载失败：${error.message}`, kind: "thought", icon: "error-log" });
+    return [];
+  } finally {
+    if (button) {
+      setBusy(button, false);
+    }
+  }
+}
+
+async function memoryWindowStartJob(button, retry = false) {
+  const endpoint = memoryWindowSessionEndpoint("/memory/jobs");
+  const jobType = button?.dataset?.memoryJobType || "";
+  if (!endpoint || !jobType) {
+    return;
+  }
+  setBusy(button, true, retry ? "重试中" : "排队中");
+  try {
+    const response = await requestJson(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_type: jobType, retry }),
+    });
+    const job = response.job;
+    if (job) {
+      memoryWindowJobs = [job, ...memoryWindowJobs.filter((entry) => entry.id !== job.id)];
+      memoryWindowRenderJobs();
+    }
+    await memoryWindowRefreshJobs();
+  } catch (error) {
+    addMessage({ author: "记忆窗口", text: `记忆${memoryJobTypeLabel(jobType)}作业启动失败：${error.message}`, kind: "thought", icon: "error-log" });
+  } finally {
+    setBusy(button, false);
+  }
 }
 
 function memoryWindowSetBeads(beads = [], summary = null) {

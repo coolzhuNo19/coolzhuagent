@@ -5944,7 +5944,9 @@ body.ui-3d .avatar-picker.is-portal {
 
 .memory-workbench-window .memory-window-panel {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  /* 筛选、摘要、生命周期作业、内容区分别占一行；此前只有三行声明，
+     导致新增的作业区被隐式压缩到仅剩一行文字高度。 */
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   gap: 10px;
   min-width: 0;
   min-height: 0;
@@ -6016,6 +6018,103 @@ body.ui-3d .avatar-picker.is-portal {
   line-height: 1;
   text-overflow: ellipsis;
   text-shadow: 2px 2px 0 #000;
+}
+
+.memory-workbench-window .memory-window-jobs {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 197, 38, 0.32);
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.memory-workbench-window .memory-window-jobs-head,
+.memory-workbench-window .memory-window-job-actions,
+.memory-workbench-window .memory-window-job-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.memory-workbench-window .memory-window-jobs-head {
+  justify-content: space-between;
+}
+
+.memory-workbench-window .memory-window-jobs-head > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.memory-workbench-window .memory-window-jobs-head strong {
+  color: var(--gold);
+  font-size: 13px;
+}
+
+.memory-workbench-window .memory-window-jobs-head span,
+.memory-workbench-window .memory-window-job-status,
+.memory-workbench-window .memory-window-job-empty,
+.memory-workbench-window .memory-window-job-row small {
+  min-width: 0;
+  overflow: hidden;
+  color: #c6d7df;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.memory-workbench-window .memory-window-job-status {
+  color: var(--gold);
+  font-weight: 1000;
+}
+
+.memory-workbench-window .memory-window-job-actions {
+  flex-wrap: wrap;
+}
+
+.memory-workbench-window .memory-window-job-actions .mini-button {
+  min-height: 26px;
+  padding: 3px 9px;
+}
+
+.memory-workbench-window .memory-window-job-list {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  max-height: 78px;
+  overflow: auto;
+}
+
+.memory-workbench-window .memory-window-job-row {
+  padding: 4px 6px;
+  border: 1px solid rgba(255, 197, 38, 0.18);
+  background: rgba(3, 12, 18, 0.36);
+}
+
+.memory-workbench-window .memory-window-job-row.is-running,
+.memory-workbench-window .memory-window-job-row.is-queued {
+  border-color: rgba(111, 214, 255, 0.44);
+}
+
+.memory-workbench-window .memory-window-job-row.is-failed {
+  border-color: rgba(255, 108, 108, 0.46);
+}
+
+.memory-workbench-window .memory-window-job-meta {
+  min-width: 0;
+  overflow: hidden;
+  color: #f6f7ef;
+  font-size: 12px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.memory-workbench-window .memory-window-job-error {
+  flex: 1 1 auto;
+  color: #ffb4a8;
 }
 
 .memory-workbench-window .memory-window-filters label {

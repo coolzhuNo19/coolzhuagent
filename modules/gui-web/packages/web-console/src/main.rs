@@ -151,6 +151,7 @@ const COMPUTER_USE_PERMISSION_GATE: &str =
 static VOICE_MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 static PET_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static REALTIME_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static MEMORY_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static SHOWUI_SERVICE_ENABLED: AtomicBool = AtomicBool::new(true);
 const AUDIO_HEALTH_CACHE_TTL_MS: u64 = 3_000;
 const DETECTION_HEALTH_CACHE_TTL_MS: u64 = 3_000;
@@ -662,6 +663,14 @@ fn app() -> Router {
         .route(
             "/api/sessions/{session_id}/memory/consolidate",
             post(api_session_consolidate_memory),
+        )
+        .route(
+            "/api/sessions/{session_id}/memory/jobs",
+            get(api_session_memory_jobs).post(api_session_start_memory_job),
+        )
+        .route(
+            "/api/sessions/{session_id}/memory/jobs/{job_id}",
+            get(api_session_memory_job),
         )
         .route(
             "/api/sessions/{session_id}/memory-mode",
@@ -10587,6 +10596,172 @@ async fn api_session_consolidate_memory(
     };
     let consolidated = consolidate_session_memory(&agent).await;
     Ok(Json(MemoryConsolidateResponse { consolidated }))
+}
+
+const MEMORY_JOB_EXTRACTION: &str = "extraction";
+const MEMORY_JOB_EDGES: &str = "edges";
+const MEMORY_JOB_CONSOLIDATION: &str = "consolidation";
+
+#[derive(Debug, Clone, Serialize)]
+struct MemoryJobDto {
+    id: String,
+    session_id: String,
+    job_type: String,
+    status: String,
+    requested_at: u64,
+    started_at: Option<u64>,
+    completed_at: Option<u64>,
+    progress: u8,
+    result_count: Option<usize>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct MemoryJobStartRequest {
+    job_type: Option<String>,
+    #[serde(default)]
+    retry: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct MemoryJobListQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryJobListResponse {
+    session: SessionSummaryDto,
+    jobs: Vec<MemoryJobDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryJobStartResponse {
+    session: SessionSummaryDto,
+    job: MemoryJobDto,
+    reused: bool,
+}
+
+/// P1-1：记忆生命周期作业的统一入口。作业记录先落 SQLite，再异步执行，
+/// 前端可轮询同一记录；失败不会静默丢失，携带 retry=true 即可重新排队。
+async fn api_session_start_memory_job(
+    AxumPath(session_id): AxumPath<String>,
+    Json(payload): Json<MemoryJobStartRequest>,
+) -> ApiResult<Json<MemoryJobStartResponse>> {
+    let job_type = normalize_memory_job_type(payload.job_type.as_deref()).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "job_type 必须是 extraction、edges 或 consolidation",
+        )
+    })?;
+    let (agent, session, path) = {
+        let store = session_store()
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+        let Some(session) = store.find_session(&session_id).cloned() else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存在"));
+        };
+        (
+            session.to_agent_session(store.is_active(&session_id)),
+            session.summary(store.is_active(&session_id)),
+            store.path.clone(),
+        )
+    };
+    let (job, reused) = create_memory_job_sqlite(&path, &session_id, job_type, payload.retry)
+        .map_err(sqlite_api_error)?;
+    if !reused {
+        let job_id = job.id.clone();
+        let session_id_for_job = session_id.clone();
+        let job_type_for_job = job_type.to_string();
+        tokio::spawn(async move {
+            run_memory_job(job_id, session_id_for_job, job_type_for_job, path, agent).await;
+        });
+    }
+    Ok(Json(MemoryJobStartResponse {
+        session,
+        job,
+        reused,
+    }))
+}
+
+async fn api_session_memory_jobs(
+    AxumPath(session_id): AxumPath<String>,
+    Query(query): Query<MemoryJobListQuery>,
+) -> ApiResult<Json<MemoryJobListResponse>> {
+    let (session, path) = {
+        let store = session_store()
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+        let Some(session) = store.find_session(&session_id) else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存在"));
+        };
+        (
+            session.summary(store.is_active(&session_id)),
+            store.path.clone(),
+        )
+    };
+    let limit = query.limit.unwrap_or(12).clamp(1, 50);
+    let jobs = list_memory_jobs_sqlite(&path, &session_id, limit).map_err(sqlite_api_error)?;
+    Ok(Json(MemoryJobListResponse { session, jobs }))
+}
+
+async fn api_session_memory_job(
+    AxumPath((session_id, job_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<MemoryJobStartResponse>> {
+    let (session, path) = {
+        let store = session_store()
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+        let Some(session) = store.find_session(&session_id) else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存在"));
+        };
+        (
+            session.summary(store.is_active(&session_id)),
+            store.path.clone(),
+        )
+    };
+    let job = get_memory_job_sqlite(&path, &session_id, &job_id)
+        .map_err(sqlite_api_error)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "记忆作业不存在"))?;
+    Ok(Json(MemoryJobStartResponse {
+        session,
+        job,
+        reused: false,
+    }))
+}
+
+async fn run_memory_job(
+    job_id: String,
+    session_id: String,
+    job_type: String,
+    path: PathBuf,
+    agent: AgentSessionDto,
+) {
+    if let Err(error) = update_memory_job_sqlite(&path, &job_id, "running", 10, None, None) {
+        warn!("memory job {job_id} could not enter running state: {error}");
+        return;
+    }
+    let result = match job_type.as_str() {
+        MEMORY_JOB_EXTRACTION => extract_session_memory(&session_id),
+        MEMORY_JOB_EDGES => Ok(build_session_edges(&agent).await),
+        MEMORY_JOB_CONSOLIDATION => Ok(consolidate_session_memory(&agent).await),
+        _ => Err("unsupported memory job type".to_string()),
+    };
+    match result {
+        Ok(count) => {
+            if let Err(error) =
+                update_memory_job_sqlite(&path, &job_id, "succeeded", 100, Some(count), None)
+            {
+                warn!("memory job {job_id} success state could not be persisted: {error}");
+            }
+        }
+        Err(error) => {
+            if let Err(persist_error) =
+                update_memory_job_sqlite(&path, &job_id, "failed", 100, None, Some(&error))
+            {
+                warn!("memory job {job_id} failure state could not be persisted: {persist_error}");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -23660,6 +23835,68 @@ const MEMORY_EDGE_SIM_THRESHOLD: f32 = 0.55;
 /// E 关联图：单次召回最多用边补充的邻居数。
 const MEMORY_EDGE_EXPANSION_LIMIT: usize = 4;
 
+/// P1-1 stage-1 extraction：从最近一条非 system 会话消息生成可回溯的
+/// L2 conversation bead。它是 provider-neutral 的确定性兜底，不伪装成模型摘要；
+/// 相同来源消息重复触发时通过 signature 幂等。
+fn extract_session_memory(session_id: &str) -> Result<usize, String> {
+    let mut store = session_store()
+        .lock()
+        .map_err(|_| "会话存储锁已损坏".to_string())?;
+    let now = unix_timestamp_millis();
+    let Some(session) = store
+        .state
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+    else {
+        return Err("会话不存在".to_string());
+    };
+    let Some(message) = session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role != "system" && !message.content.trim().is_empty())
+        .cloned()
+    else {
+        return Ok(0);
+    };
+    let summary = compact_message_snippet(&message.content, 240);
+    if summary.trim().is_empty() {
+        return Ok(0);
+    }
+    let layer = "L2";
+    let kind = "conversation";
+    let source = "memory:extraction";
+    let signature = memory_bead_signature(layer, kind, source, &summary);
+    if session
+        .memory_beads
+        .iter()
+        .any(|bead| bead.signature() == signature)
+    {
+        return Ok(0);
+    }
+    session.memory_beads.push(MemoryBeadDto {
+        id: format!(
+            "memory-extract-{now}-{:016x}",
+            hash_bytes(signature.as_bytes())
+        ),
+        kind: kind.to_string(),
+        layer: layer.to_string(),
+        summary: summary.clone(),
+        source: source.to_string(),
+        pinned: false,
+        confidence: 0.62,
+        created_at: now,
+        origin_message_id: Some(message.id),
+        origin_table: Some("session_messages".to_string()),
+        token_count: Some(estimate_bead_tokens(&summary)),
+    });
+    session.prune_memory_beads();
+    session.updated_at = now;
+    store.save().map_err(|(_, Json(error))| error.error)?;
+    Ok(1)
+}
+
 /// E 关联图：为会话当前记忆构建语义相似边（真 bge-m3 向量，cosine ≥ 阈值），覆盖式写入，返回边数。
 /// 复用 `memory_vectors`（与召回共库）；缺失向量先嵌入落盘。<2 个 bead 直接返回 0。
 async fn build_session_edges(agent: &AgentSessionDto) -> usize {
@@ -36188,6 +36425,7 @@ fn initialize_session_schema(connection: &Connection) -> rusqlite::Result<()> {
     apply_session_migration_v15(connection)?;
     apply_session_migration_v16(connection)?;
     apply_session_migration_v17(connection)?;
+    apply_session_migration_v18(connection)?;
     Ok(())
 }
 
@@ -36336,6 +36574,35 @@ fn apply_session_migration_v17(connection: &Connection) -> rusqlite::Result<()> 
     Ok(())
 }
 
+/// Schema v18（P1-1）：记忆 extraction / 关联边 / consolidation 作业状态。
+/// 作业表与 beads 分离，允许失败后重试，也不会因 session JSON 全量保存而丢失。
+fn apply_session_migration_v18(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_jobs (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            job_type TEXT NOT NULL
+                CHECK (job_type IN ('extraction', 'edges', 'consolidation')),
+            status TEXT NOT NULL
+                CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+            requested_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            progress INTEGER NOT NULL DEFAULT 0,
+            result_count INTEGER,
+            error TEXT,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_jobs_session_requested
+            ON memory_jobs(session_id, requested_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memory_jobs_session_active
+            ON memory_jobs(session_id, job_type, status);
+        "#,
+    )?;
+    Ok(())
+}
+
 const DEFAULT_MEMORY_MODE: &str = "enabled";
 
 fn is_valid_memory_mode(value: Option<&str>) -> bool {
@@ -36380,6 +36647,141 @@ fn set_session_memory_mode_sqlite(
         params![session_id, mode, u64_to_i64(unix_timestamp_millis())],
     )?;
     Ok(mode.to_string())
+}
+
+fn normalize_memory_job_type(value: Option<&str>) -> Option<&'static str> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some(MEMORY_JOB_EXTRACTION) => Some(MEMORY_JOB_EXTRACTION),
+        Some(MEMORY_JOB_EDGES) => Some(MEMORY_JOB_EDGES),
+        Some(MEMORY_JOB_CONSOLIDATION) => Some(MEMORY_JOB_CONSOLIDATION),
+        _ => None,
+    }
+}
+
+fn memory_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryJobDto> {
+    Ok(MemoryJobDto {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        job_type: row.get(2)?,
+        status: row.get(3)?,
+        requested_at: i64_to_u64(row.get(4)?),
+        started_at: row.get::<_, Option<i64>>(5)?.map(i64_to_u64),
+        completed_at: row.get::<_, Option<i64>>(6)?.map(i64_to_u64),
+        progress: i64_to_u64(row.get::<_, i64>(7)?).min(100) as u8,
+        result_count: row
+            .get::<_, Option<i64>>(8)?
+            .map(|value| i64_to_u64(value) as usize),
+        error: row.get(9)?,
+    })
+}
+
+fn memory_job_select_sql() -> &'static str {
+    "SELECT id, session_id, job_type, status, requested_at, started_at, completed_at, progress, result_count, error FROM memory_jobs"
+}
+
+fn create_memory_job_sqlite(
+    path: &Path,
+    session_id: &str,
+    job_type: &str,
+    retry: bool,
+) -> rusqlite::Result<(MemoryJobDto, bool)> {
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    if !retry {
+        let active_sql = format!(
+            "{} WHERE session_id = ?1 AND job_type = ?2 AND status IN ('queued', 'running') ORDER BY requested_at DESC LIMIT 1",
+            memory_job_select_sql()
+        );
+        if let Some(job) = connection
+            .query_row(
+                &active_sql,
+                params![session_id, job_type],
+                memory_job_from_row,
+            )
+            .optional()?
+        {
+            return Ok((job, true));
+        }
+    }
+    let now = unix_timestamp_millis();
+    let sequence = MEMORY_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let job_id = format!("memory-job-{now}-{sequence}");
+    connection.execute(
+        "INSERT INTO memory_jobs(id, session_id, job_type, status, requested_at, progress) VALUES (?1, ?2, ?3, 'queued', ?4, 0)",
+        params![job_id, session_id, job_type, u64_to_i64(now)],
+    )?;
+    let select_sql = format!("{} WHERE id = ?1", memory_job_select_sql());
+    let job = connection.query_row(&select_sql, params![job_id], memory_job_from_row)?;
+    Ok((job, false))
+}
+
+fn update_memory_job_sqlite(
+    path: &Path,
+    job_id: &str,
+    status: &str,
+    progress: u8,
+    result_count: Option<usize>,
+    error: Option<&str>,
+) -> rusqlite::Result<MemoryJobDto> {
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    let now = unix_timestamp_millis();
+    let started_at = (status == "running").then_some(u64_to_i64(now));
+    let completed_at = matches!(status, "succeeded" | "failed").then_some(u64_to_i64(now));
+    let changed = connection.execute(
+        "UPDATE memory_jobs SET status = ?1, progress = ?2, result_count = ?3, error = ?4, \
+         started_at = COALESCE(started_at, ?5), completed_at = COALESCE(?6, completed_at) WHERE id = ?7",
+        params![
+            status,
+            i64::from(progress.min(100)),
+            result_count.map(|value| u64_to_i64(value as u64)),
+            error,
+            started_at,
+            completed_at,
+            job_id,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let select_sql = format!("{} WHERE id = ?1", memory_job_select_sql());
+    connection.query_row(&select_sql, params![job_id], memory_job_from_row)
+}
+
+fn list_memory_jobs_sqlite(
+    path: &Path,
+    session_id: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<MemoryJobDto>> {
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    let select_sql = format!(
+        "{} WHERE session_id = ?1 ORDER BY requested_at DESC, id DESC LIMIT ?2",
+        memory_job_select_sql()
+    );
+    let mut statement = connection.prepare(&select_sql)?;
+    let rows = statement.query_map(params![session_id, limit as i64], memory_job_from_row)?;
+    rows.collect()
+}
+
+fn get_memory_job_sqlite(
+    path: &Path,
+    session_id: &str,
+    job_id: &str,
+) -> rusqlite::Result<Option<MemoryJobDto>> {
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    let select_sql = format!(
+        "{} WHERE session_id = ?1 AND id = ?2",
+        memory_job_select_sql()
+    );
+    connection
+        .query_row(
+            &select_sql,
+            params![session_id, job_id],
+            memory_job_from_row,
+        )
+        .optional()
 }
 
 fn chat_room_permission_profile_sqlite(path: &Path, room_id: &str) -> rusqlite::Result<String> {
@@ -41063,6 +41465,12 @@ fn purge_deleted_session_auxiliary_sqlite(path: &Path, session_id: &str) -> ApiR
             params![session_id],
         )
         .map_err(sqlite_api_error)?;
+    connection
+        .execute(
+            "DELETE FROM memory_jobs WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(sqlite_api_error)?;
     Ok(())
 }
 
@@ -41387,6 +41795,7 @@ fn save_session_state_to_sqlite(
         "memory_meta",
         "memory_edges",
         "memory_settings",
+        "memory_jobs",
     ] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE session_id NOT IN (SELECT id FROM sessions)"),
@@ -59767,6 +60176,79 @@ attach: last_assistant
     }
 
     #[test]
+    fn memory_job_lifecycle_is_persistent_and_retryable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("memory-jobs.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        connection
+            .execute(
+                "INSERT INTO sessions(id, name, provider, model, api_key_ref, created_at, updated_at) \
+                 VALUES ('s1','S1','p','m','none',0,0)",
+                [],
+            )
+            .expect("seed session");
+        drop(connection);
+
+        let (queued, reused) =
+            super::create_memory_job_sqlite(&db, "s1", super::MEMORY_JOB_EDGES, false)
+                .expect("create queued job");
+        assert!(!reused);
+        assert_eq!(queued.status, "queued");
+        assert_eq!(queued.progress, 0);
+
+        let (same, reused) =
+            super::create_memory_job_sqlite(&db, "s1", super::MEMORY_JOB_EDGES, false)
+                .expect("reuse active job");
+        assert!(reused);
+        assert_eq!(same.id, queued.id);
+
+        let running = super::update_memory_job_sqlite(&db, &queued.id, "running", 10, None, None)
+            .expect("running");
+        assert_eq!(running.status, "running");
+        assert_eq!(running.progress, 10);
+        assert!(running.started_at.is_some());
+
+        let done =
+            super::update_memory_job_sqlite(&db, &queued.id, "succeeded", 100, Some(3), None)
+                .expect("succeeded");
+        assert_eq!(done.status, "succeeded");
+        assert_eq!(done.result_count, Some(3));
+        assert!(done.completed_at.is_some());
+
+        let (failed, reused) =
+            super::create_memory_job_sqlite(&db, "s1", super::MEMORY_JOB_EDGES, false)
+                .expect("create second job");
+        assert!(!reused);
+        super::update_memory_job_sqlite(
+            &db,
+            &failed.id,
+            "failed",
+            100,
+            None,
+            Some("embedding backend unavailable"),
+        )
+        .expect("failed");
+        let failed_loaded = super::get_memory_job_sqlite(&db, "s1", &failed.id)
+            .expect("read failed")
+            .expect("failed job row");
+        assert_eq!(failed_loaded.status, "failed");
+        assert_eq!(
+            failed_loaded.error.as_deref(),
+            Some("embedding backend unavailable")
+        );
+
+        let (retry, reused) =
+            super::create_memory_job_sqlite(&db, "s1", super::MEMORY_JOB_EDGES, true)
+                .expect("retry failed job");
+        assert!(!reused);
+        assert_ne!(retry.id, failed.id);
+        let listed = super::list_memory_jobs_sqlite(&db, "s1", 10).expect("list jobs");
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].id, retry.id);
+    }
+
+    #[test]
     fn local_active_mode_maps_running_services() {
         assert_eq!(super::local_active_mode(true, false), "chat");
         assert_eq!(super::local_active_mode(false, true), "vision");
@@ -64942,7 +65424,13 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("memory_selection"));
         assert!(WEB_APP_JS.contains("budget_skipped"));
         assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-mode\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-jobs\""));
+        assert!(WEB_INDEX_HTML.contains("data-memory-job-type=\"extraction\""));
+        assert!(WEB_INDEX_HTML.contains("data-memory-job-type=\"consolidation\""));
         assert!(WEB_APP_JS.contains("/memory-mode"));
+        assert!(WEB_APP_JS.contains("/memory/jobs"));
+        assert!(WEB_APP_JS.contains("memoryWindowStartJob"));
+        assert!(WEB_APP_JS.contains("memoryWindowRenderJobs"));
         assert!(WEB_APP_JS.contains("memoryWindowUpdateMode"));
         assert!(WEB_APP_JS.contains("memory_mode"));
         assert!(WEB_APP_JS.contains("loaded_memory_ids"));
@@ -64954,6 +65442,7 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("method: \"PATCH\""));
         assert!(WEB_APP_JS.contains("memoryWindowRenderConstellation([])"));
         assert!(WEB_STYLES_CSS.contains(".memory-window-insights"));
+        assert!(WEB_STYLES_CSS.contains(".memory-window-jobs"));
         assert!(WEB_STYLES_CSS.contains(".memory-window-preview-card"));
     }
 

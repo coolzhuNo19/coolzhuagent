@@ -1106,6 +1106,22 @@
                 <article><span>Prompt</span><strong data-role="memory-summary-prompt">0</strong></article>
                 <article><span>Context tokens</span><strong data-role="memory-context-total">0</strong></article>
               </section>
+              <section class="memory-window-jobs" data-role="memory-window-jobs" aria-label="记忆生命周期作业">
+                <div class="memory-window-jobs-head">
+                  <div>
+                    <strong>Memory lifecycle</strong>
+                    <span>作业状态可追踪，失败后可重试</span>
+                  </div>
+                  <span class="memory-window-job-status" data-role="memory-job-status">暂无作业</span>
+                </div>
+                <div class="memory-window-job-actions">
+                  <button class="mini-button" data-action="memory-job-start" data-memory-job-type="extraction" type="button">提取</button>
+                  <button class="mini-button" data-action="memory-job-start" data-memory-job-type="edges" type="button">关联图</button>
+                  <button class="mini-button" data-action="memory-job-start" data-memory-job-type="consolidation" type="button">巩固</button>
+                  <button class="mini-button" data-action="memory-jobs-refresh" type="button">刷新作业</button>
+                </div>
+                <div class="memory-window-job-list" data-role="memory-job-list" aria-live="polite"></div>
+              </section>
               <section class="memory-window-layout">
                 <aside class="memory-window-list-pane" aria-label="记忆 bead 列表">
                   <header class="memory-window-section-head">
