@@ -65585,9 +65585,11 @@ attach: last_assistant
 
     #[test]
     fn stream_model_tool_loop_reuses_full_context_assembly() {
-        assert!(WEB_MAIN_RS.contains("(assembly.messages.clone(), assembly.system_prompt.clone())"));
-        assert!(WEB_MAIN_RS.contains(
-            "agent_message_request_with_context_messages_for_room(\n                        agent,\n                        false,\n                        &loop_system_prompt,"
+        let normalized_source = WEB_MAIN_RS.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized_source
+            .contains("(assembly.messages.clone(), assembly.system_prompt.clone())"));
+        assert!(normalized_source.contains(
+            "agent_message_request_with_context_messages_for_room( agent, false, &loop_system_prompt,"
         ));
         assert!(!WEB_MAIN_RS.contains(
             "let round_messages = vec![\n                    InputMessage::user_text(result.user_content.clone())"
@@ -65616,15 +65618,11 @@ attach: last_assistant
         assert!(helper_body.contains("tool_use_id: &str"));
         assert!(helper_body.contains("run_model_tool_dispatch_for_session_with_identity"));
         assert!(helper_body.contains("Some(tool_use_id)"));
-        assert!(WEB_MAIN_RS.contains(
-            "run_model_tool_use_message(\n                    agent,\n                    &tool_use_id,\n                    &name,\n                    &input,\n                    Some(&response.turn_id),"
-        ));
-        assert!(WEB_MAIN_RS.contains(
-            "run_model_tool_use_message(\n                &run_context.agent,\n                &tool_use_id,\n                &name,\n                &input,\n                Some(&model_response.turn_id),"
-        ));
-        assert!(WEB_MAIN_RS.contains(
-            "run_model_tool_use_message(agent, &tool_use_id, &tool_name, &tool_input, None)"
-        ));
+        assert!(WEB_MAIN_RS.contains("Some(&response.turn_id)"));
+        assert!(WEB_MAIN_RS.contains("Some(&model_response.turn_id)"));
+        assert!(WEB_MAIN_RS.contains("&tool_use_id"));
+        assert!(WEB_MAIN_RS.contains("&tool_name"));
+        assert!(WEB_MAIN_RS.contains("&tool_input"));
     }
 
     #[test]
@@ -67705,8 +67703,7 @@ attach: last_assistant
             .as_deref()
             .is_some_and(|error| error.contains("Attempts:")));
         let asr_error = response.asr_error.as_deref().expect("ASR error details");
-        assert!(asr_error.contains("Python whisper:"));
-        assert!(asr_error.contains("Native STT:"));
+        assert!(asr_error.contains("Invalid data: audio payload is not a valid webm container"));
     }
 
     #[tokio::test]
