@@ -110,7 +110,13 @@ let activeSessionId = null;
 let activeChatRoomId = null;
 let activeChatRoomDiagnostics = { enabled: true, auto_refresh: false, show_stream_interrupts: true, show_details: true };
 let activeChatAbortController = null;
-let showUiServiceStatus = { enabled: false, running: false, pid: null, disabled: false };
+let showUiServiceStatus = {
+  enabled: false,
+  running: false,
+  available: false,
+  pid: null,
+  disabled: false,
+};
 let activeOverviewVisionAgent = null;
 let activeWorkspaceKey = "default";
 let messagePaging = { roomId: null, hasMore: false, nextBefore: null };
@@ -6537,18 +6543,21 @@ function renderShowUiServiceStatus(status = {}) {
   showUiServiceStatus = {
     enabled: Boolean(status.enabled),
     running: Boolean(status.running),
+    // 桌宠壳可存活但 ShowUI 端点未监听；以 backend capability 的 available 为准。
+    available: status.available == null ? Boolean(status.running) : Boolean(status.available),
     pid: status.pid ?? null,
     disabled: Boolean(status.disabled),
     message: status.message || "",
   };
   const enabled = showUiServiceStatus.enabled && !showUiServiceStatus.disabled;
-  const showUiServiceActive = enabled && showUiServiceStatus.running;
+  const showUiServiceActive =
+    enabled && showUiServiceStatus.running && showUiServiceStatus.available;
   const label = showUiServiceStatus.disabled
     ? "ShowUI disabled"
     : showUiServiceActive
       ? `ShowUI running${showUiServiceStatus.pid ? ` #${showUiServiceStatus.pid}` : ""}`
       : showUiServiceStatus.running
-        ? `ShowUI shell running${showUiServiceStatus.pid ? ` #${showUiServiceStatus.pid}` : ""}`
+        ? `ShowUI shell running, backend unavailable${showUiServiceStatus.pid ? ` #${showUiServiceStatus.pid}` : ""}`
         : "ShowUI stopped";
   setBindText("showui.serviceStatus", label);
   const button = actionButtons.get("showui-service-toggle");
@@ -6574,7 +6583,9 @@ async function refreshShowUiServiceStatus() {
 
 async function toggleShowUiService() {
   const button = actionButtons.get("showui-service-toggle");
-  const nextEnabled = !showUiServiceStatus.running;
+  const nextEnabled = !(
+    showUiServiceStatus.running && showUiServiceStatus.available
+  );
   setBusy(button, true, nextEnabled ? "启动中..." : "停止中...");
   try {
     const status = await requestJson("/api/showui/service", {

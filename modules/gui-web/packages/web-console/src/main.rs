@@ -2544,6 +2544,8 @@ struct PetStateResponse {
 struct ShowUiServiceResponse {
     enabled: bool,
     running: bool,
+    /// 桌宠壳进程存活不等于 ShowUI grounding 端点已就绪；以前端显示真实可用性。
+    available: bool,
     pid: Option<u32>,
     disabled: bool,
     desktop_pet_exe: Option<String>,
@@ -2692,6 +2694,7 @@ fn showui_service_status_with_message(message: impl Into<String>) -> ShowUiServi
         enabled: SHOWUI_SERVICE_ENABLED.load(Ordering::Relaxed)
             && !showui_service_config_disabled(),
         running,
+        available: local_port_listening(LOCAL_SHOWUI_PORT),
         pid,
         disabled: showui_service_config_disabled(),
         desktop_pet_exe: desktop_pet_executable().map(|path| path.display().to_string()),
@@ -2720,6 +2723,7 @@ fn managed_showui_service_status(message: impl Into<String>) -> ShowUiServiceRes
     ShowUiServiceResponse {
         enabled: true,
         running: true,
+        available: local_port_listening(LOCAL_SHOWUI_PORT),
         pid: None,
         disabled: false,
         desktop_pet_exe: desktop_pet_executable().map(|path| path.display().to_string()),
@@ -2748,6 +2752,7 @@ fn start_showui_service(console_url: &str) -> ShowUiServiceResponse {
         return ShowUiServiceResponse {
             enabled: true,
             running: true,
+            available: local_port_listening(LOCAL_SHOWUI_PORT),
             pid: Some(pid),
             disabled: false,
             desktop_pet_exe: desktop_pet_executable().map(|path| path.display().to_string()),
@@ -2760,6 +2765,7 @@ fn start_showui_service(console_url: &str) -> ShowUiServiceResponse {
     ShowUiServiceResponse {
         enabled: true,
         running: pid.is_some(),
+        available: local_port_listening(LOCAL_SHOWUI_PORT),
         pid,
         disabled: false,
         desktop_pet_exe: desktop_pet_executable().map(|path| path.display().to_string()),
@@ -67098,11 +67104,13 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("function refreshShowUiServiceStatus"));
         assert!(WEB_APP_JS.contains("function toggleShowUiService"));
         assert!(WEB_APP_JS.contains("const showUiServiceActive ="));
-        assert!(WEB_APP_JS.contains("const nextEnabled = !showUiServiceStatus.running"));
+        assert!(WEB_APP_JS.contains("available: status.available == null"));
+        assert!(WEB_APP_JS.contains("showUiServiceStatus.running && showUiServiceStatus.available"));
         assert!(
             WEB_APP_JS.contains("button.dataset.label = showUiServiceActive ? \"停止\" : \"启动\"")
         );
         assert!(WEB_APP_JS.contains("ShowUI stopped"));
+        assert!(WEB_APP_JS.contains("ShowUI shell running, backend unavailable"));
         // 工作区名展示：复用 /api/system/info 的 workspace，点击复制完整路径
         assert!(WEB_APP_JS.contains("function setOverviewWorkspaceName"));
         assert!(WEB_APP_JS.contains("function copyOverviewWorkspacePath"));
