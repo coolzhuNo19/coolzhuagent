@@ -10533,7 +10533,11 @@ async fn api_session_context_preview(
         &room_history,
         &prompt,
         &[],
-        context_build_options_for_agent_with_floor(&agent, context_reset_floor),
+        context_build_options_for_agent_with_floor_and_room(
+            &agent,
+            context_reset_floor,
+            Some(&room_id),
+        ),
     )))
 }
 
@@ -24344,7 +24348,11 @@ async fn call_agent_model_with_tool_loop(
         context_history,
         prompt,
         image_urls,
-        context_build_options_for_agent(agent),
+        context_build_options_for_agent_with_floor_and_room(
+            agent,
+            session_context_reset_floor(&agent.id),
+            chat_room_id,
+        ),
         collaboration_roster,
     );
     let base_history = assembly.messages.clone();
@@ -24919,7 +24927,7 @@ fn build_context_assembly_with_roster(
     );
     let max_prompt_tokens = options.max_prompt_tokens.max(1);
     let mut truncated = false;
-    let mut memory_beads = select_context_memory_beads(agent, current_user_text, options);
+    let mut memory_beads = select_context_memory_beads(agent, current_user_text, &options);
     let memory_revision = context_memory_revision(agent);
     let build_system_prompt = |beads: &[MemoryBeadDto]| {
         let mut prompt = build_agent_system_prompt_with_beads(agent, beads);
@@ -25108,6 +25116,10 @@ fn build_context_assembly_with_roster(
         .iter()
         .map(|bead| bead.id.clone())
         .collect::<Vec<_>>();
+    let workspace_id = workspace_identity(&active_workspace_path());
+    let chat_room_id = options.chat_room_id.clone();
+    let permission_profile = context_permission_profile(chat_room_id.as_deref());
+    let tool_catalog_revision = context_tool_catalog_revision();
     let context_snapshot_id = context_snapshot_id(
         agent,
         &memory_revision,
@@ -25116,7 +25128,22 @@ fn build_context_assembly_with_roster(
         &selected_history,
         &system_prompt,
         &current_user_text_for_prompt,
+        &workspace_id,
+        chat_room_id.as_deref(),
+        &permission_profile,
+        &tool_catalog_revision,
     );
+    let runtime_snapshot = ContextRuntimeSnapshot {
+        snapshot_id: context_snapshot_id.clone(),
+        workspace_id,
+        chat_room_id,
+        permission_profile,
+        model: agent.model.clone(),
+        provider: agent.provider.clone(),
+        tool_catalog_revision,
+        memory_revision: memory_revision.clone(),
+        history_floor_millis: options.history_floor_millis,
+    };
 
     ctx_span.record("outcome", "ok");
     diagnostics::info(
@@ -25129,6 +25156,20 @@ fn build_context_assembly_with_roster(
             ("history_msgs", selected_history.len().to_string()),
             ("total_tokens", total.to_string()),
             ("truncated", truncated.to_string()),
+            ("context_snapshot", runtime_snapshot.snapshot_id.clone()),
+            ("workspace_id", runtime_snapshot.workspace_id.clone()),
+            (
+                "chat_room_id",
+                runtime_snapshot.chat_room_id.clone().unwrap_or_default(),
+            ),
+            (
+                "permission_profile",
+                runtime_snapshot.permission_profile.clone(),
+            ),
+            (
+                "tool_catalog_revision",
+                runtime_snapshot.tool_catalog_revision.clone(),
+            ),
         ],
     );
     ContextAssembly {
@@ -25138,6 +25179,7 @@ fn build_context_assembly_with_roster(
         context_snapshot_id,
         memory_revision,
         memory_bead_ids,
+        runtime_snapshot,
         history_floor_millis: options.history_floor_millis,
         history_message_count: selected_history.len(),
         token_budget: ContextTokenBudget {
@@ -25170,6 +25212,39 @@ fn context_memory_revision(agent: &AgentSessionDto) -> String {
     format!("mem-{:016x}", hash_bytes(parts.join("\u{1e}").as_bytes()))
 }
 
+fn context_permission_profile(chat_room_id: Option<&str>) -> String {
+    let room_id = chat_room_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(room_id) = room_id {
+        if let Ok(profile) =
+            chat_room_permission_profile_sqlite(&default_session_sqlite_path(), room_id)
+        {
+            return profile;
+        }
+    }
+    active_permission_profile().as_str().to_string()
+}
+
+fn context_tool_catalog_revision() -> String {
+    let catalog = build_tools_catalog();
+    let mut parts = Vec::new();
+    for category in &catalog.categories {
+        for item in &category.items {
+            parts.push(format!(
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                category.id,
+                item.item.id,
+                item.item.status,
+                item.item.permissions.join(","),
+                item.item.executable_now,
+            ));
+        }
+    }
+    parts.sort();
+    format!("tools-{:016x}", hash_bytes(parts.join("\u{1e}").as_bytes()))
+}
+
 fn context_snapshot_id(
     agent: &AgentSessionDto,
     memory_revision: &str,
@@ -25178,6 +25253,10 @@ fn context_snapshot_id(
     selected_history: &[PersistedChatMessage],
     system_prompt: &str,
     current_user_text: &str,
+    workspace_id: &str,
+    chat_room_id: Option<&str>,
+    permission_profile: &str,
+    tool_catalog_revision: &str,
 ) -> String {
     let history_identity = selected_history
         .iter()
@@ -25187,12 +25266,16 @@ fn context_snapshot_id(
     let input_hash = hash_bytes(current_user_text.as_bytes());
     let prompt_hash = hash_bytes(system_prompt.as_bytes());
     let seed = format!(
-        "{}|{}|{}|{}|{}|{:016x}|{:016x}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{:016x}|{:016x}",
         agent.id,
         memory_revision,
         history_floor_millis.unwrap_or_default(),
         memory_bead_ids.join(","),
         history_identity,
+        workspace_id,
+        chat_room_id.unwrap_or_default(),
+        permission_profile,
+        tool_catalog_revision,
         prompt_hash,
         input_hash,
     );
@@ -25202,7 +25285,7 @@ fn context_snapshot_id(
 fn select_context_memory_beads(
     agent: &AgentSessionDto,
     current_user_text: &str,
-    options: ContextBuildOptions,
+    options: &ContextBuildOptions,
 ) -> Vec<MemoryBeadDto> {
     let mut recall_span = diagnostics::start_span("memory.recall", "memory");
     diagnostics::info(
@@ -25360,14 +25443,30 @@ fn effective_model_limit_for_agent(agent: &AgentSessionDto) -> (u32, u32) {
 }
 
 fn context_build_options_for_agent(agent: &AgentSessionDto) -> ContextBuildOptions {
-    context_build_options_for_agent_with_floor(agent, session_context_reset_floor(&agent.id))
+    context_build_options_for_agent_with_floor_and_room(
+        agent,
+        session_context_reset_floor(&agent.id),
+        None,
+    )
 }
 
 fn context_build_options_for_agent_with_floor(
     agent: &AgentSessionDto,
     history_floor_millis: Option<u64>,
 ) -> ContextBuildOptions {
+    context_build_options_for_agent_with_floor_and_room(agent, history_floor_millis, None)
+}
+
+fn context_build_options_for_agent_with_floor_and_room(
+    agent: &AgentSessionDto,
+    history_floor_millis: Option<u64>,
+    chat_room_id: Option<&str>,
+) -> ContextBuildOptions {
     let mut options = ContextBuildOptions::default();
+    options.chat_room_id = chat_room_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let policy = context_lifecycle_policy();
     let (model_context_raw, max_output) = effective_model_limit_for_agent(agent);
     let model_context = model_context_raw.max(1);
@@ -27516,7 +27615,7 @@ struct PreparedGoalTrigger {
     consultation_required: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ContextBuildOptions {
     history_token_budget: u32,
     memory_token_budget: u32,
@@ -27524,6 +27623,8 @@ struct ContextBuildOptions {
     image_token_estimate: u32,
     max_memory_beads: usize,
     history_floor_millis: Option<u64>,
+    /// 当前 turn 所属聊天室；None 表示调用方没有房间作用域（例如通用模型探测）。
+    chat_room_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27613,6 +27714,7 @@ impl Default for ContextBuildOptions {
             image_token_estimate: default_context_image_token_estimate(),
             max_memory_beads: 8,
             history_floor_millis: None,
+            chat_room_id: None,
         }
     }
 }
@@ -27628,6 +27730,20 @@ struct ContextTokenBudget {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct ContextRuntimeSnapshot {
+    /// 本轮上下文与运行时作用域的联合身份；作用域变化会生成新值。
+    snapshot_id: String,
+    workspace_id: String,
+    chat_room_id: Option<String>,
+    permission_profile: String,
+    model: String,
+    provider: String,
+    tool_catalog_revision: String,
+    memory_revision: String,
+    history_floor_millis: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ContextAssembly {
     system_prompt: String,
     messages: Vec<InputMessage>,
@@ -27638,6 +27754,8 @@ struct ContextAssembly {
     memory_revision: String,
     /// 实际注入 prompt 的 bead id，便于诊断“记忆已加载但未进入上下文”的差异。
     memory_bead_ids: Vec<String>,
+    /// 本轮固定的 workspace/聊天室/权限/模型/工具目录作用域。
+    runtime_snapshot: ContextRuntimeSnapshot,
     history_floor_millis: Option<u64>,
     history_message_count: usize,
     token_budget: ContextTokenBudget,
@@ -27913,7 +28031,11 @@ async fn stream_agent_model(
         context_history,
         prompt,
         image_urls,
-        context_build_options_for_agent(agent),
+        context_build_options_for_agent_with_floor_and_room(
+            agent,
+            session_context_reset_floor(&agent.id),
+            chat_room_id,
+        ),
         collaboration_roster,
     );
     let request = agent_message_request_with_context_for_room(agent, true, &assembly, chat_room_id);
@@ -52371,6 +52493,7 @@ mod tests {
                 image_token_estimate: 512,
                 max_memory_beads: 4,
                 history_floor_millis: None,
+                chat_room_id: None,
             },
         );
 
@@ -52397,6 +52520,7 @@ mod tests {
                 image_token_estimate: 512,
                 max_memory_beads: 0,
                 history_floor_millis: None,
+                chat_room_id: None,
             },
         );
 
@@ -52435,6 +52559,7 @@ mod tests {
                 image_token_estimate: 512,
                 max_memory_beads: 4,
                 history_floor_millis: None,
+                chat_room_id: Some("room-context".to_string()),
             },
         );
 
@@ -52457,6 +52582,83 @@ mod tests {
         assert_eq!(assembly.history_message_count, 2);
         assert!(!assembly.truncated);
         assert!(assembly.token_budget.total <= assembly.token_budget.budget);
+        assert_eq!(
+            assembly.runtime_snapshot.chat_room_id.as_deref(),
+            Some("room-context")
+        );
+        assert_eq!(
+            assembly.runtime_snapshot.snapshot_id,
+            assembly.context_snapshot_id
+        );
+        assert_eq!(assembly.runtime_snapshot.model, agent.model);
+        assert_eq!(assembly.runtime_snapshot.provider, agent.provider);
+        assert!(!assembly.runtime_snapshot.workspace_id.is_empty());
+        assert!(assembly
+            .runtime_snapshot
+            .tool_catalog_revision
+            .starts_with("tools-"));
+    }
+
+    #[test]
+    fn context_snapshot_id_changes_when_runtime_scope_changes() {
+        let agent = context_test_agent();
+        let history = vec![persisted_role_message("h1", "user", "history", 1)];
+        let base = super::context_snapshot_id(
+            &agent,
+            "mem-1",
+            None,
+            &["bead-1".to_string()],
+            &history,
+            "system",
+            "input",
+            "workspace-a",
+            Some("room-a"),
+            "workspace-write",
+            "tools-a",
+        );
+        let workspace_changed = super::context_snapshot_id(
+            &agent,
+            "mem-1",
+            None,
+            &["bead-1".to_string()],
+            &history,
+            "system",
+            "input",
+            "workspace-b",
+            Some("room-a"),
+            "workspace-write",
+            "tools-a",
+        );
+        let permission_changed = super::context_snapshot_id(
+            &agent,
+            "mem-1",
+            None,
+            &["bead-1".to_string()],
+            &history,
+            "system",
+            "input",
+            "workspace-a",
+            Some("room-a"),
+            "full-access",
+            "tools-a",
+        );
+        let tools_changed = super::context_snapshot_id(
+            &agent,
+            "mem-1",
+            None,
+            &["bead-1".to_string()],
+            &history,
+            "system",
+            "input",
+            "workspace-a",
+            Some("room-a"),
+            "workspace-write",
+            "tools-b",
+        );
+
+        assert_ne!(base, workspace_changed);
+        assert_ne!(base, permission_changed);
+        assert_ne!(base, tools_changed);
     }
 
     #[test]
@@ -52479,6 +52681,7 @@ mod tests {
                 image_token_estimate: 512,
                 max_memory_beads: 4,
                 history_floor_millis: Some(20),
+                chat_room_id: None,
             },
         );
 
@@ -52514,6 +52717,7 @@ mod tests {
                 image_token_estimate: 512,
                 max_memory_beads: 4,
                 history_floor_millis: None,
+                chat_room_id: None,
             },
         );
 
@@ -64458,6 +64662,9 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("function memoryWindowRefreshPreviews"));
         assert!(WEB_APP_JS.contains("context_snapshot_id"));
         assert!(WEB_APP_JS.contains("memory_revision"));
+        assert!(WEB_APP_JS.contains("runtime_snapshot"));
+        assert!(WEB_APP_JS.contains("runtime_model"));
+        assert!(WEB_APP_JS.contains("tool_catalog_revision"));
         assert!(WEB_APP_JS.contains("loaded_memory_ids"));
         assert!(WEB_APP_JS.contains("memory-bead-pin-toggle"));
         assert!(WEB_APP_JS.contains("memory-bead-edit"));
@@ -68566,6 +68773,17 @@ attach: last_assistant
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
+            runtime_snapshot: super::ContextRuntimeSnapshot {
+                snapshot_id: "ctx-test".to_string(),
+                workspace_id: "ws-test".to_string(),
+                chat_room_id: None,
+                permission_profile: "workspace-write".to_string(),
+                model: "glm-5.1".to_string(),
+                provider: "test".to_string(),
+                tool_catalog_revision: "tools-test".to_string(),
+                memory_revision: "mem-test".to_string(),
+                history_floor_millis: None,
+            },
             history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
@@ -68649,6 +68867,17 @@ attach: last_assistant
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
+            runtime_snapshot: super::ContextRuntimeSnapshot {
+                snapshot_id: "ctx-test".to_string(),
+                workspace_id: "ws-test".to_string(),
+                chat_room_id: None,
+                permission_profile: "workspace-write".to_string(),
+                model: "glm-5.1".to_string(),
+                provider: "test".to_string(),
+                tool_catalog_revision: "tools-test".to_string(),
+                memory_revision: "mem-test".to_string(),
+                history_floor_millis: None,
+            },
             history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
@@ -68694,6 +68923,17 @@ attach: last_assistant
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
+            runtime_snapshot: super::ContextRuntimeSnapshot {
+                snapshot_id: "ctx-test".to_string(),
+                workspace_id: "ws-test".to_string(),
+                chat_room_id: None,
+                permission_profile: "workspace-write".to_string(),
+                model: "glm-5.1".to_string(),
+                provider: "test".to_string(),
+                tool_catalog_revision: "tools-test".to_string(),
+                memory_revision: "mem-test".to_string(),
+                history_floor_millis: None,
+            },
             history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
@@ -68743,6 +68983,17 @@ attach: last_assistant
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
+            runtime_snapshot: super::ContextRuntimeSnapshot {
+                snapshot_id: "ctx-test".to_string(),
+                workspace_id: "ws-test".to_string(),
+                chat_room_id: None,
+                permission_profile: "workspace-write".to_string(),
+                model: "glm-5.1".to_string(),
+                provider: "test".to_string(),
+                tool_catalog_revision: "tools-test".to_string(),
+                memory_revision: "mem-test".to_string(),
+                history_floor_millis: None,
+            },
             history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
@@ -68915,6 +69166,7 @@ attach: last_assistant
                 image_token_estimate: 512,
                 max_memory_beads: 8,
                 history_floor_millis: None,
+                chat_room_id: None,
             },
         );
         let joined = assembly
