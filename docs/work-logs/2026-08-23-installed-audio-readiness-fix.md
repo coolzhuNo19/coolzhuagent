@@ -51,6 +51,17 @@
 - `cargo build -p coolzhu-web-console --offline`：通过。
 - 源码运行结果：`tmp/logs/source-audio-readiness-fix-8777-20260823-152914.json`。
 
+## 修复版 release 包回归
+
+- MSI：`dist/CoolzhuAgent-0.2.5-20260823-155056.msi`，180147712 字节。
+- SHA-256：`14CE55AC1E42B8AED3E777408E75AF05FC3734BA128DFB2A00F1B068A472CCE`。
+- WiX：`5.0.2+aa65968c`；包安全检查通过；未签名（`signed=false`）。
+- 包内 `bin/coolzhu-web-console.exe` 构建版本：`0b4ebe3c5117 · local`。
+- 未直接覆盖 Program Files 安装，以免中断用户当前会话；包内二进制在隔离 workspace、`127.0.0.1:8777` 启动成功，控制台标题为 `COOLZHU CODE 控制台`，DOM 页面加载正常。
+- 包内 `/api/computer-use/capabilities` 正确将 ShowUI 和 Browser Use 标为 skipped；`vision.capture_desktop`、`computer.left_click`、closed-loop 均返回 `execute=false / executed=false` 的安全 dry-run。
+- 包内英文 TTS WAV：`tmp/logs/package-tts-english-8777-20260823.wav`，119734 字节，`data` chunk 119688 字节；中文 TTS 返回 HTTP 500 和具体空采样原因。
+- 包内运行结果：`tmp/logs/package-selfcheck-8777-20260823.json`。
+
 ## 后续
 
 修复提交到独立分支并创建 PR。当前 Program Files 中仍运行用户刚安装的旧构建；新修复构建需在 PR 验证后重新打包，再按用户授权执行安装升级。
