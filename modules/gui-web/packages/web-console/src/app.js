@@ -154,6 +154,7 @@ let memoryWindowSummary = null;
 let memoryWindowPromptPreview = null;
 let memoryWindowContextPreview = null;
 let memoryWindowPreviewTimer = null;
+let memoryWindowMode = "enabled";
 const DEFAULT_BROWSER_SEARCH_ENGINE_URL = "https://www.baidu.com/s?wd={query}";
 let browserRuntimeConfig = {
   browser: {
@@ -363,6 +364,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.querySelector('[data-role="memory-constellation"]')?.addEventListener("click", onMemoryBeadListClick);
   document.querySelector('[data-role="memory-window-filters"]')?.addEventListener("input", memoryWindowApplyFilters);
   document.querySelector('[data-role="memory-window-filters"]')?.addEventListener("change", memoryWindowApplyFilters);
+  document.querySelector('[data-role="memory-window-mode"]')?.addEventListener("change", memoryWindowUpdateMode);
   actionButtons.get("memory-window-refresh")?.addEventListener("click", async () => {
     const button = actionButtons.get("memory-window-refresh");
     setBusy(button, true, "刷新中");
@@ -7131,10 +7133,14 @@ function memoryWindowBeadEndpoint(beadId) {
 
 async function loadSessionBeads(sessionId = memoryWindowSessionId()) {
   if (!sessionId) {
+    memoryWindowMode = "enabled";
+    memoryWindowRenderMode();
     memoryWindowSetBeads([], memoryWindowDeriveSummary([]));
     return [];
   }
   const response = await requestJson(`/api/sessions/${encodeURIComponent(sessionId)}/beads`);
+  memoryWindowMode = memoryWindowNormalizeMode(response.session?.memory_mode);
+  memoryWindowRenderMode();
   memoryWindowSetBeads(response.beads || [], response.summary);
   return memoryWindowBeads;
 }
@@ -7174,6 +7180,43 @@ function memoryWindowSetRoleText(role, value) {
   const node = document.querySelector(`[data-role="${role}"]`);
   if (node) {
     node.textContent = String(value ?? "-");
+  }
+}
+
+function memoryWindowNormalizeMode(value) {
+  return ["enabled", "disabled", "polluted"].includes(String(value || "")) ? String(value) : "enabled";
+}
+
+function memoryWindowRenderMode() {
+  const select = document.querySelector('[data-role="memory-window-mode"]');
+  if (select) {
+    select.value = memoryWindowNormalizeMode(memoryWindowMode);
+  }
+}
+
+async function memoryWindowUpdateMode(event) {
+  const endpoint = memoryWindowSessionEndpoint("/memory-mode");
+  if (!endpoint) {
+    memoryWindowRenderMode();
+    return;
+  }
+  const previous = memoryWindowMode;
+  const requested = memoryWindowNormalizeMode(event?.target?.value);
+  memoryWindowMode = requested;
+  try {
+    const response = await requestJson(endpoint, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ memory_mode: requested }),
+    });
+    memoryWindowMode = memoryWindowNormalizeMode(response.memory_mode || response.session?.memory_mode);
+    memoryWindowRenderMode();
+    await loadSessions();
+    await memoryWindowRefreshPreviews();
+  } catch (error) {
+    memoryWindowMode = previous;
+    memoryWindowRenderMode();
+    addMessage({ author: "记忆窗口", text: `memory mode 切换失败：${error.message}`, kind: "thought", icon: "error-log" });
   }
 }
 
@@ -7578,6 +7621,8 @@ function memoryWindowSchedulePreviewRefresh() {
 async function memoryWindowRefreshPreviews() {
   const endpoint = memoryWindowSessionEndpoint();
   if (!endpoint) {
+    memoryWindowMode = "enabled";
+    memoryWindowRenderMode();
     memoryWindowSummary = memoryWindowDeriveSummary([]);
     memoryWindowPromptPreview = null;
     memoryWindowContextPreview = null;
@@ -7649,7 +7694,7 @@ function memoryWindowRenderContextPreview(response, fallback = "No context previ
     `snapshot=${response.context_snapshot_id || "-"} memory_revision=${response.memory_revision || "-"}`,
     `memory_selection=${memorySelection.strategy || "-"} candidates=${memoryCandidates.join(",") || "none"} selected=${memorySelected.join(",") || "none"}`,
     `memory_tokens=${memorySelection.used_tokens ?? 0}/${memorySelection.token_budget ?? 0} ttl_filtered=${(memorySelection.expired_or_invalid_ids || []).join(",") || "none"} superseded=${(memorySelection.superseded_ids || []).join(",") || "none"} budget_skipped=${(memorySelection.budget_skipped_ids || []).join(",") || "none"}`,
-    `runtime=${runtime.snapshot_id || "-"} workspace=${runtime.workspace_id || "-"} room=${runtime.chat_room_id || "-"} permission=${runtime.permission_profile || "-"}`,
+    `runtime=${runtime.snapshot_id || "-"} workspace=${runtime.workspace_id || "-"} room=${runtime.chat_room_id || "-"} permission=${runtime.permission_profile || "-"} memory_mode=${runtime.memory_mode || memoryWindowMode || "-"}`,
     `runtime_model=${runtime.model || "-"} provider=${runtime.provider || "-"} tools=${runtime.tool_catalog_revision || "-"}`,
     `messages=${messages} history=${response.history_message_count ?? 0} memory_beads=${beads}`,
     `loaded_memory_ids=${memoryIds.join(",") || "none"} history_floor=${response.history_floor_millis ?? "none"}`,

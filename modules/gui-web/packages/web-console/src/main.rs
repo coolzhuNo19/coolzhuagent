@@ -664,6 +664,10 @@ fn app() -> Router {
             post(api_session_consolidate_memory),
         )
         .route(
+            "/api/sessions/{session_id}/memory-mode",
+            patch(api_session_memory_mode),
+        )
+        .route(
             "/api/sessions/{session_id}/context-preview",
             get(api_session_context_preview),
         )
@@ -10583,6 +10587,64 @@ async fn api_session_consolidate_memory(
     };
     let consolidated = consolidate_session_memory(&agent).await;
     Ok(Json(MemoryConsolidateResponse { consolidated }))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateMemoryModeRequest {
+    memory_mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionMemoryModeResponse {
+    session: SessionSummaryDto,
+    memory_mode: String,
+    updated_at: u64,
+}
+
+/// P1-1：更新会话级 memory mode，并让下一次上下文装配获得新的 snapshot 身份。
+async fn api_session_memory_mode(
+    AxumPath(session_id): AxumPath<String>,
+    Json(payload): Json<UpdateMemoryModeRequest>,
+) -> ApiResult<Json<SessionMemoryModeResponse>> {
+    let requested = payload
+        .memory_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if !is_valid_memory_mode(requested) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "memory_mode 必须是 enabled、disabled 或 polluted",
+        ));
+    }
+    let mode = normalize_memory_mode(requested).to_string();
+    let mut store = session_store()
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+    let now = unix_timestamp_millis();
+    {
+        let Some(session) = store
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存在"));
+        };
+        session.updated_at = now;
+    }
+    // 先保存会话更新时间，再写侧表；侧表通过 session_id 与会话保持同一工作区生命周期。
+    store.save()?;
+    set_session_memory_mode_sqlite(&default_session_sqlite_path(), &session_id, &mode)
+        .map_err(sqlite_api_error)?;
+    let Some(session) = store.find_session(&session_id) else {
+        return Err(api_error(StatusCode::NOT_FOUND, "会话不存在"));
+    };
+    Ok(Json(SessionMemoryModeResponse {
+        session: session.summary(store.is_active(&session_id)),
+        memory_mode: mode,
+        updated_at: now,
+    }))
 }
 
 async fn api_session_add_bead(
@@ -24927,8 +24989,9 @@ fn build_context_assembly_with_roster(
     );
     let max_prompt_tokens = options.max_prompt_tokens.max(1);
     let mut truncated = false;
+    let memory_mode = memory_mode_for_session(&agent.id);
     let (mut memory_beads, mut memory_selection) =
-        select_context_memory_beads(agent, current_user_text, &options);
+        select_context_memory_beads(agent, current_user_text, &options, &memory_mode);
     let memory_revision = context_memory_revision(agent);
     let build_system_prompt = |beads: &[MemoryBeadDto]| {
         let mut prompt = build_agent_system_prompt_with_beads(agent, beads);
@@ -25134,6 +25197,7 @@ fn build_context_assembly_with_roster(
         &workspace_id,
         chat_room_id.as_deref(),
         &permission_profile,
+        &memory_mode,
         &tool_catalog_revision,
     );
     let runtime_snapshot = ContextRuntimeSnapshot {
@@ -25145,6 +25209,7 @@ fn build_context_assembly_with_roster(
         provider: agent.provider.clone(),
         tool_catalog_revision,
         memory_revision: memory_revision.clone(),
+        memory_mode: memory_mode.clone(),
         history_floor_millis: options.history_floor_millis,
     };
 
@@ -25173,6 +25238,7 @@ fn build_context_assembly_with_roster(
                 "tool_catalog_revision",
                 runtime_snapshot.tool_catalog_revision.clone(),
             ),
+            ("memory_mode", runtime_snapshot.memory_mode.clone()),
         ],
     );
     ContextAssembly {
@@ -25260,6 +25326,7 @@ fn context_snapshot_id(
     workspace_id: &str,
     chat_room_id: Option<&str>,
     permission_profile: &str,
+    memory_mode: &str,
     tool_catalog_revision: &str,
 ) -> String {
     let history_identity = selected_history
@@ -25270,7 +25337,7 @@ fn context_snapshot_id(
     let input_hash = hash_bytes(current_user_text.as_bytes());
     let prompt_hash = hash_bytes(system_prompt.as_bytes());
     let seed = format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{:016x}|{:016x}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:016x}|{:016x}",
         agent.id,
         memory_revision,
         history_floor_millis.unwrap_or_default(),
@@ -25279,6 +25346,7 @@ fn context_snapshot_id(
         workspace_id,
         chat_room_id.unwrap_or_default(),
         permission_profile,
+        memory_mode,
         tool_catalog_revision,
         prompt_hash,
         input_hash,
@@ -25290,6 +25358,7 @@ fn select_context_memory_beads(
     agent: &AgentSessionDto,
     current_user_text: &str,
     options: &ContextBuildOptions,
+    memory_mode: &str,
 ) -> (Vec<MemoryBeadDto>, ContextMemorySelectionEvidence) {
     let mut recall_span = diagnostics::start_span("memory.recall", "memory");
     diagnostics::info(
@@ -25300,8 +25369,34 @@ fn select_context_memory_beads(
             ("trace", current_turn_trace().unwrap_or_default()),
             ("query", compact_message_snippet(current_user_text, 120)),
             ("limit", options.max_memory_beads.to_string()),
+            ("memory_mode", memory_mode.to_string()),
         ],
     );
+    if memory_mode != DEFAULT_MEMORY_MODE {
+        recall_span.record("outcome", "blocked");
+        diagnostics::info(
+            "memory",
+            "recall.blocked",
+            "会话 memory mode 阻止自动记忆召回",
+            &[
+                ("trace", current_turn_trace().unwrap_or_default()),
+                ("memory_mode", memory_mode.to_string()),
+            ],
+        );
+        return (
+            Vec::new(),
+            ContextMemorySelectionEvidence {
+                strategy: format!("{memory_mode}_blocked"),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                expired_or_invalid_ids: Vec::new(),
+                superseded_ids: Vec::new(),
+                budget_skipped_ids: Vec::new(),
+                used_tokens: 0,
+                token_budget: options.memory_token_budget,
+            },
+        );
+    }
     let query = MemoryBeadQueryOptions {
         q: Some(current_user_text.to_string()),
         layer: None,
@@ -27784,6 +27879,7 @@ struct ContextRuntimeSnapshot {
     provider: String,
     tool_catalog_revision: String,
     memory_revision: String,
+    memory_mode: String,
     history_floor_millis: Option<u64>,
 }
 
@@ -36091,6 +36187,7 @@ fn initialize_session_schema(connection: &Connection) -> rusqlite::Result<()> {
     apply_session_migration_v14(connection)?;
     apply_session_migration_v15(connection)?;
     apply_session_migration_v16(connection)?;
+    apply_session_migration_v17(connection)?;
     Ok(())
 }
 
@@ -36219,6 +36316,72 @@ fn apply_session_migration_v16(connection: &Connection) -> rusqlite::Result<()> 
     // 表本身使用 IF NOT EXISTS，随每次 schema 初始化安全补齐。
     Ok(())
 }
+
+/// Schema v17（P1-1）：会话级 memory mode。关闭或污染态只阻止自动召回，
+/// 不删除已有 bead，便于恢复、审计和后续人工处理。
+fn apply_session_migration_v17(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_settings (
+            session_id TEXT PRIMARY KEY,
+            memory_mode TEXT NOT NULL DEFAULT 'enabled'
+                CHECK (memory_mode IN ('enabled', 'disabled', 'polluted')),
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_settings_mode
+            ON memory_settings(memory_mode, updated_at);
+        "#,
+    )?;
+    Ok(())
+}
+
+const DEFAULT_MEMORY_MODE: &str = "enabled";
+
+fn is_valid_memory_mode(value: Option<&str>) -> bool {
+    matches!(value, Some("enabled") | Some("disabled") | Some("polluted"))
+}
+
+fn normalize_memory_mode(value: Option<&str>) -> &'static str {
+    match value.map(str::trim) {
+        Some("disabled") => "disabled",
+        Some("polluted") => "polluted",
+        _ => DEFAULT_MEMORY_MODE,
+    }
+}
+
+fn memory_mode_for_session(session_id: &str) -> String {
+    let Ok(connection) = open_session_connection(&default_session_sqlite_path()) else {
+        return DEFAULT_MEMORY_MODE.to_string();
+    };
+    let mode = connection
+        .query_row(
+            "SELECT memory_mode FROM memory_settings WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    normalize_memory_mode(mode.as_deref()).to_string()
+}
+
+fn set_session_memory_mode_sqlite(
+    path: &Path,
+    session_id: &str,
+    memory_mode: &str,
+) -> rusqlite::Result<String> {
+    let mode = normalize_memory_mode(Some(memory_mode));
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    connection.execute(
+        "INSERT INTO memory_settings(session_id, memory_mode, updated_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(session_id) DO UPDATE SET memory_mode=excluded.memory_mode, updated_at=excluded.updated_at",
+        params![session_id, mode, u64_to_i64(unix_timestamp_millis())],
+    )?;
+    Ok(mode.to_string())
+}
+
 fn chat_room_permission_profile_sqlite(path: &Path, room_id: &str) -> rusqlite::Result<String> {
     let connection = open_session_connection(path)?;
     initialize_session_schema(&connection)?;
@@ -41223,6 +41386,7 @@ fn save_session_state_to_sqlite(
         "memory_access",
         "memory_meta",
         "memory_edges",
+        "memory_settings",
     ] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE session_id NOT IN (SELECT id FROM sessions)"),
@@ -42771,6 +42935,7 @@ impl PersistedSession {
             endpoint: self.endpoint.clone(),
             reasoning_effort: normalize_reasoning_effort(Some(&self.reasoning_effort)),
             api_key_status: api_key_configuration_status(&self.api_key_ref),
+            memory_mode: memory_mode_for_session(&self.id),
             active,
             updated_at: self.updated_at,
         }
@@ -42977,6 +43142,7 @@ struct SessionSummaryDto {
     endpoint: Option<String>,
     reasoning_effort: String,
     api_key_status: String,
+    memory_mode: String,
     active: bool,
     updated_at: u64,
 }
@@ -52669,6 +52835,26 @@ mod tests {
     }
 
     #[test]
+    fn context_memory_mode_blocks_auto_recall_with_explicit_evidence() {
+        let agent = context_test_agent();
+        let options = super::ContextBuildOptions {
+            memory_token_budget: 80,
+            max_memory_beads: 4,
+            ..Default::default()
+        };
+
+        let (beads, evidence) =
+            super::select_context_memory_beads(&agent, "alpha click target", &options, "disabled");
+
+        assert!(beads.is_empty());
+        assert_eq!(evidence.strategy, "disabled_blocked");
+        assert!(evidence.candidate_ids.is_empty());
+        assert!(evidence.selected_ids.is_empty());
+        assert_eq!(evidence.used_tokens, 0);
+        assert_eq!(evidence.token_budget, 80);
+    }
+
+    #[test]
     fn context_snapshot_id_changes_when_runtime_scope_changes() {
         let agent = context_test_agent();
         let history = vec![persisted_role_message("h1", "user", "history", 1)];
@@ -52683,6 +52869,7 @@ mod tests {
             "workspace-a",
             Some("room-a"),
             "workspace-write",
+            "enabled",
             "tools-a",
         );
         let workspace_changed = super::context_snapshot_id(
@@ -52696,6 +52883,7 @@ mod tests {
             "workspace-b",
             Some("room-a"),
             "workspace-write",
+            "enabled",
             "tools-a",
         );
         let permission_changed = super::context_snapshot_id(
@@ -52709,6 +52897,7 @@ mod tests {
             "workspace-a",
             Some("room-a"),
             "full-access",
+            "enabled",
             "tools-a",
         );
         let tools_changed = super::context_snapshot_id(
@@ -52722,12 +52911,28 @@ mod tests {
             "workspace-a",
             Some("room-a"),
             "workspace-write",
+            "enabled",
             "tools-b",
+        );
+        let memory_mode_changed = super::context_snapshot_id(
+            &agent,
+            "mem-1",
+            None,
+            &["bead-1".to_string()],
+            &history,
+            "system",
+            "input",
+            "workspace-a",
+            Some("room-a"),
+            "workspace-write",
+            "disabled",
+            "tools-a",
         );
 
         assert_ne!(base, workspace_changed);
         assert_ne!(base, permission_changed);
         assert_ne!(base, tools_changed);
+        assert_ne!(base, memory_mode_changed);
     }
 
     #[test]
@@ -64736,6 +64941,10 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("tool_catalog_revision"));
         assert!(WEB_APP_JS.contains("memory_selection"));
         assert!(WEB_APP_JS.contains("budget_skipped"));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-mode\""));
+        assert!(WEB_APP_JS.contains("/memory-mode"));
+        assert!(WEB_APP_JS.contains("memoryWindowUpdateMode"));
+        assert!(WEB_APP_JS.contains("memory_mode"));
         assert!(WEB_APP_JS.contains("loaded_memory_ids"));
         assert!(WEB_APP_JS.contains("memory-bead-pin-toggle"));
         assert!(WEB_APP_JS.contains("memory-bead-edit"));
@@ -68863,6 +69072,7 @@ attach: last_assistant
                 provider: "test".to_string(),
                 tool_catalog_revision: "tools-test".to_string(),
                 memory_revision: "mem-test".to_string(),
+                memory_mode: "enabled".to_string(),
                 history_floor_millis: None,
             },
             history_floor_millis: None,
@@ -68967,6 +69177,7 @@ attach: last_assistant
                 provider: "test".to_string(),
                 tool_catalog_revision: "tools-test".to_string(),
                 memory_revision: "mem-test".to_string(),
+                memory_mode: "enabled".to_string(),
                 history_floor_millis: None,
             },
             history_floor_millis: None,
@@ -69033,6 +69244,7 @@ attach: last_assistant
                 provider: "test".to_string(),
                 tool_catalog_revision: "tools-test".to_string(),
                 memory_revision: "mem-test".to_string(),
+                memory_mode: "enabled".to_string(),
                 history_floor_millis: None,
             },
             history_floor_millis: None,
@@ -69103,6 +69315,7 @@ attach: last_assistant
                 provider: "test".to_string(),
                 tool_catalog_revision: "tools-test".to_string(),
                 memory_revision: "mem-test".to_string(),
+                memory_mode: "enabled".to_string(),
                 history_floor_millis: None,
             },
             history_floor_millis: None,
