@@ -7421,7 +7421,9 @@ async function memoryWindowValidateEvents(button = null) {
       throw new Error("schema / sequence / event_id 校验失败");
     }
     if (status) {
-      status.textContent = `${events.length} events · coolzhu.agent.event.v1 · JSONL 有序`;
+      const toolCalls = events.filter((event) => event.event_type === "tool.call").length;
+      const toolResults = events.filter((event) => event.event_type === "tool.result").length;
+      status.textContent = `${events.length} events · coolzhu.agent.event.v1 · JSONL 有序 · ToolCall ${toolCalls} / ToolResult ${toolResults}`;
     }
     return events;
   } catch (error) {

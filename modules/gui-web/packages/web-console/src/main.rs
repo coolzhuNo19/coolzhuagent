@@ -14886,8 +14886,8 @@ async fn run_goal_phase_once(
     .await;
     let mut tool_messages = Vec::new();
     for (tool_use_id, name, input) in model_response.tool_requests.clone() {
-        tool_messages.push(
-            run_model_tool_use_message(
+        tool_messages.extend(
+            run_model_tool_use_messages(
                 &run_context.agent,
                 &tool_use_id,
                 &name,
@@ -15522,8 +15522,8 @@ async fn api_chat_send(
             });
         }
         for (tool_use_id, name, input) in effective_tool_requests {
-            messages.push(
-                run_model_tool_use_message(
+            messages.extend(
+                run_model_tool_use_messages(
                     agent,
                     &tool_use_id,
                     &name,
@@ -16102,6 +16102,46 @@ async fn api_chat_send_stream(
                         "error_count": dispatch_error_count
                     }),
                 );
+                let stream_turn_key = result
+                    .messages
+                    .first()
+                    .map(|message| message.id.as_str())
+                    .unwrap_or("stream-turn");
+                let persisted_tool_messages = dispatches
+                    .iter()
+                    .flat_map(|dispatch| {
+                        let status = if dispatch.is_error {
+                            "failed"
+                        } else {
+                            "completed"
+                        };
+                        let call_summary = if dispatch.is_error {
+                            format!(
+                                "工具 `{}` 失败：{}",
+                                dispatch.name, dispatch.summary_text
+                            )
+                        } else {
+                            format!(
+                                "工具 `{}` 已完成：{}",
+                                dispatch.name, dispatch.summary_text
+                            )
+                        };
+                        tool_messages_from_summary(
+                            agent,
+                            &dispatch.tool_use_id,
+                            stream_turn_key,
+                            &dispatch.name,
+                            call_summary,
+                            dispatch.tool_result_text.clone(),
+                            status,
+                            &dispatch.route,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for message in persisted_tool_messages {
+                    yield Ok(sse_json_event("message", &message));
+                    messages.push(message);
+                }
                 let tool_result_blocks: Vec<InputContentBlock> = dispatches
                 .into_iter()
                 .map(|dispatch| InputContentBlock::ToolResult {
@@ -16256,6 +16296,46 @@ async fn api_chat_send_stream(
                             })
                             .map(|dispatch| dispatch.summary_text.clone());
                     }
+                    let stream_turn_key = result
+                        .messages
+                        .first()
+                        .map(|message| message.id.as_str())
+                        .unwrap_or("stream-turn");
+                    let persisted_tool_messages = dispatches
+                        .iter()
+                        .flat_map(|dispatch| {
+                            let status = if dispatch.is_error {
+                                "failed"
+                            } else {
+                                "completed"
+                            };
+                            let call_summary = if dispatch.is_error {
+                                format!(
+                                    "工具 `{}` 失败：{}",
+                                    dispatch.name, dispatch.summary_text
+                                )
+                            } else {
+                                format!(
+                                    "工具 `{}` 已完成：{}",
+                                    dispatch.name, dispatch.summary_text
+                                )
+                            };
+                            tool_messages_from_summary(
+                                agent,
+                                &dispatch.tool_use_id,
+                                stream_turn_key,
+                                &dispatch.name,
+                                call_summary,
+                                dispatch.tool_result_text.clone(),
+                                status,
+                                &dispatch.route,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    for message in persisted_tool_messages {
+                        yield Ok(sse_json_event("message", &message));
+                        messages.push(message);
+                    }
                     let mut tr_blocks: Vec<InputContentBlock> = dispatches
                         .into_iter()
                         .map(|d| InputContentBlock::ToolResult {
@@ -16372,7 +16452,7 @@ async fn api_chat_send_stream(
                             "input": tool_input.clone()
                         }),
                     );
-                    let tool_message = run_model_tool_use_message(
+                    let tool_messages = run_model_tool_use_messages(
                         agent,
                         &tool_use_id,
                         &tool_name,
@@ -16381,6 +16461,18 @@ async fn api_chat_send_stream(
                         Some(&result.chat_room_id),
                     )
                     .await;
+                    let tool_message = tool_messages
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| ChatMessageDto {
+                            id: format!("tool-call-{}", unix_timestamp_millis()),
+                            author: "系统工具执行 Agent".to_string(),
+                            role: "assistant".to_string(),
+                            target: agent.display_name.clone(),
+                            content: "工具调用未返回可显示结果".to_string(),
+                            kind: "tool-summary".to_string(),
+                            attachments: Vec::new(),
+                        });
                     yield Ok(sse_json_event("message", &tool_message));
                     emit_active_realtime_session_event(
                         "action_step",
@@ -16394,7 +16486,12 @@ async fn api_chat_send_stream(
                         }),
                     );
                     tool_result_summaries.push(tool_message.content.clone());
-                    messages.push(tool_message);
+                    for message in tool_messages {
+                        if message.id != tool_message.id {
+                            yield Ok(sse_json_event("message", &message));
+                        }
+                        messages.push(message);
+                    }
                 }
             }
             // 同上：纯视觉理解不触发 computer-use 动作，仅视觉动作意图 / 工具意图才执行。
@@ -31051,14 +31148,61 @@ async fn run_tool_intent_message(agent: &AgentSessionDto, prompt: &str) -> Optio
     })
 }
 
-async fn run_model_tool_use_message(
+fn tool_messages_from_summary(
+    agent: &AgentSessionDto,
+    tool_use_id: &str,
+    dispatch_turn_id: &str,
+    name: &str,
+    call_summary: String,
+    result_summary: String,
+    status: &str,
+    route: &str,
+) -> Vec<ChatMessageDto> {
+    let tool_call_id = format!(
+        "tool-call-{:016x}",
+        hash_bytes(
+            format!(
+                "{}\u{1f}{}\u{1f}{}",
+                agent.id, dispatch_turn_id, tool_use_id
+            )
+            .as_bytes(),
+        )
+    );
+    let result_id = tool_call_id.replacen("tool-call-", "tool-result-", 1);
+    let result_content = format!(
+        "tool_call_id: {tool_call_id}\ntool_name: {name}\nroute: {route}\nstatus: {status}\nsummary: {}",
+        compact_message_snippet(&result_summary, 1200)
+    );
+    vec![
+        ChatMessageDto {
+            id: tool_call_id,
+            author: "系统工具执行 Agent".to_string(),
+            role: "assistant".to_string(),
+            target: agent.display_name.clone(),
+            content: call_summary,
+            kind: "tool-summary".to_string(),
+            attachments: Vec::new(),
+        },
+        ChatMessageDto {
+            id: result_id,
+            author: "工具结果".to_string(),
+            role: "assistant".to_string(),
+            target: agent.display_name.clone(),
+            content: result_content,
+            kind: "tool-result".to_string(),
+            attachments: Vec::new(),
+        },
+    ]
+}
+
+async fn run_model_tool_use_messages(
     agent: &AgentSessionDto,
     tool_use_id: &str,
     name: &str,
     input: &JsonValue,
     turn_id: Option<&str>,
     chat_room_id: Option<&str>,
-) -> ChatMessageDto {
+) -> Vec<ChatMessageDto> {
     diag!(
         "[TOOL-CHAIN] run_model_tool_use_message: agent={}, tool={name}, tool_use_id={tool_use_id}, input={input}",
         agent.name
@@ -31092,7 +31236,7 @@ async fn run_model_tool_use_message(
         chat_room_id,
     )
     .await;
-    let content = match response {
+    let (content, result_content, result_status, result_route) = match response {
         Ok(dispatch) => {
             diagnostics::info(
                 "tool",
@@ -31104,7 +31248,17 @@ async fn run_model_tool_use_message(
                     ("latency_ms", tool_started.elapsed().as_millis().to_string()),
                 ],
             );
-            dispatch_plan_chat_summary(&dispatch)
+            let summary = dispatch_plan_chat_summary(&dispatch);
+            let result_text = dispatch
+                .tool_result_text
+                .clone()
+                .unwrap_or_else(|| dispatch_plan_detail(&dispatch));
+            (
+                summary,
+                compact_message_snippet(&result_text, 1200),
+                dispatch.status,
+                dispatch.route,
+            )
         }
         Err(error) => {
             let detail = error.1.error.to_string();
@@ -31120,19 +31274,25 @@ async fn run_model_tool_use_message(
                     ("latency_ms", tool_started.elapsed().as_millis().to_string()),
                 ],
             );
-            format!("工具 `{name}` 调用失败：{detail}")
+            (
+                format!("工具 `{name}` 调用失败：{detail}"),
+                compact_message_snippet(&detail, 1200),
+                "failed".to_string(),
+                "runtime-failed".to_string(),
+            )
         }
     };
 
-    ChatMessageDto {
-        id: format!("msg-{}-model-tool", unix_timestamp_millis()),
-        author: "系统工具执行 Agent".to_string(),
-        role: "assistant".to_string(),
-        target: agent.display_name.clone(),
+    tool_messages_from_summary(
+        agent,
+        tool_use_id,
+        &dispatch_turn_id,
+        name,
         content,
-        kind: "tool-summary".to_string(),
-        attachments: Vec::new(),
-    }
+        result_content,
+        &result_status,
+        &result_route,
+    )
 }
 
 async fn run_model_tool_dispatch(name: &str, input: &JsonValue) -> ApiResult<ToolDispatchResponse> {
@@ -44396,6 +44556,15 @@ struct SessionHistoryItemDto {
     attachments: Vec<ChatAttachmentDto>,
     message_count: Option<usize>,
     token_count: Option<u32>,
+    /// ToolCall/ToolResult 的可重放元数据；普通消息和 compaction 不填充。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_route: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44452,6 +44621,29 @@ fn agent_event_id(
     format!("event-{:016x}", hash_bytes(key.as_bytes()))
 }
 
+fn session_history_item_event_type(item: &SessionHistoryItemDto) -> &'static str {
+    match item.kind.as_str() {
+        "tool_call" => "tool.call",
+        "tool_result" => "tool.result",
+        _ => "item.completed",
+    }
+}
+
+fn session_history_item_event_payload(item: &SessionHistoryItemDto) -> JsonValue {
+    match item.kind.as_str() {
+        "tool_call" | "tool_result" => json!({
+            "item": item,
+            "tool_call": {
+                "id": item.tool_call_id.as_deref(),
+                "name": item.tool_name.as_deref(),
+                "status": item.tool_status.as_deref(),
+                "route": item.tool_route.as_deref(),
+            },
+        }),
+        _ => json!(item),
+    }
+}
+
 fn session_agent_events_jsonl(history: &SessionHistoryResponse) -> String {
     let thread_id = history.session.id.clone();
     let mut lines = Vec::new();
@@ -44500,12 +44692,13 @@ fn session_agent_events_jsonl(history: &SessionHistoryResponse) -> String {
             json!(turn),
         );
         for item in history.items.iter().filter(|item| item.turn_id == turn.id) {
+            let event_type = session_history_item_event_type(item);
             push_event(
-                "item.completed",
+                event_type,
                 Some(&turn.id),
                 Some(&item.id),
                 item.created_at,
-                json!(item),
+                session_history_item_event_payload(item),
             );
         }
         push_event(
@@ -44562,16 +44755,72 @@ fn history_message_item_kind(message: &PersistedChatMessage) -> String {
     if role == "user" {
         return "user_message".to_string();
     }
-    if role == "tool" {
+    let kind = message.kind.trim().to_ascii_lowercase();
+    if role == "tool" || matches!(kind.as_str(), "tool-result" | "tool_result") {
         return "tool_result".to_string();
     }
     if role == "system" {
         return "system".to_string();
     }
-    if message.kind.to_ascii_lowercase().contains("tool") {
+    if kind.contains("tool") {
         return "tool_call".to_string();
     }
     "assistant_message".to_string()
+}
+
+/// 从已有的聊天室工具摘要中提取不含原始参数的稳定工具元数据。
+///
+/// 旧会话只持久化了可读摘要，没有独立 ToolCall 表，因此这里兼容
+/// `tool_name:/route:/status:` 行和 `工具 \`name\`` 摘要格式；参数正文
+/// 不回填到 history/event，避免把潜在凭据重新暴露给回放消费者。
+fn history_tool_metadata(
+    message: &PersistedChatMessage,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let kind = message.kind.trim().to_ascii_lowercase();
+    let role = message.role.trim().to_ascii_lowercase();
+    if role != "tool" && !kind.contains("tool") {
+        return (None, None, None, None);
+    }
+    let line_value = |prefix: &str| {
+        message
+            .content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(prefix).map(str::trim))
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let tool_name = line_value("tool_name:").or_else(|| {
+        let marker = "工具 `";
+        let start = message.content.find(marker)? + marker.len();
+        let rest = &message.content[start..];
+        let end = rest.find('`')?;
+        let value = rest[..end].trim();
+        (!value.is_empty()).then(|| value.to_string())
+    });
+    let route = line_value("route:");
+    let status = line_value("status:").or_else(|| {
+        let lower = message.content.to_ascii_lowercase();
+        if lower.contains("失败") || lower.contains("failed") {
+            Some("failed".to_string())
+        } else if lower.contains("超时") || lower.contains("timeout") {
+            Some("timeout".to_string())
+        } else if lower.contains("拒绝") || lower.contains("rejected") {
+            Some("rejected".to_string())
+        } else if lower.contains("预览") || lower.contains("dry-run") {
+            Some("dry-run".to_string())
+        } else {
+            Some("completed".to_string())
+        }
+    });
+    // provider tool id 只有新写入的结构化摘要才会提供；旧消息退回 item id，
+    // 这样跨页仍有可关联的稳定键，但不会伪造模型侧 provider id。
+    let call_id = line_value("tool_call_id:").or_else(|| Some(message.id.clone()));
+    (call_id, tool_name, status, route)
 }
 
 fn history_turn_id(session_id: &str, cursor: &str) -> String {
@@ -44616,19 +44865,27 @@ fn session_history_response(
         let turn_id = history_turn_id(&session.id, &first.id);
         let items = session.messages[start..end]
             .iter()
-            .map(|message| SessionHistoryItemDto {
-                id: message.id.clone(),
-                turn_id: turn_id.clone(),
-                kind: history_message_item_kind(message),
-                role: message.role.clone(),
-                author: message.author.clone(),
-                target: message.target.clone(),
-                content: message.content.clone(),
-                source: "session_messages".to_string(),
-                created_at: message.created_at,
-                attachments: message.attachments.clone(),
-                message_count: None,
-                token_count: Some(estimate_message_tokens(message)),
+            .map(|message| {
+                let (tool_call_id, tool_name, tool_status, tool_route) =
+                    history_tool_metadata(message);
+                SessionHistoryItemDto {
+                    id: message.id.clone(),
+                    turn_id: turn_id.clone(),
+                    kind: history_message_item_kind(message),
+                    role: message.role.clone(),
+                    author: message.author.clone(),
+                    target: message.target.clone(),
+                    content: message.content.clone(),
+                    source: "session_messages".to_string(),
+                    created_at: message.created_at,
+                    attachments: message.attachments.clone(),
+                    message_count: None,
+                    token_count: Some(estimate_message_tokens(message)),
+                    tool_call_id,
+                    tool_name,
+                    tool_status,
+                    tool_route,
+                }
             })
             .collect::<Vec<_>>();
         bundles.push(SessionHistoryTurnBundle {
@@ -44668,6 +44925,10 @@ fn session_history_response(
             attachments: Vec::new(),
             message_count: None,
             token_count: bead.token_count,
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_route: None,
         };
         bundles.push(SessionHistoryTurnBundle {
             turn: SessionHistoryTurnDto {
@@ -61172,6 +61433,68 @@ attach: last_assistant
     }
 
     #[test]
+    fn session_agent_events_preserve_tool_call_and_result_contract() {
+        let mut session = super::seed_session();
+        session.id = "tool-events-test".to_string();
+        session.messages = vec![
+            persisted_role_message("u1", "user", "读取配置", 10),
+            super::PersistedChatMessage {
+                id: "call-item-1".to_string(),
+                author: "系统工具执行 Agent".to_string(),
+                role: "assistant".to_string(),
+                target: "mario-demo".to_string(),
+                content: "tool_name: read_file\nroute: runtime-executed\nstatus: ok".to_string(),
+                kind: "tool-summary".to_string(),
+                attachments: Vec::new(),
+                created_at: 20,
+            },
+            super::PersistedChatMessage {
+                id: "result-item-1".to_string(),
+                author: "工具审批执行".to_string(),
+                role: "assistant".to_string(),
+                target: "mario-demo".to_string(),
+                content: "tool_call_id: call-1\ntool_name: read_file\nroute: runtime-executed\nstatus: ok\n结果: 已读取".to_string(),
+                kind: "tool-result".to_string(),
+                attachments: Vec::new(),
+                created_at: 30,
+            },
+        ];
+        let history = super::session_history_response(
+            &session,
+            true,
+            super::SessionHistoryQuery {
+                limit: Some(20),
+                before: None,
+            },
+        );
+        assert_eq!(
+            history
+                .items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user_message", "tool_call", "tool_result"]
+        );
+        let jsonl = super::session_agent_events_jsonl(&history);
+        let events = jsonl
+            .lines()
+            .map(|line| serde_json::from_str::<super::JsonValue>(line).expect("valid JSONL"))
+            .collect::<Vec<_>>();
+        let call = events
+            .iter()
+            .find(|event| event["event_type"] == "tool.call")
+            .expect("tool.call");
+        assert_eq!(call["payload"]["tool_call"]["name"], "read_file");
+        assert_eq!(call["payload"]["tool_call"]["status"], "ok");
+        let result = events
+            .iter()
+            .find(|event| event["event_type"] == "tool.result")
+            .expect("tool.result");
+        assert_eq!(result["payload"]["tool_call"]["id"], "call-1");
+        assert_eq!(result["payload"]["item"]["kind"], "tool_result");
+    }
+
+    #[test]
     fn local_active_mode_maps_running_services() {
         assert_eq!(super::local_active_mode(true, false), "chat");
         assert_eq!(super::local_active_mode(false, true), "vision");
@@ -66363,6 +66686,8 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("/events?limit=6"));
         assert!(WEB_APP_JS.contains("function memoryWindowValidateEvents"));
         assert!(WEB_APP_JS.contains("coolzhu.agent.event.v1"));
+        assert!(WEB_APP_JS.contains("event.event_type === \"tool.call\""));
+        assert!(WEB_APP_JS.contains("event.event_type === \"tool.result\""));
         assert!(WEB_APP_JS.contains("memoryWindowStartJob"));
         assert!(WEB_APP_JS.contains("memoryWindowRenderJobs"));
         assert!(WEB_APP_JS.contains("memoryWindowRenderHistory"));
