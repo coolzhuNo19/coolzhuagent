@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 $workspace = Split-Path -Parent $PSScriptRoot
 $tmpRoot = Join-Path $workspace 'tmp\tests\clawbot-ilink-provider-file'

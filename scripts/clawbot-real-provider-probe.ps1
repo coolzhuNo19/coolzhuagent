@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$ProviderUrl,
   [string]$ProviderToken,
   [string]$AccountId,

@@ -79,4 +79,19 @@ if ([string]$userGuide.target -ne 'docs/user-guide') {
     throw "unexpected user guide target: $($userGuide.target)"
 }
 
+if ($resourceIds -notcontains 'documentation.command-line') {
+    throw 'package manifest must include documentation.command-line resource'
+}
+
+$commandLineGuide = @($manifest.resources | Where-Object { $_.id -eq 'documentation.command-line' })[0]
+if ([string]$commandLineGuide.source -ne 'docs/command-line.md') {
+    throw "unexpected command-line guide source: $($commandLineGuide.source)"
+}
+if ([string]$commandLineGuide.target -ne 'docs/command-line.md') {
+    throw "unexpected command-line guide target: $($commandLineGuide.target)"
+}
+if (-not (Test-Path -LiteralPath (Join-Path $workspace ([string]$commandLineGuide.source)) -PathType Leaf)) {
+    throw 'command-line guide source file is missing'
+}
+
 Write-Output 'PASS package-manifest'

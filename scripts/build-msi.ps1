@@ -19,6 +19,7 @@ $packageRootCandidate = if ([System.IO.Path]::IsPathRooted($PackageRoot)) {
 $packageRoot = [System.IO.Path]::GetFullPath($packageRootCandidate).TrimEnd('\', '/')
 $productWxs = Join-Path $workspace 'installer\Product.wxs'
 $installerIcon = Join-Path $workspace 'docs\design-assets\coolzhu-icons-2026-08-12\coolzhu-installer-icon.ico'
+$applicationIcon = Join-Path $workspace 'docs\design-assets\coolzhu-icons-2026-08-12\coolzhu-application-icon.ico'
 $distDir = Join-Path $workspace 'dist'
 $localDotnetExe = Join-Path $workspace 'tmp\tools\dotnet\dotnet.exe'
 $wixToolDir = Join-Path $workspace 'tmp\tools\wix'
@@ -40,25 +41,142 @@ function ConvertTo-WorkspaceRelativePath {
     return $fullPath.Substring($workspacePrefix.Length).Replace('\', '/')
 }
 
+function Get-ReleaseSourceCommit {
+    $gitOutput = @(& git -C $workspace rev-parse --verify HEAD 2>&1)
+    $gitExitCode = $LASTEXITCODE
+    if ($gitExitCode -ne 0) {
+        throw "git rev-parse HEAD failed with exit code ${gitExitCode}: $($gitOutput -join ' ')"
+    }
+    $commit = ([string]($gitOutput | Select-Object -First 1)).Trim()
+    if ($commit -notmatch '^[0-9a-fA-F]{40}$') {
+        throw "git rev-parse HEAD returned an invalid commit: $commit"
+    }
+    return $commit.ToLowerInvariant()
+}
+
+function Get-ReleaseBuildTarget {
+    $configuredTarget = [Environment]::GetEnvironmentVariable('CARGO_BUILD_TARGET', 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($configuredTarget)) {
+        $target = $configuredTarget.Trim()
+    } else {
+        $cargoVersionOutput = @(& cargo -vV 2>&1)
+        $cargoExitCode = $LASTEXITCODE
+        if ($cargoExitCode -ne 0) {
+            throw "cargo -vV failed with exit code ${cargoExitCode}: $($cargoVersionOutput -join ' ')"
+        }
+        $hostTargets = @(
+            foreach ($line in $cargoVersionOutput) {
+                $match = [regex]::Match([string]$line, '^host:\s*(\S+)\s*$')
+                if ($match.Success) {
+                    $match.Groups[1].Value
+                }
+            }
+        )
+        if ($hostTargets.Count -ne 1) {
+            throw 'cargo -vV did not report exactly one host target'
+        }
+        $target = [string]$hostTargets[0]
+    }
+    if ($target -notmatch '^[A-Za-z0-9_.-]+$') {
+        throw "invalid Cargo build target: $target"
+    }
+    return $target
+}
+
+function Assert-StagedCliVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$CliPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedVersion
+    )
+
+    if (-not (Test-Path -LiteralPath $CliPath -PathType Leaf)) {
+        throw "staged CLI missing: $CliPath"
+    }
+    $versionOutput = @(& $CliPath --version 2>&1)
+    $versionExitCode = $LASTEXITCODE
+    if ($versionExitCode -ne 0) {
+        throw "staged CLI --version failed with exit code $versionExitCode"
+    }
+    $reportedVersions = @(
+        foreach ($line in $versionOutput) {
+            $match = [regex]::Match([string]$line, '^\s*Version\s+(\d+\.\d+\.\d+)\s*$')
+            if ($match.Success) {
+                $match.Groups[1].Value
+            }
+        }
+    )
+    if ($reportedVersions.Count -ne 1) {
+        throw 'staged CLI --version did not report exactly one three-part Version field'
+    }
+    $reportedVersion = [string]$reportedVersions[0]
+    if (-not [string]::Equals($reportedVersion, $ExpectedVersion, [System.StringComparison]::Ordinal)) {
+        throw "staged CLI version mismatch: MSI requests $ExpectedVersion but CLI reports $reportedVersion"
+    }
+    return $reportedVersion
+}
+
+function Invoke-WithReleaseBuildEnvironment {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Environment,
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Action
+    )
+
+    $environmentNames = @($Environment.Keys | ForEach-Object { [string]$_ })
+    $previousEnvironment = @{}
+    foreach ($name in $environmentNames) {
+        $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+    try {
+        foreach ($entry in $Environment.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value, 'Process')
+        }
+        & $Action
+    } finally {
+        foreach ($name in $environmentNames) {
+            [Environment]::SetEnvironmentVariable(
+                $name,
+                $previousEnvironment[$name],
+                'Process'
+            )
+        }
+    }
+}
+
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "MSI Version must be three-part numeric SemVer, got: $Version"
 }
 
 if (-not $SkipPackageBuild) {
-    & (Join-Path $workspace 'scripts\package-all.ps1') `
-        -Configuration $Configuration `
-        -PackageRoot $packageRoot
+    $releaseBuildEnvironment = [ordered]@{
+        COOLZHU_RELEASE_VERSION = $Version
+        COOLZHU_BUILD_DATE = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
+        COOLZHU_GIT_SHA = Get-ReleaseSourceCommit
+        COOLZHU_BUILD_TARGET = Get-ReleaseBuildTarget
+    }
+    Invoke-WithReleaseBuildEnvironment -Environment $releaseBuildEnvironment -Action {
+        & (Join-Path $workspace 'scripts\package-all.ps1') `
+            -Configuration $Configuration `
+            -PackageRoot $packageRoot
+    }
 }
 
 if (-not (Test-Path -LiteralPath (Join-Path $packageRoot 'COOLZHU-AGENT.exe'))) {
     throw "Package launcher missing: $(Join-Path $packageRoot 'COOLZHU-AGENT.exe')"
 }
+$stagedCliVersion = Assert-StagedCliVersion `
+    -CliPath (Join-Path $packageRoot 'bin\coolzhu-cli.exe') `
+    -ExpectedVersion $Version
 
 if (-not (Test-Path -LiteralPath $productWxs)) {
     throw "WiX product file missing: $productWxs"
 }
 if (-not (Test-Path -LiteralPath $installerIcon -PathType Leaf)) {
     throw "Installer icon missing: $installerIcon"
+}
+if (-not (Test-Path -LiteralPath $applicationIcon -PathType Leaf)) {
+    throw "Application icon missing: $applicationIcon"
 }
 
 $packageSafetyReport = Join-Path $distDir "CoolzhuAgent-$Version-package-safety.json"
@@ -114,6 +232,7 @@ $wixBuildArgs = @(
     '-d', "Version=$Version",
     '-d', "PackageRoot=$packageRoot",
     '-d', "InstallerIcon=$installerIcon",
+    '-d', "ApplicationIcon=$applicationIcon",
     '-out', $stagingMsi
 )
 if ($useLocalDotnetForWix) {
@@ -144,6 +263,7 @@ $packageSafetyReportRelative = ConvertTo-WorkspaceRelativePath $packageSafetyRep
 $installerReport = [ordered]@{
     generated_at = (Get-Date).ToUniversalTime().ToString('o')
     version = $Version
+    cli_version = $stagedCliVersion
     configuration = $Configuration
     msi = $publishedMsiRelative
     sha256 = $msiHash

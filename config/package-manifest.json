@@ -161,6 +161,11 @@
       "id": "documentation.user-guide",
       "source": "docs/user-guide",
       "target": "docs/user-guide"
+    },
+    {
+      "id": "documentation.command-line",
+      "source": "docs/command-line.md",
+      "target": "docs/command-line.md"
     }
   ]
 }

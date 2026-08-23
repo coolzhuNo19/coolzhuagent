@@ -94,12 +94,12 @@ use tracing::{error, info, instrument, warn};
 use tracing_subscriber::EnvFilter;
 use vision::{
     apply_grounding_confidence_policy, build_showui_grounding_request,
-    default_local_vision_base_url, default_local_vision_model, local_vlm_resource_launcher_hint,
-    parse_detection_elements, parse_grounding_result, parse_relative_point, relative_bbox_to_pixel,
-    relative_point_to_pixel, DetectionBackend, DetectionElementKind, DetectionRequest,
-    HttpDetectionBackend, LocalOpenAiVisionBackend, VisionBackend, VisionBackendKind,
-    VisionImageSource, VisionRequest, VisionResponse, VisionToolCapability,
-    VisionToolCapabilityStatus, VisionToolService,
+    default_local_vision_base_url, default_local_vision_model, local_vlm_health_url,
+    local_vlm_resource_launcher_hint, parse_detection_elements, parse_grounding_result,
+    parse_relative_point, relative_bbox_to_pixel, relative_point_to_pixel, DetectionBackend,
+    DetectionElementKind, DetectionRequest, HttpDetectionBackend, LocalOpenAiVisionBackend,
+    VisionBackend, VisionBackendKind, VisionImageSource, VisionRequest, VisionResponse,
+    VisionToolCapability, VisionToolCapabilityStatus, VisionToolService,
 };
 
 #[cfg(windows)]
@@ -538,7 +538,7 @@ fn current_showui_pid() -> Option<u32> {
         .and_then(|process| process.as_ref().map(std::process::Child::id))
 }
 
-/// 桌宠退出是否联动关闭 web-console（进程联动风险项，默认 false）。
+/// 桌宠退出是否联动关闭 web-console（默认开启；显式配置 false 才保留控制台）。
 fn pet_exit_closes_console_enabled() -> bool {
     read_config(|config| config.pet.pet_exit_closes_console)
 }
@@ -5282,8 +5282,8 @@ struct ConfigPet {
     enabled: bool,
     #[serde(default)]
     exe_path: Option<String>,
-    /// 桌宠退出时是否联动关闭 web-console（默认 false）。开启后桌宠退出会带动控制台优雅退出。
-    #[serde(default)]
+    /// 桌宠退出时是否联动关闭 web-console（默认 true）。显式设为 false 才保留控制台。
+    #[serde(default = "default_true")]
     pet_exit_closes_console: bool,
 }
 
@@ -5611,7 +5611,7 @@ impl Default for ConfigPet {
         Self {
             enabled: default_true(),
             exe_path: None,
-            pet_exit_closes_console: false,
+            pet_exit_closes_console: true,
         }
     }
 }
@@ -16207,11 +16207,87 @@ async fn api_diagnostics_health() -> Json<DiagnosticsHealthResponse> {
     Json(build_diagnostics_health().await)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProviderReadinessCounts {
+    total: usize,
+    ready: usize,
+    warn: usize,
+    error: usize,
+}
+
+fn provider_readiness_counts<'a>(
+    statuses: impl IntoIterator<Item = &'a str>,
+) -> ProviderReadinessCounts {
+    let mut counts = ProviderReadinessCounts::default();
+    for status in statuses {
+        counts.total += 1;
+        match status {
+            "ok" => counts.ready += 1,
+            "warn" => counts.warn += 1,
+            "error" => counts.error += 1,
+            _ => counts.warn += 1,
+        }
+    }
+    counts
+}
+
+fn functional_config_check_for(
+    real_llm_enabled: bool,
+    llm_tools_enabled: bool,
+    semantic_memory_enabled: bool,
+    computer_use_enabled: bool,
+    providers: ProviderReadinessCounts,
+) -> DiagnosticsCheck {
+    let model_capabilities_ok = real_llm_enabled && llm_tools_enabled && computer_use_enabled;
+    let provider_session_ready = providers.ready > 0;
+    let status = if model_capabilities_ok && provider_session_ready {
+        "ok"
+    } else {
+        "warn"
+    };
+    let fix_hint = if !model_capabilities_ok {
+        Some("开启 [model] enable_real_llm/enable_llm_tools 与 [computer_use] enabled")
+    } else if real_llm_enabled && !provider_session_ready {
+        Some("检查可选择会话的 provider/model/base_url 与会话凭据配置")
+    } else {
+        None
+    };
+
+    diagnostics_check(
+        "functional.config",
+        "默认能力配置",
+        status,
+        &format!(
+            "real_llm={real_llm_enabled} llm_tools={llm_tools_enabled} semantic_memory={semantic_memory_enabled} computer_use={computer_use_enabled}；会话 provider={}/{} ready（{} warn，{} error；仅展示就绪计数）",
+            providers.ready, providers.total, providers.warn, providers.error
+        ),
+        fix_hint,
+    )
+}
+
 /// 只读常用功能自检：验证本地链路与配置，不调用真实模型、麦克风或桌面输入。
 async fn api_diagnostics_functional() -> Json<FunctionalDiagnosticsResponse> {
     let workspace = active_workspace_path();
     let config = load_workspace_config_at(&workspace);
     let mut checks = Vec::new();
+    let provider_health = default_agent_sessions()
+        .into_iter()
+        .filter(|agent| agent.selectable && agent.enabled)
+        .map(|agent| agent_health(&agent))
+        .collect::<Vec<_>>();
+    let provider_readiness = provider_readiness_counts(
+        provider_health
+            .iter()
+            .map(|agent| agent.provider_status.as_str()),
+    );
+    checks.push(functional_config_check_for(
+        config.model.enable_real_llm,
+        config.model.enable_llm_tools,
+        config.model.enable_semantic_memory,
+        config.computer_use.enabled,
+        provider_readiness,
+    ));
+
     let mut add = |id: &str, label: &str, status: &str, detail: String, fix_hint: Option<&str>| {
         checks.push(DiagnosticsCheck {
             id: id.to_string(),
@@ -16221,35 +16297,6 @@ async fn api_diagnostics_functional() -> Json<FunctionalDiagnosticsResponse> {
             fix_hint: fix_hint.map(str::to_string),
         });
     };
-
-    let model_capabilities_ok = config.model.enable_real_llm
-        && config.model.enable_llm_tools
-        && config.computer_use.enabled;
-    let provider_credential_ready = default_agent_sessions().iter().any(|agent| {
-        agent.api_key_status.contains("present") || agent.api_key_status.contains("optional")
-    });
-    let config_status = if !model_capabilities_ok {
-        "warn"
-    } else if config.model.enable_real_llm && !provider_credential_ready {
-        "warn"
-    } else {
-        "ok"
-    };
-    let config_detail = format!(
-        "real_llm={} llm_tools={} semantic_memory={} computer_use={}；凭据={}（聊天室能力可单独收紧）",
-        config.model.enable_real_llm,
-        config.model.enable_llm_tools,
-        config.model.enable_semantic_memory,
-        config.computer_use.enabled,
-        if provider_credential_ready { "已发现" } else { "未配置，需在会话/provider 中配置" },
-    );
-    add(
-        "functional.config",
-        "默认能力配置",
-        config_status,
-        config_detail,
-        Some("开启 [model] enable_real_llm/enable_llm_tools 与 [computer_use] enabled；凭据请在会话/provider 配置"),
-    );
     let workspace_status = if workspace.is_dir() { "ok" } else { "error" };
     add(
         "functional.workspace",
@@ -17583,6 +17630,7 @@ async fn run_tool_dry_run(tool_id: &str, input: JsonValue) -> ApiResult<Json<Too
                 model: input_string(&input, "model"),
                 api_key: input_string(&input, "api_key"),
                 timeout_seconds: input_u64(&input, "timeout_seconds"),
+                readiness_verified: false,
             };
             let response = run_vision_find_target(request).await?;
             json!(response)
@@ -18434,6 +18482,31 @@ async fn local_vlm_locate_attempt(
         .clone()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(authoritative_local_vision_model);
+    let api_key = authoritative_local_vision_api_key();
+    let health_url = local_vlm_health_url(&base_url);
+    let models_url = local_vlm_models_url(&base_url);
+    let model_path = configured_local_vlm_model_path(&model);
+    let readiness_started = std::time::Instant::now();
+    let readiness = probe_local_vlm_readiness(
+        true,
+        &health_url,
+        &models_url,
+        &model,
+        &model_path,
+        api_key.as_deref(),
+    )
+    .await;
+    if let Some(attempt) = local_vlm_unready_attempt(
+        &readiness,
+        &base_url,
+        &model,
+        &health_url,
+        &models_url,
+        &model_path,
+        readiness_started.elapsed().as_millis() as u64,
+    ) {
+        return attempt;
+    }
     let timeout_seconds = config.local_vlm.timeout_seconds.clamp(5, 180);
     let sample_count = config.local_vlm.sample_count.clamp(1, 5);
     let threshold = min_confidence.max(config.local_vlm.confidence_floor.clamp(0.0, 1.0));
@@ -18458,8 +18531,9 @@ async fn local_vlm_locate_attempt(
             capture_path: Some(capture_path.display().to_string()),
             model: Some(model.clone()),
             base_url: Some(base_url.clone()),
-            api_key: authoritative_local_vision_api_key(),
+            api_key: api_key.clone(),
             timeout_seconds: Some(timeout_seconds),
+            readiness_verified: true,
         })
         .await
         {
@@ -18601,6 +18675,8 @@ async fn remote_vlm_locate_attempt(
         base_url: Some(base_url.clone()),
         api_key,
         timeout_seconds: Some(config.timeout_ms.saturating_div(1000).clamp(5, 180)),
+        // remote_vlm 有独立 Provider 配置，不应套用本地模型目录门禁。
+        readiness_verified: true,
     })
     .await
     {
@@ -18663,16 +18739,471 @@ async fn remote_vlm_locate_attempt(
     }
 }
 
+fn configured_local_vlm_install_root() -> PathBuf {
+    config_local_vlm_root()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("COOLZHU_LOCAL_VLM_ROOT")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        // 与 resources/local-vlm/start-local-vlm.ps1 的默认安装根保持一致。
+        .or_else(|| user_home_dir().map(|home| home.join(".claw").join("local-vlm")))
+        .unwrap_or_else(|| env::temp_dir().join("coolzhu-local-vlm"))
+}
+
+fn local_vlm_model_directory_name(model: &str) -> &str {
+    let model = model.trim();
+    // API model id 与资源包目录名不同；保持与打包/迁移文档中的真实目录一致。
+    if model.eq_ignore_ascii_case("qwen2.5-vl-3b") {
+        "Qwen2.5-VL-3B-Instruct"
+    } else {
+        model
+    }
+}
+
+fn configured_local_vlm_model_path(model: &str) -> PathBuf {
+    configured_local_vlm_install_root()
+        .join("models")
+        .join(local_vlm_model_directory_name(model))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalVlmReadiness {
+    health_reachable: bool,
+    model_path_required: bool,
+    model_path_exists: bool,
+    models_reachable: bool,
+    model_catalog_valid: bool,
+    configured_model_available: bool,
+    status: &'static str,
+    ready: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalVlmModelsProbe {
+    reachable: bool,
+    catalog_valid: bool,
+    configured_model_available: bool,
+}
+
+fn local_vlm_readiness_status(
+    enabled: bool,
+    health_required: bool,
+    health_reachable: bool,
+    model_path_required: bool,
+    model_path_exists: bool,
+    models_reachable: bool,
+    model_catalog_valid: bool,
+    configured_model_available: bool,
+) -> (&'static str, bool) {
+    if !enabled {
+        return ("disabled", false);
+    }
+    if model_path_required && !model_path_exists {
+        return if health_reachable {
+            ("model_missing", false)
+        } else {
+            ("service_unavailable_and_model_missing", false)
+        };
+    }
+    if health_required && !health_reachable {
+        return ("service_unavailable", false);
+    }
+    if !models_reachable {
+        return ("model_catalog_unavailable", false);
+    }
+    if !model_catalog_valid {
+        return ("model_catalog_invalid", false);
+    }
+    if !configured_model_available {
+        return ("configured_model_unavailable", false);
+    }
+    ("ready", true)
+}
+
+fn local_vlm_readiness(
+    enabled: bool,
+    health_required: bool,
+    health_reachable: bool,
+    model_path_required: bool,
+    model_path_exists: bool,
+    models_probe: LocalVlmModelsProbe,
+) -> LocalVlmReadiness {
+    let (status, ready) = local_vlm_readiness_status(
+        enabled,
+        health_required,
+        health_reachable,
+        model_path_required,
+        model_path_exists,
+        models_probe.reachable,
+        models_probe.catalog_valid,
+        models_probe.configured_model_available,
+    );
+    LocalVlmReadiness {
+        health_reachable,
+        model_path_required,
+        model_path_exists,
+        models_reachable: models_probe.reachable,
+        model_catalog_valid: models_probe.catalog_valid,
+        configured_model_available: models_probe.configured_model_available,
+        status,
+        ready,
+    }
+}
+
+fn local_vlm_models_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/models") {
+        return trimmed.to_string();
+    }
+    if let Some(service_base) = trimmed.strip_suffix("/chat/completions") {
+        return format!("{service_base}/models");
+    }
+    if trimmed.ends_with("/v1") {
+        format!("{trimmed}/models")
+    } else {
+        format!("{trimmed}/v1/models")
+    }
+}
+
+fn canonical_local_vlm_model_id(model: &str) -> String {
+    let normalized = model.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "qwen2.5-vl-3b" | "qwen2.5-vl-3b-instruct" => "qwen2.5-vl-3b".to_string(),
+        _ => normalized,
+    }
+}
+
+fn local_vlm_model_ids_match(configured: &str, advertised: &str) -> bool {
+    canonical_local_vlm_model_id(configured) == canonical_local_vlm_model_id(advertised)
+}
+
+fn local_vlm_model_catalog_ids(payload: &JsonValue) -> Option<Vec<&str>> {
+    let entries = if let Some(entries) = payload.as_array() {
+        entries
+    } else {
+        payload
+            .get("data")
+            .or_else(|| payload.get("models"))?
+            .as_array()?
+    };
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| {
+                entry.as_str().or_else(|| {
+                    entry
+                        .get("id")
+                        .or_else(|| entry.get("model"))
+                        .and_then(JsonValue::as_str)
+                })
+            })
+            .collect(),
+    )
+}
+
+async fn probe_local_vlm_models(
+    models_url: &str,
+    configured_model: &str,
+    api_key: Option<&str>,
+) -> LocalVlmModelsProbe {
+    let client = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(400))
+        .timeout(Duration::from_millis(900))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            return LocalVlmModelsProbe {
+                reachable: false,
+                catalog_valid: false,
+                configured_model_available: false,
+            };
+        }
+    };
+    let mut request = client.get(models_url);
+    if let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) {
+        request = request.bearer_auth(api_key);
+    }
+    let response = match request
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+    {
+        Ok(response) => response,
+        Err(_) => {
+            return LocalVlmModelsProbe {
+                reachable: false,
+                catalog_valid: false,
+                configured_model_available: false,
+            };
+        }
+    };
+    let payload = match response.json::<JsonValue>().await {
+        Ok(payload) => payload,
+        Err(_) => {
+            return LocalVlmModelsProbe {
+                reachable: true,
+                catalog_valid: false,
+                configured_model_available: false,
+            };
+        }
+    };
+    let Some(model_ids) = local_vlm_model_catalog_ids(&payload) else {
+        return LocalVlmModelsProbe {
+            reachable: true,
+            catalog_valid: false,
+            configured_model_available: false,
+        };
+    };
+    LocalVlmModelsProbe {
+        reachable: true,
+        catalog_valid: true,
+        configured_model_available: model_ids
+            .into_iter()
+            .any(|advertised| local_vlm_model_ids_match(configured_model, advertised)),
+    }
+}
+
+async fn probe_local_vlm_health(health_url: &str) -> bool {
+    let client = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(400))
+        .timeout(Duration::from_millis(900))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    client
+        .get(health_url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .is_ok()
+}
+
+async fn probe_local_vlm_readiness(
+    enabled: bool,
+    health_url: &str,
+    models_url: &str,
+    configured_model: &str,
+    model_path: &Path,
+    api_key: Option<&str>,
+) -> LocalVlmReadiness {
+    probe_openai_compatible_vlm_readiness(
+        enabled,
+        true,
+        health_url,
+        models_url,
+        configured_model,
+        Some(model_path),
+        api_key,
+    )
+    .await
+}
+
+async fn probe_openai_compatible_vlm_readiness(
+    enabled: bool,
+    health_required: bool,
+    health_url: &str,
+    models_url: &str,
+    configured_model: &str,
+    required_model_path: Option<&Path>,
+    api_key: Option<&str>,
+) -> LocalVlmReadiness {
+    let model_path_required = required_model_path.is_some();
+    let model_path_exists = required_model_path.map_or(true, Path::is_dir);
+    if !enabled {
+        return local_vlm_readiness(
+            false,
+            health_required,
+            false,
+            model_path_required,
+            model_path_exists,
+            LocalVlmModelsProbe {
+                reachable: false,
+                catalog_valid: false,
+                configured_model_available: false,
+            },
+        );
+    }
+    let (health_reachable, models_probe) = tokio::join!(
+        probe_local_vlm_health(health_url),
+        probe_local_vlm_models(models_url, configured_model, api_key)
+    );
+    local_vlm_readiness(
+        true,
+        health_required,
+        health_reachable,
+        model_path_required,
+        model_path_exists,
+        models_probe,
+    )
+}
+
+fn local_vlm_unready_attempt(
+    readiness: &LocalVlmReadiness,
+    base_url: &str,
+    model: &str,
+    health_url: &str,
+    models_url: &str,
+    model_path: &Path,
+    elapsed_ms: u64,
+) -> Option<vision::locate::BackendAttempt> {
+    if readiness.ready {
+        return None;
+    }
+    Some(vision::locate::BackendAttempt {
+        backend: vision::locate::BackendId::LocalVlm,
+        status: vision::locate::AttemptStatus::Skipped,
+        point: None,
+        bbox: None,
+        confidence: None,
+        raw_response: None,
+        model: Some(model.to_string()),
+        base_url: Some(base_url.to_string()),
+        elapsed_ms,
+        error: Some(local_vlm_unready_reason(
+            readiness,
+            health_url,
+            models_url,
+            Some(model_path),
+            model,
+        )),
+    })
+}
+
+fn local_vlm_unready_reason(
+    readiness: &LocalVlmReadiness,
+    health_url: &str,
+    models_url: &str,
+    model_path: Option<&Path>,
+    model: &str,
+) -> String {
+    let model_path = model_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not-required-for-explicit-endpoint".to_string());
+    format!(
+        "local_vlm not ready: status={}, health_url={}, models_url={}, model_path={}, configured_model={}",
+        readiness.status,
+        health_url,
+        models_url,
+        model_path,
+        model
+    )
+}
+
+async fn ensure_local_vlm_ready(
+    base_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    let health_url = local_vlm_health_url(base_url);
+    let models_url = local_vlm_models_url(base_url);
+    let model_path = configured_local_vlm_model_path(model);
+    let readiness = probe_local_vlm_readiness(
+        active_vision_router_config().local_vlm.enabled,
+        &health_url,
+        &models_url,
+        model,
+        &model_path,
+        api_key,
+    )
+    .await;
+    if readiness.ready {
+        Ok(())
+    } else {
+        Err(local_vlm_unready_reason(
+            &readiness,
+            &health_url,
+            &models_url,
+            Some(&model_path),
+            model,
+        ))
+    }
+}
+
+fn local_vlm_backend_status_json(
+    config: &LocalVlmRouterConfig,
+    base_url: String,
+    model: String,
+    health_url: String,
+    models_url: String,
+    model_path: &Path,
+    readiness: &LocalVlmReadiness,
+) -> JsonValue {
+    json!({
+        "id": "local_vlm",
+        "enabled": config.enabled,
+        "ready": readiness.ready,
+        "status": readiness.status,
+        "base_url": base_url,
+        "health_url": health_url,
+        "health_reachable": readiness.health_reachable,
+        "models_url": models_url,
+        "models_reachable": readiness.models_reachable,
+        "model_catalog_valid": readiness.model_catalog_valid,
+        "configured_model_available": readiness.configured_model_available,
+        "model": model,
+        "model_path": model_path.display().to_string(),
+        "model_path_required": readiness.model_path_required,
+        "model_path_exists": readiness.model_path_exists,
+        "fix_hint": match readiness.status {
+            "ready" => "No action required.",
+            "disabled" => "Enable local_vlm before using local grounding.",
+            "service_unavailable_and_model_missing" => "Install the configured local VLM model and start its health service.",
+            "service_unavailable" => "Start the configured local VLM service and verify its /health endpoint returns HTTP 2xx.",
+            "model_missing" => "Install the configured local VLM model under <local_vlm_root>/models/<model>.",
+            "model_catalog_unavailable" => "Verify the configured local VLM service exposes an authenticated OpenAI-compatible /v1/models endpoint.",
+            "model_catalog_invalid" => "Make /v1/models return an OpenAI-compatible model list such as {data:[{id:...}]}.",
+            "configured_model_unavailable" => "Load the configured model in the local VLM service and expose its id from /v1/models.",
+            _ => "Check the local VLM service and model installation.",
+        },
+    })
+}
+
 async fn api_vision_locate_backends() -> Json<serde_json::Value> {
     let config = active_vision_router_config();
+    let local_base_url = config
+        .local_vlm
+        .base_url
+        .clone()
+        .unwrap_or_else(authoritative_local_vision_base_url);
+    let local_model = config
+        .local_vlm
+        .model
+        .clone()
+        .unwrap_or_else(authoritative_local_vision_model);
+    let local_health_url = local_vlm_health_url(&local_base_url);
+    let local_models_url = local_vlm_models_url(&local_base_url);
+    let local_model_path = configured_local_vlm_model_path(&local_model);
+    let local_api_key = authoritative_local_vision_api_key();
+    let local_readiness = probe_local_vlm_readiness(
+        config.local_vlm.enabled,
+        &local_health_url,
+        &local_models_url,
+        &local_model,
+        &local_model_path,
+        local_api_key.as_deref(),
+    )
+    .await;
+    let local_vlm = local_vlm_backend_status_json(
+        &config.local_vlm,
+        local_base_url,
+        local_model,
+        local_health_url,
+        local_models_url,
+        &local_model_path,
+        &local_readiness,
+    );
     Json(json!({
         "backends": [
             { "id": "uia", "enabled": config.uia.enabled, "status": if config.uia.enabled { "ready" } else { "disabled" }, "platform_supported": true,
               "version": "Windows" },
-            { "id": "local_vlm", "enabled": config.local_vlm.enabled,
-              "status": if config.local_vlm.enabled { "ready" } else { "disabled" },
-              "base_url": config.local_vlm.base_url.clone().unwrap_or_else(authoritative_local_vision_base_url),
-              "model": config.local_vlm.model.clone().unwrap_or_else(authoritative_local_vision_model) },
+            local_vlm,
             { "id": "remote_vlm", "enabled": config.remote_vlm.enabled,
               "status": if config.remote_vlm.providers.is_empty() { "unconfigured" } else { "ready" },
               "providers": config.remote_vlm.providers.iter().map(|provider| json!({
@@ -20000,6 +20531,10 @@ async fn run_vision_grounding_model(
         .clone()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "unspecified visual target".to_string());
+    let explicit_openai_endpoint = payload
+        .base_url
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
     let base_url = payload
         .base_url
         .clone()
@@ -20022,6 +20557,12 @@ async fn run_vision_grounding_model(
         .filter(|value| !value.trim().is_empty())
         .or_else(authoritative_local_vision_api_key)
         .unwrap_or_default();
+    // 显式 base_url 是用户主动选择的外部 OpenAI-compatible 端点，历史契约只要求
+    // chat/completions；不得额外强制它实现 /health 或 /v1/models。只有自动选择的
+    // local_vlm 路径应用本地模型与服务 readiness 门禁。
+    if !payload.readiness_verified && !explicit_openai_endpoint {
+        ensure_local_vlm_ready(&base_url, &model, Some(&api_key)).await?;
+    }
     let timeout_seconds = payload.timeout_seconds.unwrap_or(20).clamp(5, 180);
     diag!(
         "[VISION-MODEL] url={base_url}, model={model}, has_key={}",
@@ -20402,6 +20943,7 @@ async fn run_visual_action_dry_run(
         model: payload.model.clone(),
         api_key: payload.api_key.clone(),
         timeout_seconds: payload.timeout_seconds,
+        readiness_verified: false,
     })
     .await?;
 
@@ -25260,7 +25802,7 @@ async fn verify_cursor_on_target(x: i32, y: i32, target: &str) -> bool {
         });
     if let Some(key) = key_source {
         std::env::set_var("ZAI_API_KEY", &key);
-        diag!("[VERIFY] zhipu key seeded (len={})", key.len());
+        diag!("[VERIFY] zhipu key seeded: true");
     }
     match provider_client_for_agent(&verify_agent) {
         Ok(client) => {
@@ -26017,37 +26559,27 @@ fn llm_health_check(agents: &[AgentHealthDto]) -> DiagnosticsCheck {
             Some("Create at least one agent session before using real chat."),
         );
     }
-    let ok = agents
-        .iter()
-        .filter(|agent| agent.provider_status == "ok")
-        .count();
-    let warn = agents
-        .iter()
-        .filter(|agent| agent.provider_status == "warn")
-        .count();
-    let error = agents
-        .iter()
-        .filter(|agent| agent.provider_status == "error")
-        .count();
-    if error > 0 {
+    let providers =
+        provider_readiness_counts(agents.iter().map(|agent| agent.provider_status.as_str()));
+    if providers.error > 0 {
         diagnostics_check(
             "llm.providers",
             "LLM Providers",
             "error",
             &format!(
-                "{ok}/{} selectable agents are ready; {warn} warn; {error} error.",
-                agents.len()
+                "{}/{} selectable agents are ready; {} warn; {} error.",
+                providers.ready, providers.total, providers.warn, providers.error
             ),
             Some("Configure missing API keys first, then verify provider/model/base_url warnings."),
         )
-    } else if warn > 0 {
+    } else if providers.warn > 0 {
         diagnostics_check(
             "llm.providers",
             "LLM Providers",
             "warn",
             &format!(
-                "{ok}/{} selectable agents are ready; {warn} warn; {error} error.",
-                agents.len()
+                "{}/{} selectable agents are ready; {} warn; {} error.",
+                providers.ready, providers.total, providers.warn, providers.error
             ),
             Some(
                 "Review provider/model/base_url warnings before running long real-model sessions.",
@@ -26058,7 +26590,10 @@ fn llm_health_check(agents: &[AgentHealthDto]) -> DiagnosticsCheck {
             "llm.providers",
             "LLM Providers",
             "ok",
-            &format!("{ok}/{} selectable agents are ready.", agents.len()),
+            &format!(
+                "{}/{} selectable agents are ready.",
+                providers.ready, providers.total
+            ),
             Some("No action required."),
         )
     }
@@ -26336,12 +26871,19 @@ fn session_api_key(session_id: &str) -> Option<String> {
             .map(|session| session.api_key_ref.clone())?
     };
     diag!(
-        "[API-KEY] session={session_id}, api_key_ref first_4={}",
-        &api_key_ref.chars().take(4).collect::<String>()
+        "{}",
+        api_key_reference_presence_log(session_id, &api_key_ref)
     );
     let result = resolve_api_key_ref(&api_key_ref);
     diag!("[API-KEY] resolved: has_key={}", result.is_some());
     result
+}
+
+fn api_key_reference_presence_log(session_id: &str, api_key_ref: &str) -> String {
+    format!(
+        "[API-KEY] session={session_id}, reference_present={}",
+        !api_key_ref.trim().is_empty()
+    )
 }
 
 fn resolve_api_key_ref(value: &str) -> Option<String> {
@@ -30887,6 +31429,7 @@ async fn visual_ground_safe_click_point(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| default_local_vision_model().to_string());
     let api_key = authoritative_local_vision_api_key().unwrap_or_default();
+    ensure_local_vlm_ready(&base_url, &model, Some(&api_key)).await?;
     let backend = LocalOpenAiVisionBackend::new(base_url, model)
         .with_api_key(api_key)
         .with_timeout_seconds(20);
@@ -43295,6 +43838,8 @@ struct VisionFindTargetRequest {
     model: Option<String>,
     api_key: Option<String>,
     timeout_seconds: Option<u64>,
+    #[serde(skip)]
+    readiness_verified: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -47912,13 +48457,34 @@ mod tests {
     use std::path::Path;
     use vision::{VisionBackendKind, VisionResponse, VisionToolCapability};
 
-    const WEB_APP_JS: &str = include_str!("app.js");
+    const WEB_APP_JS_RAW: &str = include_str!("app.js");
     const WEB_INDEX_HTML: &str = include_str!("../index.html");
     const WEB_STT_TAIL_CAPTURE_JS: &str = include_str!("stt_tail_capture.js");
     const WEB_README_MD: &str = include_str!("../README.md");
-    const WEB_STYLES_CSS: &str = include_str!("styles.css");
+    const WEB_STYLES_CSS_RAW: &str = include_str!("styles.css");
     const WEB_MAIN_RS: &str = include_str!("main.rs");
     const WEB_AVATAR_MANIFEST: &str = include_str!("../assets/avatars/manifest.json");
+
+    // Git 在 Windows checkout 时可能把前端资源转换为 CRLF。下面的静态契约都以
+    // LF 片段表达，因此只在测试输入侧规范化换行，避免源码内容相同却因宿主
+    // `core.autocrlf` 配置产生整批假阴性。
+    fn normalize_embedded_test_asset(source: &'static str) -> &'static str {
+        if source.contains('\r') {
+            Box::leak(
+                source
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n")
+                    .into_boxed_str(),
+            )
+        } else {
+            source
+        }
+    }
+
+    static WEB_APP_JS: std::sync::LazyLock<&'static str> =
+        std::sync::LazyLock::new(|| normalize_embedded_test_asset(WEB_APP_JS_RAW));
+    static WEB_STYLES_CSS: std::sync::LazyLock<&'static str> =
+        std::sync::LazyLock::new(|| normalize_embedded_test_asset(WEB_STYLES_CSS_RAW));
 
     #[test]
     fn default_mcp_config_is_portable_and_contains_no_developer_home_path() {
@@ -60913,6 +61479,35 @@ attach: last_assistant
     }
 
     #[test]
+    fn api_key_diagnostics_never_log_reference_content() {
+        let marker = "secret-marker-79c4a1-api-key-reference";
+        let message = super::api_key_reference_presence_log("session-test", marker);
+        assert_eq!(
+            message,
+            "[API-KEY] session=session-test, reference_present=true"
+        );
+        for fragment in [marker, "secret-marker", "79c4a1", "api-key-reference"] {
+            assert!(
+                !message.contains(fragment),
+                "诊断消息不得包含凭据引用内容或可识别片段: {fragment}"
+            );
+        }
+
+        let start = WEB_MAIN_RS
+            .find("fn session_api_key")
+            .expect("session_api_key must exist");
+        let end = WEB_MAIN_RS[start..]
+            .find("fn resolve_api_key_ref")
+            .map(|offset| start + offset)
+            .expect("resolve_api_key_ref must follow session_api_key");
+        let source = &WEB_MAIN_RS[start..end];
+
+        assert!(source.contains("reference_present"));
+        assert!(!source.contains("chars().take"));
+        assert!(!source.contains("first_4"));
+    }
+
+    #[test]
     fn registry_executor_handles_registered_tools() {
         use super::ToolInvocationExecutor;
         let exec = super::RegistryExecutor::from_registry();
@@ -61327,6 +61922,48 @@ attach: last_assistant
             .iter()
             .any(|suggestion| suggestion.priority == "high"
                 && suggestion.message.contains("API key")));
+    }
+
+    #[test]
+    fn functional_config_accepts_ready_session_provider_without_exposing_credentials() {
+        let diagnostics = super::build_agent_diagnostics(
+            "glm-session".to_string(),
+            "智谱".to_string(),
+            "glm-5.2".to_string(),
+            Some(api::ProviderKind::ZhipuAi),
+            api::ProviderKind::ZhipuAi,
+            true,
+            None,
+            None,
+        );
+        assert!(diagnostics.api_key_present);
+        assert_eq!(diagnostics.api_key_source.as_deref(), Some("session-key"));
+        assert_eq!(diagnostics.provider_status, "ok");
+
+        let providers = super::provider_readiness_counts([diagnostics.provider_status.as_str()]);
+        let check = super::functional_config_check_for(true, true, true, true, providers);
+
+        assert_eq!(check.status, "ok");
+        assert!(check.detail.contains("会话 provider=1/1 ready"));
+        assert!(!check.detail.contains("未配置"));
+        assert!(!check.detail.contains("session-key"));
+        assert!(!check.detail.contains("API key"));
+        assert!(check.fix_hint.is_none());
+    }
+
+    #[test]
+    fn functional_config_warns_when_no_selectable_session_provider_is_ready() {
+        let providers = super::provider_readiness_counts(["error", "warn"]);
+        let check = super::functional_config_check_for(true, true, true, true, providers);
+
+        assert_eq!(check.status, "warn");
+        assert!(check.detail.contains("会话 provider=0/2 ready"));
+        assert!(check.detail.contains("1 warn，1 error"));
+        assert!(check
+            .fix_hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("会话凭据"));
     }
 
     #[test]
@@ -61897,6 +62534,29 @@ attach: last_assistant
             WEB_STYLES_CSS.contains("@media (max-width: 1200px) {\n  body.ui-3d .settings-layout")
         );
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .settings-layout > .audio-settings"));
+        assert!(WEB_STYLES_CSS.contains("high-dpi-short-overflow-reachability"));
+        let short_screen_override = WEB_STYLES_CSS
+            .rfind("high-dpi-short-overflow-reachability")
+            .expect("short-screen override marker must exist");
+        let last_hidden_task_rule = WEB_STYLES_CSS
+            .rfind("body.ui-3d .task-pending-column {\n  grid-template-rows: auto auto")
+            .expect("the themed task layout must remain covered by the short-screen override");
+        assert!(
+            short_screen_override > last_hidden_task_rule,
+            "the short-screen override must follow later themed overflow rules"
+        );
+        assert!(WEB_STYLES_CSS.trim_end().ends_with(
+            "  body.ui-3d .vision-command-rail .vision-window-action-card {\n    min-height: 0;\n    height: auto;\n    overflow: visible;\n  }\n}"
+        ));
+        assert!(WEB_STYLES_CSS
+            .contains("body.ui-3d .task-pending-column,\n  body.ui-3d .module-selfcheck"));
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .memory-window-center-pane,\n  body.ui-3d .memory-window-source"
+        ));
+        assert!(
+            WEB_STYLES_CSS.contains("body.ui-3d .vision-command-rail .vision-window-action-card")
+        );
+        assert!(WEB_STYLES_CSS.contains("overflow: visible;"));
     }
 
     #[test]
@@ -62659,7 +63319,7 @@ attach: last_assistant
         let legacy_dir = manifest_dir.join("assets/icons");
 
         let alias_section = source_section(
-            WEB_APP_JS,
+            &WEB_APP_JS,
             "const WUXIA_ICON_ALIASES = new Map([",
             "]);\n// 仅保留源码资源目录中真实存在",
         );
@@ -62681,7 +63341,7 @@ attach: last_assistant
         }
 
         let legacy_section = source_section(
-            WEB_APP_JS,
+            &WEB_APP_JS,
             "const PACKAGED_LEGACY_PNG_ICON_NAMES = new Set([",
             "]);\nconst DEFAULT_PACKAGED_ICON_URL",
         );
@@ -62710,7 +63370,7 @@ attach: last_assistant
         };
 
         // 静态字面量调用全部解析；icon 属性中的三元表达式只取问号后的结果值。
-        let mut rest = WEB_APP_JS;
+        let mut rest: &str = &WEB_APP_JS;
         while let Some(start) = rest.find("iconUrl(\"") {
             rest = &rest[start + "iconUrl(\"".len()..];
             let end = rest.find('"').expect("unterminated iconUrl literal");
@@ -62727,7 +63387,7 @@ attach: last_assistant
 
         // 不能由 iconUrl 字面量扫描覆盖的两个运行时函数使用封闭白名单。
         let message_icons = returned_string_literals(source_section(
-            WEB_APP_JS,
+            &WEB_APP_JS,
             "function iconForMessage(message)",
             "function kindForMessage(message)",
         ));
@@ -62750,7 +63410,7 @@ attach: last_assistant
         }
 
         let project_icons = returned_string_literals(source_section(
-            WEB_APP_JS,
+            &WEB_APP_JS,
             "function projectIconForEntry(entry = {})",
             "function projectGitStatus(entry = {})",
         ));
@@ -63304,17 +63964,17 @@ attach: last_assistant
         assert!(WEB_MAIN_RS.contains(".stderr(Stdio::null())"));
         let forced_exit = ["std::process", "::exit(0)"].concat();
         assert!(!WEB_MAIN_RS.contains(&forced_exit)); // 优雅退出（信号 + with_graceful_shutdown），不用硬退出
-                                                      // 桌宠退出联动 web-console（可配置 pet_exit_closes_console，默认关）：新设计
+                                                      // 桌宠退出联动 web-console（可配置 pet_exit_closes_console，默认开）：新设计
         assert!(WEB_MAIN_RS.contains("pet_exit_closes_console"));
         assert!(WEB_MAIN_RS.contains("web_console_shutdown_signal"));
         assert!(WEB_MAIN_RS.contains("with_graceful_shutdown"));
     }
 
     #[test]
-    fn web_console_pet_exit_does_not_close_console_by_default() {
+    fn web_console_pet_exit_closes_console_by_default() {
         assert!(
-            !super::ConfigPet::default().pet_exit_closes_console,
-            "web-console should stay reachable by default when the desktop pet exits"
+            super::ConfigPet::default().pet_exit_closes_console,
+            "web-console should close by default when the desktop pet exits"
         );
         assert!(WEB_MAIN_RS.contains("pet_exit_closes_console"));
         assert!(WEB_MAIN_RS.contains("pet_exit_closes_console_enabled"));
@@ -63443,6 +64103,315 @@ attach: last_assistant
         assert!(hint.contains("modules/vision/resources/uidetr/uidetr_service.py"));
         assert!(hint.contains(r"C:\models\ui-detr.pth"));
         assert!(!hint.contains(r"C:\Users\"));
+    }
+
+    #[test]
+    fn local_vlm_backend_does_not_report_ready_without_service_or_model() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing_model_path = temp.path().join("models").join("showui-2b");
+        let config = super::LocalVlmRouterConfig::default();
+        let readiness = super::local_vlm_readiness(
+            true,
+            true,
+            false,
+            true,
+            false,
+            super::LocalVlmModelsProbe {
+                reachable: false,
+                catalog_valid: false,
+                configured_model_available: false,
+            },
+        );
+        let backend = super::local_vlm_backend_status_json(
+            &config,
+            "http://127.0.0.1:8000/v1".to_string(),
+            "showui-2b".to_string(),
+            "http://127.0.0.1:8000/health".to_string(),
+            "http://127.0.0.1:8000/v1/models".to_string(),
+            &missing_model_path,
+            &readiness,
+        );
+
+        assert_eq!(backend["enabled"], true);
+        assert_eq!(backend["ready"], false);
+        assert_eq!(backend["status"], "service_unavailable_and_model_missing");
+        assert_eq!(backend["health_reachable"], false);
+        assert_eq!(backend["model_path_exists"], false);
+    }
+
+    #[test]
+    fn local_vlm_backend_ready_requires_health_model_path_and_model_catalog() {
+        assert_eq!(
+            super::local_vlm_readiness_status(true, true, true, true, true, true, true, true),
+            ("ready", true)
+        );
+        assert_eq!(
+            super::local_vlm_readiness_status(true, true, false, true, true, false, false, false),
+            ("service_unavailable", false)
+        );
+        assert_eq!(
+            super::local_vlm_readiness_status(true, true, true, true, false, true, true, true),
+            ("model_missing", false)
+        );
+        assert_eq!(
+            super::local_vlm_readiness_status(true, true, true, true, true, false, false, false),
+            ("model_catalog_unavailable", false)
+        );
+        assert_eq!(
+            super::local_vlm_readiness_status(true, true, true, true, true, true, true, false),
+            ("configured_model_unavailable", false)
+        );
+        assert_eq!(
+            super::local_vlm_readiness_status(true, false, false, false, true, true, true, true),
+            ("ready", true),
+            "显式 OpenAI 兼容端点不要求 /health 或本地模型目录"
+        );
+    }
+
+    #[test]
+    fn local_vlm_model_path_maps_documented_qwen_api_id_to_resource_directory() {
+        assert_eq!(
+            super::local_vlm_model_directory_name("qwen2.5-vl-3b"),
+            "Qwen2.5-VL-3B-Instruct"
+        );
+        assert_eq!(
+            super::local_vlm_model_directory_name("showui-2b"),
+            "showui-2b"
+        );
+        assert!(super::local_vlm_model_ids_match(
+            "qwen2.5-vl-3b",
+            "Qwen2.5-VL-3B-Instruct"
+        ));
+        assert!(!super::local_vlm_model_ids_match(
+            "qwen2.5-vl-3b",
+            "showui-2b"
+        ));
+    }
+
+    #[test]
+    fn local_vlm_models_url_maps_openai_compatible_base_urls() {
+        assert_eq!(
+            super::local_vlm_models_url("http://127.0.0.1:8000/v1"),
+            "http://127.0.0.1:8000/v1/models"
+        );
+        assert_eq!(
+            super::local_vlm_models_url("http://127.0.0.1:8000"),
+            "http://127.0.0.1:8000/v1/models"
+        );
+        assert_eq!(
+            super::local_vlm_models_url("http://127.0.0.1:8000/v1/chat/completions"),
+            "http://127.0.0.1:8000/v1/models"
+        );
+    }
+
+    async fn spawn_local_vlm_probe_server(
+        health_status: &str,
+        models_status: &str,
+        models_body: &str,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local VLM probe fixture");
+        let address = listener.local_addr().expect("local VLM fixture address");
+        let health_status = health_status.to_string();
+        let models_status = models_status.to_string();
+        let models_body = models_body.to_string();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let mut request_lines = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept probe request");
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).await.expect("read probe request");
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let request_line = request.lines().next().unwrap_or_default().to_string();
+                let (status, body) = if request_line.contains(" /health ") {
+                    (health_status.as_str(), r#"{"status":"ok"}"#)
+                } else {
+                    (models_status.as_str(), models_body.as_str())
+                };
+                request_lines.push(request_line);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write probe response");
+            }
+            request_lines
+        });
+        (format!("http://{address}/v1"), server)
+    }
+
+    #[tokio::test]
+    async fn local_vlm_readiness_rejects_unrelated_health_service_without_models_endpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_path = temp.path().join("Qwen2.5-VL-3B-Instruct");
+        std::fs::create_dir_all(&model_path).expect("create model directory fixture");
+        let (base_url, server) =
+            spawn_local_vlm_probe_server("200 OK", "404 Not Found", "{}").await;
+        let readiness = super::probe_local_vlm_readiness(
+            true,
+            &super::local_vlm_health_url(&base_url),
+            &super::local_vlm_models_url(&base_url),
+            "qwen2.5-vl-3b",
+            &model_path,
+            None,
+        )
+        .await;
+        let requests = server.await.expect("probe fixture server");
+
+        assert!(readiness.health_reachable);
+        assert!(!readiness.ready);
+        assert_eq!(readiness.status, "model_catalog_unavailable");
+        assert!(requests
+            .iter()
+            .any(|request| request.contains("GET /health ")));
+        assert!(requests
+            .iter()
+            .any(|request| request.contains("GET /v1/models ")));
+    }
+
+    #[tokio::test]
+    async fn local_vlm_readiness_accepts_documented_qwen_model_alias_from_catalog() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_path = temp.path().join("Qwen2.5-VL-3B-Instruct");
+        std::fs::create_dir_all(&model_path).expect("create model directory fixture");
+        let (base_url, server) = spawn_local_vlm_probe_server(
+            "200 OK",
+            "200 OK",
+            r#"{"object":"list","data":[{"id":"Qwen2.5-VL-3B-Instruct"}]}"#,
+        )
+        .await;
+        let readiness = super::probe_local_vlm_readiness(
+            true,
+            &super::local_vlm_health_url(&base_url),
+            &super::local_vlm_models_url(&base_url),
+            "qwen2.5-vl-3b",
+            &model_path,
+            None,
+        )
+        .await;
+        server.await.expect("probe fixture server");
+
+        assert_eq!(readiness.status, "ready");
+        assert!(readiness.ready);
+        assert!(readiness.configured_model_available);
+    }
+
+    #[test]
+    fn local_vlm_locate_attempt_gates_inference_on_shared_readiness() {
+        let function_start = WEB_MAIN_RS
+            .find("async fn local_vlm_locate_attempt")
+            .expect("local VLM locate attempt");
+        let function_end = WEB_MAIN_RS[function_start..]
+            .find("async fn remote_vlm_locate_attempt")
+            .map(|offset| function_start + offset)
+            .expect("remote VLM locate attempt follows local VLM");
+        let body = &WEB_MAIN_RS[function_start..function_end];
+        let readiness_probe = body
+            .find("probe_local_vlm_readiness")
+            .expect("local locate probes shared readiness");
+        let readiness_gate = body
+            .find("local_vlm_unready_attempt")
+            .expect("local locate returns a skipped attempt when unready");
+        let inference = body
+            .find("run_vision_find_target")
+            .expect("local locate inference call");
+        assert!(readiness_probe < readiness_gate && readiness_gate < inference);
+
+        let readiness = super::local_vlm_readiness(
+            true,
+            true,
+            false,
+            true,
+            true,
+            super::LocalVlmModelsProbe {
+                reachable: false,
+                catalog_valid: false,
+                configured_model_available: false,
+            },
+        );
+        let attempt = super::local_vlm_unready_attempt(
+            &readiness,
+            "http://127.0.0.1:8000/v1",
+            "showui-2b",
+            "http://127.0.0.1:8000/health",
+            "http://127.0.0.1:8000/v1/models",
+            Path::new(r"C:\models\showui-2b"),
+            17,
+        )
+        .expect("unready local VLM is skipped");
+        assert_eq!(attempt.status, vision::locate::AttemptStatus::Skipped);
+        assert_eq!(attempt.elapsed_ms, 17);
+        assert!(attempt
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("status=service_unavailable"));
+    }
+
+    #[test]
+    fn local_vlm_readiness_gate_covers_direct_visual_action_and_safe_click_paths() {
+        let grounding_start = WEB_MAIN_RS
+            .find("async fn run_vision_grounding_model")
+            .expect("vision grounding model function");
+        let grounding_end = WEB_MAIN_RS[grounding_start..]
+            .find("async fn run_vision_describe_screen_model")
+            .map(|offset| grounding_start + offset)
+            .expect("describe model follows grounding model");
+        let grounding_body = &WEB_MAIN_RS[grounding_start..grounding_end];
+        let local_grounding_gate = grounding_body
+            .find("ensure_local_vlm_ready")
+            .expect("direct vision grounding uses readiness gate");
+        let grounding_backend = grounding_body
+            .find("LocalOpenAiVisionBackend::new")
+            .expect("direct vision grounding backend");
+        assert!(local_grounding_gate < grounding_backend);
+        assert!(grounding_body.contains("explicit_openai_endpoint"));
+        assert!(
+            grounding_body.contains("if !payload.readiness_verified && !explicit_openai_endpoint")
+        );
+
+        let safe_click_start = WEB_MAIN_RS
+            .find("async fn visual_ground_safe_click_point")
+            .expect("strong visual safe-click function");
+        let safe_click_end = WEB_MAIN_RS[safe_click_start..]
+            .find("fn safe_click_target_description")
+            .map(|offset| safe_click_start + offset)
+            .expect("safe-click target description follows visual grounding");
+        let safe_click_body = &WEB_MAIN_RS[safe_click_start..safe_click_end];
+        let safe_click_gate = safe_click_body
+            .find("ensure_local_vlm_ready")
+            .expect("strong visual safe-click uses readiness gate");
+        let safe_click_backend = safe_click_body
+            .find("LocalOpenAiVisionBackend::new")
+            .expect("strong visual safe-click backend");
+        assert!(safe_click_gate < safe_click_backend);
+
+        let visual_action_start = WEB_MAIN_RS
+            .find("async fn run_visual_action_dry_run")
+            .expect("visual action dry-run function");
+        let visual_action_end = WEB_MAIN_RS[visual_action_start..]
+            .find("fn visual_action_evidence")
+            .map(|offset| visual_action_start + offset)
+            .expect("visual action evidence follows dry-run");
+        let visual_action_body = &WEB_MAIN_RS[visual_action_start..visual_action_end];
+        assert!(visual_action_body.contains("readiness_verified: false"));
+        assert!(visual_action_body.contains("run_vision_find_target"));
+    }
+
+    #[tokio::test]
+    async fn local_vlm_health_probe_reports_closed_port_unavailable() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("allocate a temporary loopback port");
+        let port = listener.local_addr().expect("listener address").port();
+        drop(listener);
+
+        assert!(!super::probe_local_vlm_health(&format!("http://127.0.0.1:{port}/health")).await);
     }
 
     #[test]
@@ -65938,10 +66907,9 @@ attach: last_assistant
             .asr_error
             .as_deref()
             .is_some_and(|error| error.contains("Attempts:")));
-        assert!(response
-            .asr_error
-            .as_deref()
-            .is_some_and(|error| error.contains("Invalid data")));
+        let asr_error = response.asr_error.as_deref().expect("ASR error details");
+        assert!(asr_error.contains("Python whisper:"));
+        assert!(asr_error.contains("Native STT:"));
     }
 
     #[tokio::test]

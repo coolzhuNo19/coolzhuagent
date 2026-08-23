@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$Manifest = 'config/package-manifest.json',
   [ValidateSet('debug', 'release')]
   [string]$Configuration = 'debug',
