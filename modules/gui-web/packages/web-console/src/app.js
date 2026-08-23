@@ -7640,10 +7640,15 @@ function memoryWindowRenderContextPreview(response, fallback = "No context previ
   const messages = Array.isArray(response.messages) ? response.messages.length : 0;
   const beads = Array.isArray(response.memory_beads) ? response.memory_beads.length : 0;
   const memoryIds = Array.isArray(response.memory_bead_ids) ? response.memory_bead_ids : [];
+  const memorySelection = response.memory_selection || {};
+  const memoryCandidates = Array.isArray(memorySelection.candidate_ids) ? memorySelection.candidate_ids : [];
+  const memorySelected = Array.isArray(memorySelection.selected_ids) ? memorySelection.selected_ids : [];
   const runtime = response.runtime_snapshot || {};
   const systemSnippet = String(response.system_prompt || "").slice(0, 500);
   node.textContent = [
     `snapshot=${response.context_snapshot_id || "-"} memory_revision=${response.memory_revision || "-"}`,
+    `memory_selection=${memorySelection.strategy || "-"} candidates=${memoryCandidates.join(",") || "none"} selected=${memorySelected.join(",") || "none"}`,
+    `memory_tokens=${memorySelection.used_tokens ?? 0}/${memorySelection.token_budget ?? 0} ttl_filtered=${(memorySelection.expired_or_invalid_ids || []).join(",") || "none"} superseded=${(memorySelection.superseded_ids || []).join(",") || "none"} budget_skipped=${(memorySelection.budget_skipped_ids || []).join(",") || "none"}`,
     `runtime=${runtime.snapshot_id || "-"} workspace=${runtime.workspace_id || "-"} room=${runtime.chat_room_id || "-"} permission=${runtime.permission_profile || "-"}`,
     `runtime_model=${runtime.model || "-"} provider=${runtime.provider || "-"} tools=${runtime.tool_catalog_revision || "-"}`,
     `messages=${messages} history=${response.history_message_count ?? 0} memory_beads=${beads}`,

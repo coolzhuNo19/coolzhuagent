@@ -24927,7 +24927,8 @@ fn build_context_assembly_with_roster(
     );
     let max_prompt_tokens = options.max_prompt_tokens.max(1);
     let mut truncated = false;
-    let mut memory_beads = select_context_memory_beads(agent, current_user_text, &options);
+    let (mut memory_beads, mut memory_selection) =
+        select_context_memory_beads(agent, current_user_text, &options);
     let memory_revision = context_memory_revision(agent);
     let build_system_prompt = |beads: &[MemoryBeadDto]| {
         let mut prompt = build_agent_system_prompt_with_beads(agent, beads);
@@ -25116,6 +25117,8 @@ fn build_context_assembly_with_roster(
         .iter()
         .map(|bead| bead.id.clone())
         .collect::<Vec<_>>();
+    memory_selection.selected_ids = memory_bead_ids.clone();
+    memory_selection.used_tokens = memory_tokens;
     let workspace_id = workspace_identity(&active_workspace_path());
     let chat_room_id = options.chat_room_id.clone();
     let permission_profile = context_permission_profile(chat_room_id.as_deref());
@@ -25179,6 +25182,7 @@ fn build_context_assembly_with_roster(
         context_snapshot_id,
         memory_revision,
         memory_bead_ids,
+        memory_selection,
         runtime_snapshot,
         history_floor_millis: options.history_floor_millis,
         history_message_count: selected_history.len(),
@@ -25286,7 +25290,7 @@ fn select_context_memory_beads(
     agent: &AgentSessionDto,
     current_user_text: &str,
     options: &ContextBuildOptions,
-) -> Vec<MemoryBeadDto> {
+) -> (Vec<MemoryBeadDto>, ContextMemorySelectionEvidence) {
     let mut recall_span = diagnostics::start_span("memory.recall", "memory");
     diagnostics::info(
         "memory",
@@ -25332,10 +25336,32 @@ fn select_context_memory_beads(
     };
 
     // F 时效：按 kind 规则过滤已过期的瞬时记忆（chat/会话等 7 天 TTL），不污染召回。
+    let candidate_ids = candidates
+        .iter()
+        .map(|bead| bead.id.clone())
+        .collect::<Vec<_>>();
     let mut candidates = runtime::filter_unexpired(&candidates, unix_timestamp_millis());
+    let unexpired_ids = candidates
+        .iter()
+        .map(|bead| bead.id.clone())
+        .collect::<HashSet<_>>();
+    let expired_or_invalid_ids = candidate_ids
+        .iter()
+        .filter(|id| !unexpired_ids.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
     // C 冲突消解：剔除被取代（superseded）的旧 bead。
     let superseded = load_superseded_bead_ids(&agent.id);
+    let before_superseded_ids = candidates
+        .iter()
+        .map(|bead| bead.id.clone())
+        .collect::<Vec<_>>();
     candidates.retain(|bead| !superseded.contains(&bead.id));
+    let superseded_ids = before_superseded_ids
+        .iter()
+        .filter(|id| superseded.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
 
     // B 衰减：能力开关（首次安装默认开）。开启后按 effective_recall_score 重排，
     // 让高 confidence + 新鲜的记忆上浮（pinned 不衰减）。访问强化（access_count）待字段扩展后补。
@@ -25348,11 +25374,13 @@ fn select_context_memory_beads(
 
     let mut selected = Vec::new();
     let mut used_tokens = 0_u32;
+    let mut budget_skipped_ids = Vec::new();
     for bead in candidates {
         let tokens = bead
             .token_count
             .unwrap_or_else(|| estimate_bead_tokens(&bead.summary));
         if used_tokens.saturating_add(tokens) > options.memory_token_budget {
+            budget_skipped_ids.push(bead.id.clone());
             continue;
         }
         used_tokens = used_tokens.saturating_add(tokens);
@@ -25392,7 +25420,23 @@ fn select_context_memory_beads(
             );
         }
     }
-    selected
+    let selected_ids = selected
+        .iter()
+        .map(|bead| bead.id.clone())
+        .collect::<Vec<_>>();
+    (
+        selected,
+        ContextMemorySelectionEvidence {
+            strategy: strategy.to_string(),
+            candidate_ids,
+            selected_ids,
+            expired_or_invalid_ids,
+            superseded_ids,
+            budget_skipped_ids,
+            used_tokens,
+            token_budget: options.memory_token_budget,
+        },
+    )
 }
 
 /// 取会话生效的 token 限制：优先 config 里该会话的手填覆盖（context_window/max_output_tokens，>0 才生效），
@@ -27744,6 +27788,21 @@ struct ContextRuntimeSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct ContextMemorySelectionEvidence {
+    /// 召回路径：semantic、keyword 或 prompt_fallback。
+    strategy: String,
+    /// 经过查询但尚未做 TTL/superseded/token 过滤的候选 bead。
+    candidate_ids: Vec<String>,
+    /// 最终实际注入 system prompt 的 bead；预算裁剪后会再次同步。
+    selected_ids: Vec<String>,
+    expired_or_invalid_ids: Vec<String>,
+    superseded_ids: Vec<String>,
+    budget_skipped_ids: Vec<String>,
+    used_tokens: u32,
+    token_budget: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ContextAssembly {
     system_prompt: String,
     messages: Vec<InputMessage>,
@@ -27754,6 +27813,8 @@ struct ContextAssembly {
     memory_revision: String,
     /// 实际注入 prompt 的 bead id，便于诊断“记忆已加载但未进入上下文”的差异。
     memory_bead_ids: Vec<String>,
+    /// 记忆召回、过滤和 token 预算证据，供预览/回放诊断。
+    memory_selection: ContextMemorySelectionEvidence,
     /// 本轮固定的 workspace/聊天室/权限/模型/工具目录作用域。
     runtime_snapshot: ContextRuntimeSnapshot,
     history_floor_millis: Option<u64>,
@@ -52597,6 +52658,14 @@ mod tests {
             .runtime_snapshot
             .tool_catalog_revision
             .starts_with("tools-"));
+        assert_eq!(assembly.memory_selection.selected_ids, vec!["bead-alpha"]);
+        assert!(assembly
+            .memory_selection
+            .candidate_ids
+            .contains(&"bead-alpha".to_string()));
+        assert_eq!(assembly.memory_selection.token_budget, 80);
+        assert!(assembly.memory_selection.used_tokens <= 80);
+        assert!(assembly.memory_selection.superseded_ids.is_empty());
     }
 
     #[test]
@@ -64665,6 +64734,8 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("runtime_snapshot"));
         assert!(WEB_APP_JS.contains("runtime_model"));
         assert!(WEB_APP_JS.contains("tool_catalog_revision"));
+        assert!(WEB_APP_JS.contains("memory_selection"));
+        assert!(WEB_APP_JS.contains("budget_skipped"));
         assert!(WEB_APP_JS.contains("loaded_memory_ids"));
         assert!(WEB_APP_JS.contains("memory-bead-pin-toggle"));
         assert!(WEB_APP_JS.contains("memory-bead-edit"));
@@ -68773,6 +68844,16 @@ attach: last_assistant
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
+            memory_selection: super::ContextMemorySelectionEvidence {
+                strategy: "test".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                expired_or_invalid_ids: Vec::new(),
+                superseded_ids: Vec::new(),
+                budget_skipped_ids: Vec::new(),
+                used_tokens: 0,
+                token_budget: 0,
+            },
             runtime_snapshot: super::ContextRuntimeSnapshot {
                 snapshot_id: "ctx-test".to_string(),
                 workspace_id: "ws-test".to_string(),
@@ -68867,6 +68948,16 @@ attach: last_assistant
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
+            memory_selection: super::ContextMemorySelectionEvidence {
+                strategy: "test".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                expired_or_invalid_ids: Vec::new(),
+                superseded_ids: Vec::new(),
+                budget_skipped_ids: Vec::new(),
+                used_tokens: 0,
+                token_budget: 0,
+            },
             runtime_snapshot: super::ContextRuntimeSnapshot {
                 snapshot_id: "ctx-test".to_string(),
                 workspace_id: "ws-test".to_string(),
@@ -68923,6 +69014,16 @@ attach: last_assistant
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
+            memory_selection: super::ContextMemorySelectionEvidence {
+                strategy: "test".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                expired_or_invalid_ids: Vec::new(),
+                superseded_ids: Vec::new(),
+                budget_skipped_ids: Vec::new(),
+                used_tokens: 0,
+                token_budget: 0,
+            },
             runtime_snapshot: super::ContextRuntimeSnapshot {
                 snapshot_id: "ctx-test".to_string(),
                 workspace_id: "ws-test".to_string(),
@@ -68983,6 +69084,16 @@ attach: last_assistant
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
+            memory_selection: super::ContextMemorySelectionEvidence {
+                strategy: "test".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                expired_or_invalid_ids: Vec::new(),
+                superseded_ids: Vec::new(),
+                budget_skipped_ids: Vec::new(),
+                used_tokens: 0,
+                token_budget: 0,
+            },
             runtime_snapshot: super::ContextRuntimeSnapshot {
                 snapshot_id: "ctx-test".to_string(),
                 workspace_id: "ws-test".to_string(),
