@@ -641,6 +641,10 @@ fn app() -> Router {
             get(api_session_messages),
         )
         .route(
+            "/api/sessions/{session_id}/history",
+            get(api_session_history),
+        )
+        .route(
             "/api/sessions/{session_id}/beads",
             get(api_session_beads).post(api_session_add_bead),
         )
@@ -10373,6 +10377,18 @@ async fn api_session_messages(
         .lock()
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
     store.session_messages(&session_id, query)
+}
+
+/// P1-1：按 Codex harness 的 thread/turn/item 形态返回兼容历史投影。
+/// 旧的 `/messages` 保持不变；新端点只负责稳定游标和类型化 item，不改变现有存储。
+async fn api_session_history(
+    AxumPath(session_id): AxumPath<String>,
+    Query(query): Query<SessionHistoryQuery>,
+) -> ApiResult<Json<SessionHistoryResponse>> {
+    let store = session_store()
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+    store.session_history(&session_id, query)
 }
 
 async fn api_session_beads(
@@ -25096,6 +25112,47 @@ fn context_compaction_memory_summary(
     (!summary.trim().is_empty()).then_some(summary)
 }
 
+fn context_compaction_item_from_history(
+    dropped_history: &[PersistedChatMessage],
+    summary: &str,
+    agent: &AgentSessionDto,
+) -> Option<ContextCompactionItem> {
+    if dropped_history.is_empty() || summary.trim().is_empty() {
+        return None;
+    }
+    let first_id = dropped_history
+        .first()
+        .map(|message| message.id.as_str())
+        .unwrap_or_default();
+    let last_id = dropped_history
+        .last()
+        .map(|message| message.id.as_str())
+        .unwrap_or_default();
+    let signature = format!("{first_id}\u{1f}{last_id}\u{1f}{summary}");
+    let id = format!("compaction-{:016x}", hash_bytes(signature.as_bytes()));
+    let persisted = agent
+        .memory_beads
+        .iter()
+        .any(|bead| bead.source == "context:auto-compact" && bead.summary == summary);
+    Some(ContextCompactionItem {
+        id,
+        kind: "compaction".to_string(),
+        source: "context:auto-compact".to_string(),
+        summary: summary.to_string(),
+        message_count: dropped_history.len(),
+        token_count: estimate_bead_tokens(summary),
+        created_at: dropped_history
+            .last()
+            .map(|message| message.created_at)
+            .unwrap_or_default(),
+        status: if persisted {
+            "persisted".to_string()
+        } else {
+            "preview".to_string()
+        },
+    })
+}
+
 fn is_goal_temporary_memory_bead(bead: &MemoryBeadDto) -> bool {
     (bead.source == "chat-room:auto-extract" && is_goal_temporary_text(&bead.summary))
         || (bead.kind != "goal-task-skill"
@@ -25320,6 +25377,7 @@ fn build_context_assembly_with_roster(
     // 12-D 自动 compact：超出 token 预算的较旧历史不再直接丢弃，而是收集起来做滚动摘要，
     // 以一条 [历史摘要] 注入 system_prompt，避免长会话丢失早期上下文。
     let mut dropped_history: Vec<PersistedChatMessage> = Vec::new();
+    let mut compaction_item = None;
     let effective_history_budget = options.history_token_budget.min(
         max_prompt_tokens
             .saturating_sub(system_tokens)
@@ -25360,6 +25418,8 @@ fn build_context_assembly_with_roster(
     if !dropped_history.is_empty() {
         dropped_history.reverse();
         let rolling_summary = summarize_dropped_history(&dropped_history);
+        compaction_item =
+            context_compaction_item_from_history(&dropped_history, &rolling_summary, agent);
         diagnostics::info(
             "context",
             "compact.ok",
@@ -25486,6 +25546,7 @@ fn build_context_assembly_with_roster(
         memory_revision,
         memory_bead_ids,
         memory_selection,
+        compaction_item,
         runtime_snapshot,
         history_floor_millis: options.history_floor_millis,
         history_message_count: selected_history.len(),
@@ -28121,6 +28182,18 @@ struct ContextRuntimeSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct ContextCompactionItem {
+    id: String,
+    kind: String,
+    source: String,
+    summary: String,
+    message_count: usize,
+    token_count: u32,
+    created_at: u64,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ContextMemorySelectionEvidence {
     /// 召回路径：semantic、keyword 或 prompt_fallback。
     strategy: String,
@@ -28148,6 +28221,8 @@ struct ContextAssembly {
     memory_bead_ids: Vec<String>,
     /// 记忆召回、过滤和 token 预算证据，供预览/回放诊断。
     memory_selection: ContextMemorySelectionEvidence,
+    /// 历史被预算裁剪时生成的 typed compaction item；与原始消息分开，便于回放和恢复。
+    compaction_item: Option<ContextCompactionItem>,
     /// 本轮固定的 workspace/聊天室/权限/模型/工具目录作用域。
     runtime_snapshot: ContextRuntimeSnapshot,
     history_floor_millis: Option<u64>,
@@ -33533,7 +33608,7 @@ impl SessionStore {
         let mut added_memory_beads = 0usize;
         if let Some(summary) = summary {
             let signature =
-                memory_bead_signature("L2", "conversation", "context:auto-compact", &summary);
+                memory_bead_signature("L2", "compaction", "context:auto-compact", &summary);
             if !session
                 .memory_beads
                 .iter()
@@ -33541,7 +33616,7 @@ impl SessionStore {
             {
                 session.memory_beads.push(MemoryBeadDto {
                     id: format!("ctx-compact-{now}-{:016x}", hash_bytes(summary.as_bytes())),
-                    kind: "conversation".to_string(),
+                    kind: "compaction".to_string(),
                     layer: "L2".to_string(),
                     summary: summary.clone(),
                     source: "context:auto-compact".to_string(),
@@ -35714,6 +35789,26 @@ impl SessionStore {
                 })
                 .flatten(),
         }))
+    }
+
+    fn session_history(
+        &self,
+        session_id: &str,
+        query: SessionHistoryQuery,
+    ) -> ApiResult<Json<SessionHistoryResponse>> {
+        let Some(session) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存"));
+        };
+        Ok(Json(session_history_response(
+            session,
+            self.is_active(session_id),
+            query,
+        )))
     }
 
     fn append_chat_messages(
@@ -43146,6 +43241,7 @@ fn memory_bead_kind_weight(kind: &str) -> f64 {
         "decision" => 1.0,
         "tool" => 0.95,
         "result" | "task" => 0.9,
+        "compaction" => 0.86,
         "fact" => 0.75,
         "reasoning" => 0.6,
         "chat" => 0.3,
@@ -43585,6 +43681,14 @@ struct MessageQuery {
     before: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct SessionHistoryQuery {
+    /// 每页返回的 turn 数；item 会随所属 turn 一起返回。
+    limit: Option<usize>,
+    /// 上一页返回的 turn id（也兼容该 turn 的首条 item id）。
+    before: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct GoalListQuery {
     status: Option<String>,
@@ -43977,6 +44081,204 @@ struct SessionMessagesResponse {
     messages: Vec<PersistedChatMessage>,
     has_more: bool,
     next_before: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionHistoryItemDto {
+    id: String,
+    turn_id: String,
+    /// `user_message`、`assistant_message`、`tool_result`、`system` 或 `compaction`。
+    kind: String,
+    role: String,
+    author: String,
+    target: String,
+    content: String,
+    source: String,
+    created_at: u64,
+    attachments: Vec<ChatAttachmentDto>,
+    message_count: Option<usize>,
+    token_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionHistoryTurnDto {
+    id: String,
+    session_id: String,
+    status: String,
+    started_at: u64,
+    completed_at: Option<u64>,
+    item_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionHistoryResponse {
+    session: SessionSummaryDto,
+    turns: Vec<SessionHistoryTurnDto>,
+    items: Vec<SessionHistoryItemDto>,
+    has_more: bool,
+    next_before: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionHistoryTurnBundle {
+    turn: SessionHistoryTurnDto,
+    items: Vec<SessionHistoryItemDto>,
+}
+
+fn history_message_item_kind(message: &PersistedChatMessage) -> String {
+    let role = message.role.trim().to_ascii_lowercase();
+    if role == "user" {
+        return "user_message".to_string();
+    }
+    if role == "tool" {
+        return "tool_result".to_string();
+    }
+    if role == "system" {
+        return "system".to_string();
+    }
+    if message.kind.to_ascii_lowercase().contains("tool") {
+        return "tool_call".to_string();
+    }
+    "assistant_message".to_string()
+}
+
+fn history_turn_id(session_id: &str, cursor: &str) -> String {
+    format!(
+        "turn-{:016x}",
+        hash_bytes(format!("{session_id}\u{1f}{cursor}").as_bytes())
+    )
+}
+
+fn history_compaction_turn_id(bead_id: &str) -> String {
+    format!("turn-compaction-{:016x}", hash_bytes(bead_id.as_bytes()))
+}
+
+fn session_history_response(
+    session: &PersistedSession,
+    active: bool,
+    query: SessionHistoryQuery,
+) -> SessionHistoryResponse {
+    let mut bundles = Vec::new();
+    let mut ranges = Vec::new();
+    let mut range_start = None;
+    for (index, message) in session.messages.iter().enumerate() {
+        if message.role.eq_ignore_ascii_case("user") {
+            if let Some(start) = range_start.replace(index) {
+                ranges.push((start, index));
+            }
+        } else if range_start.is_none() {
+            range_start = Some(index);
+        }
+    }
+    if let Some(start) = range_start {
+        ranges.push((start, session.messages.len()));
+    }
+
+    for (start, end) in ranges {
+        let Some(first) = session.messages.get(start) else {
+            continue;
+        };
+        let Some(last) = session.messages.get(end.saturating_sub(1)) else {
+            continue;
+        };
+        let turn_id = history_turn_id(&session.id, &first.id);
+        let items = session.messages[start..end]
+            .iter()
+            .map(|message| SessionHistoryItemDto {
+                id: message.id.clone(),
+                turn_id: turn_id.clone(),
+                kind: history_message_item_kind(message),
+                role: message.role.clone(),
+                author: message.author.clone(),
+                target: message.target.clone(),
+                content: message.content.clone(),
+                source: "session_messages".to_string(),
+                created_at: message.created_at,
+                attachments: message.attachments.clone(),
+                message_count: None,
+                token_count: Some(estimate_message_tokens(message)),
+            })
+            .collect::<Vec<_>>();
+        bundles.push(SessionHistoryTurnBundle {
+            turn: SessionHistoryTurnDto {
+                id: turn_id,
+                session_id: session.id.clone(),
+                status: if last.role.eq_ignore_ascii_case("user") {
+                    "open".to_string()
+                } else {
+                    "completed".to_string()
+                },
+                started_at: first.created_at,
+                completed_at: (!last.role.eq_ignore_ascii_case("user")).then_some(last.created_at),
+                item_ids: items.iter().map(|item| item.id.clone()).collect(),
+            },
+            items,
+        });
+    }
+
+    // 自动压缩不是普通聊天消息，作为独立 typed item 暴露，便于恢复/回放时区分摘要与原文。
+    for bead in session
+        .memory_beads
+        .iter()
+        .filter(|bead| bead.source == "context:auto-compact")
+    {
+        let turn_id = history_compaction_turn_id(&bead.id);
+        let item = SessionHistoryItemDto {
+            id: bead.id.clone(),
+            turn_id: turn_id.clone(),
+            kind: "compaction".to_string(),
+            role: "system".to_string(),
+            author: "COOLZHU AGENT".to_string(),
+            target: session.id.clone(),
+            content: bead.summary.clone(),
+            source: bead.source.clone(),
+            created_at: bead.created_at,
+            attachments: Vec::new(),
+            message_count: None,
+            token_count: bead.token_count,
+        };
+        bundles.push(SessionHistoryTurnBundle {
+            turn: SessionHistoryTurnDto {
+                id: turn_id,
+                session_id: session.id.clone(),
+                status: "compacted".to_string(),
+                started_at: bead.created_at,
+                completed_at: Some(bead.created_at),
+                item_ids: vec![item.id.clone()],
+            },
+            items: vec![item],
+        });
+    }
+    bundles.sort_by(|left, right| {
+        left.turn
+            .started_at
+            .cmp(&right.turn.started_at)
+            .then_with(|| left.turn.id.cmp(&right.turn.id))
+    });
+
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let end = query
+        .before
+        .as_deref()
+        .and_then(|cursor| {
+            bundles.iter().position(|bundle| {
+                bundle.turn.id == cursor
+                    || bundle.turn.item_ids.first().is_some_and(|id| id == cursor)
+            })
+        })
+        .unwrap_or(bundles.len());
+    let start = end.saturating_sub(limit);
+    let selected = &bundles[start..end];
+    SessionHistoryResponse {
+        session: session.summary(active),
+        turns: selected.iter().map(|bundle| bundle.turn.clone()).collect(),
+        items: selected
+            .iter()
+            .flat_map(|bundle| bundle.items.iter().cloned())
+            .collect(),
+        has_more: start > 0,
+        next_before: (start > 0).then(|| bundles[start].turn.id.clone()),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -60249,6 +60551,60 @@ attach: last_assistant
     }
 
     #[test]
+    fn session_history_exposes_turns_items_and_typed_compaction_cursor() {
+        let mut session = super::seed_session();
+        session.id = "history-test".to_string();
+        session.messages = vec![
+            persisted_role_message("u1", "user", "请检查工程", 10),
+            persisted_role_message("a1", "assistant", "已检查完成", 20),
+            persisted_role_message("u2", "user", "再总结一次", 30),
+        ];
+        session.memory_beads = vec![super::MemoryBeadDto {
+            id: "compaction-1".to_string(),
+            kind: "compaction".to_string(),
+            layer: "L2".to_string(),
+            summary: "[自动上下文压缩摘要] 旧对话已压缩".to_string(),
+            source: "context:auto-compact".to_string(),
+            token_count: Some(12),
+            created_at: 40,
+            ..super::MemoryBeadDto::default()
+        }];
+
+        let latest = super::session_history_response(
+            &session,
+            true,
+            super::SessionHistoryQuery {
+                limit: Some(1),
+                before: None,
+            },
+        );
+        assert_eq!(latest.turns.len(), 1);
+        assert_eq!(latest.turns[0].status, "compacted");
+        assert_eq!(latest.items.len(), 1);
+        assert_eq!(latest.items[0].kind, "compaction");
+        assert!(latest.has_more);
+        let cursor = latest.next_before.clone().expect("history cursor");
+
+        let previous = super::session_history_response(
+            &session,
+            true,
+            super::SessionHistoryQuery {
+                limit: Some(2),
+                before: Some(cursor),
+            },
+        );
+        assert_eq!(previous.turns.len(), 2);
+        assert!(previous
+            .items
+            .iter()
+            .any(|item| item.kind == "user_message"));
+        assert!(previous.turns.iter().all(|turn| turn
+            .item_ids
+            .iter()
+            .all(|id| previous.items.iter().any(|item| &item.id == id))));
+    }
+
+    #[test]
     fn local_active_mode_maps_running_services() {
         assert_eq!(super::local_active_mode(true, false), "chat");
         assert_eq!(super::local_active_mode(false, true), "vision");
@@ -65415,6 +65771,8 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("/beads/summary"));
         assert!(WEB_APP_JS.contains("/beads/prompt"));
         assert!(WEB_APP_JS.contains("/context-preview"));
+        assert!(WEB_APP_JS.contains("compaction_item"));
+        assert!(WEB_APP_JS.contains("/history"));
         assert!(WEB_APP_JS.contains("function memoryWindowRefreshPreviews"));
         assert!(WEB_APP_JS.contains("context_snapshot_id"));
         assert!(WEB_APP_JS.contains("memory_revision"));
@@ -65425,12 +65783,15 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("budget_skipped"));
         assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-mode\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-jobs\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-history\""));
         assert!(WEB_INDEX_HTML.contains("data-memory-job-type=\"extraction\""));
         assert!(WEB_INDEX_HTML.contains("data-memory-job-type=\"consolidation\""));
         assert!(WEB_APP_JS.contains("/memory-mode"));
         assert!(WEB_APP_JS.contains("/memory/jobs"));
+        assert!(WEB_APP_JS.contains("/history?limit=6"));
         assert!(WEB_APP_JS.contains("memoryWindowStartJob"));
         assert!(WEB_APP_JS.contains("memoryWindowRenderJobs"));
+        assert!(WEB_APP_JS.contains("memoryWindowRenderHistory"));
         assert!(WEB_APP_JS.contains("memoryWindowUpdateMode"));
         assert!(WEB_APP_JS.contains("memory_mode"));
         assert!(WEB_APP_JS.contains("loaded_memory_ids"));
@@ -65443,6 +65804,8 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("memoryWindowRenderConstellation([])"));
         assert!(WEB_STYLES_CSS.contains(".memory-window-insights"));
         assert!(WEB_STYLES_CSS.contains(".memory-window-jobs"));
+        assert!(WEB_STYLES_CSS.contains(".memory-window-history"));
+        assert!(WEB_STYLES_CSS.contains("grid-template-rows: auto auto auto auto minmax(0, 1fr)"));
         assert!(WEB_STYLES_CSS.contains(".memory-window-preview-card"));
     }
 
@@ -69552,6 +69915,7 @@ attach: last_assistant
                 used_tokens: 0,
                 token_budget: 0,
             },
+            compaction_item: None,
             runtime_snapshot: super::ContextRuntimeSnapshot {
                 snapshot_id: "ctx-test".to_string(),
                 workspace_id: "ws-test".to_string(),
@@ -69657,6 +70021,7 @@ attach: last_assistant
                 used_tokens: 0,
                 token_budget: 0,
             },
+            compaction_item: None,
             runtime_snapshot: super::ContextRuntimeSnapshot {
                 snapshot_id: "ctx-test".to_string(),
                 workspace_id: "ws-test".to_string(),
@@ -69724,6 +70089,7 @@ attach: last_assistant
                 used_tokens: 0,
                 token_budget: 0,
             },
+            compaction_item: None,
             runtime_snapshot: super::ContextRuntimeSnapshot {
                 snapshot_id: "ctx-test".to_string(),
                 workspace_id: "ws-test".to_string(),
@@ -69795,6 +70161,7 @@ attach: last_assistant
                 used_tokens: 0,
                 token_budget: 0,
             },
+            compaction_item: None,
             runtime_snapshot: super::ContextRuntimeSnapshot {
                 snapshot_id: "ctx-test".to_string(),
                 workspace_id: "ws-test".to_string(),
@@ -69934,6 +70301,7 @@ attach: last_assistant
         assert!(session.context_reset_at > 0);
         assert!(session.memory_beads.iter().any(|bead| {
             bead.source == "context:auto-compact"
+                && bead.kind == "compaction"
                 && bead.summary.contains("clawd-on-desk-main")
                 && !bead.summary.contains("goal-artifacts")
         }));

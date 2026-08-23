@@ -154,6 +154,7 @@ let memoryWindowSummary = null;
 let memoryWindowPromptPreview = null;
 let memoryWindowContextPreview = null;
 let memoryWindowJobs = [];
+let memoryWindowHistory = { turns: [], items: [], has_more: false, next_before: null };
 let memoryWindowPreviewTimer = null;
 let memoryWindowMode = "enabled";
 const DEFAULT_BROWSER_SEARCH_ENGINE_URL = "https://www.baidu.com/s?wd={query}";
@@ -371,6 +372,9 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   document.querySelector('[data-action="memory-jobs-refresh"]')?.addEventListener("click", (event) => {
     memoryWindowRefreshJobs(event.currentTarget);
+  });
+  document.querySelector('[data-action="memory-history-refresh"]')?.addEventListener("click", (event) => {
+    memoryWindowRefreshHistory(event.currentTarget);
   });
   document.querySelector('[data-role="memory-job-list"]')?.addEventListener("click", (event) => {
     const button = event.target.closest('[data-action="memory-job-retry"]');
@@ -7162,6 +7166,7 @@ async function memoryWindowRefresh() {
   const beads = await loadSessionBeads();
   await memoryWindowRefreshPreviews();
   await memoryWindowRefreshJobs();
+  await memoryWindowRefreshHistory();
   return beads;
 }
 
@@ -7257,6 +7262,90 @@ async function memoryWindowRefreshJobs(button = null) {
     memoryWindowRenderJobs();
     addMessage({ author: "记忆窗口", text: `作业状态加载失败：${error.message}`, kind: "thought", icon: "error-log" });
     return [];
+  } finally {
+    if (button) {
+      setBusy(button, false);
+    }
+  }
+}
+
+function memoryHistoryStatusLabel(status) {
+  return {
+    open: "进行中",
+    completed: "已完成",
+    compacted: "已压缩",
+  }[String(status || "")] || String(status || "未知");
+}
+
+function memoryWindowRenderHistory() {
+  const list = document.querySelector('[data-role="memory-history-list"]');
+  const status = document.querySelector('[data-role="memory-history-status"]');
+  if (!list) {
+    return;
+  }
+  list.replaceChildren();
+  const turns = Array.isArray(memoryWindowHistory.turns) ? memoryWindowHistory.turns : [];
+  const items = Array.isArray(memoryWindowHistory.items) ? memoryWindowHistory.items : [];
+  if (status) {
+    status.textContent = turns.length
+      ? `${turns.length} 个 turn · ${items.length} 个 item${memoryWindowHistory.has_more ? " · 还有更早" : ""}`
+      : "暂无历史";
+  }
+  if (!turns.length) {
+    const empty = document.createElement("span");
+    empty.className = "memory-window-history-empty";
+    empty.textContent = "暂无可分页的会话历史。";
+    list.append(empty);
+    return;
+  }
+  const itemsByTurn = new Map();
+  items.forEach((item) => {
+    const bucket = itemsByTurn.get(item.turn_id) || [];
+    bucket.push(item);
+    itemsByTurn.set(item.turn_id, bucket);
+  });
+  turns.forEach((turn) => {
+    const row = document.createElement("div");
+    row.className = `memory-window-history-row is-${turn.status || "unknown"}`;
+    const meta = document.createElement("span");
+    meta.className = "memory-window-history-meta";
+    meta.textContent = `${memoryHistoryStatusLabel(turn.status)} · ${turn.item_ids?.length || 0} items`;
+    row.append(meta);
+    const preview = document.createElement("small");
+    const turnItems = itemsByTurn.get(turn.id) || [];
+    preview.textContent = turnItems
+      .map((item) => `${item.kind}: ${String(item.content || "").replace(/\s+/g, " ").slice(0, 120)}`)
+      .join(" | ");
+    row.append(preview);
+    list.append(row);
+  });
+}
+
+async function memoryWindowRefreshHistory(button = null) {
+  const endpoint = memoryWindowSessionEndpoint("/history?limit=6");
+  if (!endpoint) {
+    memoryWindowHistory = { turns: [], items: [], has_more: false, next_before: null };
+    memoryWindowRenderHistory();
+    return memoryWindowHistory;
+  }
+  if (button) {
+    setBusy(button, true, "刷新中");
+  }
+  try {
+    const response = await requestJson(endpoint);
+    memoryWindowHistory = {
+      turns: Array.isArray(response.turns) ? response.turns : [],
+      items: Array.isArray(response.items) ? response.items : [],
+      has_more: Boolean(response.has_more),
+      next_before: response.next_before || null,
+    };
+    memoryWindowRenderHistory();
+    return memoryWindowHistory;
+  } catch (error) {
+    memoryWindowHistory = { turns: [], items: [], has_more: false, next_before: null };
+    memoryWindowRenderHistory();
+    addMessage({ author: "记忆窗口", text: `历史加载失败：${error.message}`, kind: "thought", icon: "error-log" });
+    return memoryWindowHistory;
   } finally {
     if (button) {
       setBusy(button, false);
@@ -7828,6 +7917,7 @@ function memoryWindowRenderContextPreview(response, fallback = "No context previ
   const memoryCandidates = Array.isArray(memorySelection.candidate_ids) ? memorySelection.candidate_ids : [];
   const memorySelected = Array.isArray(memorySelection.selected_ids) ? memorySelection.selected_ids : [];
   const runtime = response.runtime_snapshot || {};
+  const compaction = response.compaction_item || null;
   const systemSnippet = String(response.system_prompt || "").slice(0, 500);
   node.textContent = [
     `snapshot=${response.context_snapshot_id || "-"} memory_revision=${response.memory_revision || "-"}`,
@@ -7839,6 +7929,9 @@ function memoryWindowRenderContextPreview(response, fallback = "No context previ
     `loaded_memory_ids=${memoryIds.join(",") || "none"} history_floor=${response.history_floor_millis ?? "none"}`,
     `tokens total=${budget.total ?? 0}/${budget.budget ?? 0} system=${budget.system ?? 0} memory=${budget.memory ?? 0} history=${budget.history ?? 0} user=${budget.user ?? 0}`,
     `truncated=${Boolean(response.truncated)}`,
+    compaction
+      ? `compaction_item=${compaction.id || "-"} status=${compaction.status || "-"} messages=${compaction.message_count ?? 0} tokens=${compaction.token_count ?? 0}`
+      : "compaction_item=none",
     systemSnippet ? `system:\n${systemSnippet}` : "",
   ].filter(Boolean).join("\n").slice(0, 2400);
 }

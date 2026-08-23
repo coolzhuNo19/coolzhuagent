@@ -5946,7 +5946,7 @@ body.ui-3d .avatar-picker.is-portal {
   display: grid;
   /* 筛选、摘要、生命周期作业、内容区分别占一行；此前只有三行声明，
      导致新增的作业区被隐式压缩到仅剩一行文字高度。 */
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
   gap: 10px;
   min-width: 0;
   min-height: 0;
@@ -6115,6 +6115,74 @@ body.ui-3d .avatar-picker.is-portal {
 .memory-workbench-window .memory-window-job-error {
   flex: 1 1 auto;
   color: #ffb4a8;
+}
+
+.memory-workbench-window .memory-window-history {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid rgba(111, 214, 255, 0.28);
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.memory-workbench-window .memory-window-history-head,
+.memory-workbench-window .memory-window-history-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.memory-workbench-window .memory-window-history-head {
+  justify-content: space-between;
+}
+
+.memory-workbench-window .memory-window-history-head > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.memory-workbench-window .memory-window-history-head strong {
+  color: #7edcff;
+  font-size: 13px;
+}
+
+.memory-workbench-window .memory-window-history-head span,
+.memory-workbench-window .memory-window-history-empty,
+.memory-workbench-window .memory-window-history-row small {
+  min-width: 0;
+  overflow: hidden;
+  color: #c6d7df;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.memory-workbench-window .memory-window-history-list {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  max-height: 64px;
+  overflow: auto;
+}
+
+.memory-workbench-window .memory-window-history-row {
+  padding: 4px 6px;
+  border: 1px solid rgba(111, 214, 255, 0.18);
+  background: rgba(3, 12, 18, 0.34);
+}
+
+.memory-workbench-window .memory-window-history-row.is-compacted {
+  border-color: rgba(255, 197, 38, 0.46);
+}
+
+.memory-workbench-window .memory-window-history-meta {
+  flex: 0 0 auto;
+  color: #f6f7ef;
+  font-size: 12px;
+  font-weight: 900;
 }
 
 .memory-workbench-window .memory-window-filters label {
