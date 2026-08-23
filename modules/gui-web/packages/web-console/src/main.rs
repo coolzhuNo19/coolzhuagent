@@ -44623,6 +44623,7 @@ fn agent_event_id(
 
 fn session_history_item_event_type(item: &SessionHistoryItemDto) -> &'static str {
     match item.kind.as_str() {
+        "reasoning" => "reasoning.completed",
         "tool_call" => "tool.call",
         "tool_result" => "tool.result",
         _ => "item.completed",
@@ -44631,6 +44632,13 @@ fn session_history_item_event_type(item: &SessionHistoryItemDto) -> &'static str
 
 fn session_history_item_event_payload(item: &SessionHistoryItemDto) -> JsonValue {
     match item.kind.as_str() {
+        "reasoning" => json!({
+            "item": item,
+            "reasoning": {
+                "visibility": "summary",
+                "redacted": false,
+            },
+        }),
         "tool_call" | "tool_result" => json!({
             "item": item,
             "tool_call": {
@@ -44756,6 +44764,9 @@ fn history_message_item_kind(message: &PersistedChatMessage) -> String {
         return "user_message".to_string();
     }
     let kind = message.kind.trim().to_ascii_lowercase();
+    if kind == "reasoning" {
+        return "reasoning".to_string();
+    }
     if role == "tool" || matches!(kind.as_str(), "tool-result" | "tool_result") {
         return "tool_result".to_string();
     }
@@ -61439,6 +61450,16 @@ attach: last_assistant
         session.messages = vec![
             persisted_role_message("u1", "user", "读取配置", 10),
             super::PersistedChatMessage {
+                id: "reasoning-item-1".to_string(),
+                author: "模型思考摘要".to_string(),
+                role: "assistant".to_string(),
+                target: "推理卡片".to_string(),
+                content: "先检查配置文件，再调用读取工具。".to_string(),
+                kind: "reasoning".to_string(),
+                attachments: Vec::new(),
+                created_at: 15,
+            },
+            super::PersistedChatMessage {
                 id: "call-item-1".to_string(),
                 author: "系统工具执行 Agent".to_string(),
                 role: "assistant".to_string(),
@@ -61473,7 +61494,7 @@ attach: last_assistant
                 .iter()
                 .map(|item| item.kind.as_str())
                 .collect::<Vec<_>>(),
-            vec!["user_message", "tool_call", "tool_result"]
+            vec!["user_message", "reasoning", "tool_call", "tool_result"]
         );
         let jsonl = super::session_agent_events_jsonl(&history);
         let events = jsonl
@@ -61486,6 +61507,15 @@ attach: last_assistant
             .expect("tool.call");
         assert_eq!(call["payload"]["tool_call"]["name"], "read_file");
         assert_eq!(call["payload"]["tool_call"]["status"], "ok");
+        let reasoning = events
+            .iter()
+            .find(|event| event["event_type"] == "reasoning.completed")
+            .expect("reasoning.completed");
+        assert_eq!(reasoning["payload"]["reasoning"]["visibility"], "summary");
+        assert_eq!(
+            reasoning["payload"]["item"]["content"],
+            "先检查配置文件，再调用读取工具。"
+        );
         let result = events
             .iter()
             .find(|event| event["event_type"] == "tool.result")
@@ -66686,6 +66716,7 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("/events?limit=6"));
         assert!(WEB_APP_JS.contains("function memoryWindowValidateEvents"));
         assert!(WEB_APP_JS.contains("coolzhu.agent.event.v1"));
+        assert!(WEB_APP_JS.contains("event.event_type === \"reasoning.completed\""));
         assert!(WEB_APP_JS.contains("event.event_type === \"tool.call\""));
         assert!(WEB_APP_JS.contains("event.event_type === \"tool.result\""));
         assert!(WEB_APP_JS.contains("memoryWindowStartJob"));
@@ -67507,9 +67538,11 @@ attach: last_assistant
         assert!(!WEB_MAIN_RS
             .contains("yield Ok(sse_json_event(\"message_done\", &reasoning_message));"));
         assert!(WEB_APP_JS.contains("function shouldRenderCompletedMessage"));
+        assert!(WEB_APP_JS.contains("includeReasoning = false"));
+        assert!(WEB_APP_JS.contains("includeReasoning: true"));
         assert!(WEB_APP_JS.contains("function isGoalPhaseMessage"));
-        assert!(WEB_APP_JS.contains("message.kind !== \"reasoning\""));
-        assert!(WEB_APP_JS.contains("message.kind !== \"tool-call\""));
+        assert!(WEB_APP_JS.contains("reasoning && !includeReasoning"));
+        assert!(WEB_APP_JS.contains("const toolCall = message.kind === \"tool-call\""));
         assert!(!WEB_APP_JS.contains("function hideReasoningForAssistant"));
         assert!(!WEB_APP_JS.contains("hideReasoningForAssistant(data.id)"));
         assert!(WEB_APP_JS.contains("if (data?.kind === \"reasoning\")"));

@@ -7423,7 +7423,8 @@ async function memoryWindowValidateEvents(button = null) {
     if (status) {
       const toolCalls = events.filter((event) => event.event_type === "tool.call").length;
       const toolResults = events.filter((event) => event.event_type === "tool.result").length;
-      status.textContent = `${events.length} events · coolzhu.agent.event.v1 · JSONL 有序 · ToolCall ${toolCalls} / ToolResult ${toolResults}`;
+      const reasoningEvents = events.filter((event) => event.event_type === "reasoning.completed").length;
+      status.textContent = `${events.length} events · coolzhu.agent.event.v1 · JSONL 有序 · Reasoning ${reasoningEvents} / ToolCall ${toolCalls} / ToolResult ${toolResults}`;
     }
     return events;
   } catch (error) {
@@ -8697,7 +8698,9 @@ async function loadChatRoomMessages(roomId, { before = null, appendOlder = false
     list.replaceChildren();
   }
 
-  const visibleMessages = (response.messages || []).filter(shouldRenderCompletedMessage);
+  const visibleMessages = (response.messages || []).filter((message) => (
+    shouldRenderCompletedMessage(message, { includeReasoning: true })
+  ));
   const messages = appendOlder ? [...visibleMessages].reverse() : visibleMessages;
   messages.forEach((message) => {
     addMessage({
@@ -11025,7 +11028,7 @@ function handleChatStreamEvent({ event, data }) {
   return data;
 }
 
-function shouldRenderCompletedMessage(message) {
+function shouldRenderCompletedMessage(message, { includeReasoning = false } = {}) {
   if (!message) {
     return false;
   }
@@ -11033,7 +11036,12 @@ function shouldRenderCompletedMessage(message) {
     return false;
   }
   const kind = message?.kind ?? kindForMessage(message || {});
-  return message.kind !== "reasoning" && message.kind !== "tool-call" && kind !== "reasoning" && kind !== "tool-call";
+  const reasoning = message.kind === "reasoning" || kind === "reasoning";
+  const toolCall = message.kind === "tool-call" || kind === "tool-call";
+  if (reasoning && !includeReasoning) {
+    return false;
+  }
+  return !toolCall;
 }
 
 function isSpeakableAssistantReplyForTts(message) {
@@ -11209,7 +11217,7 @@ async function sendMessageFallback(payload, text, { t0 } = {}) {
   });
   console.debug(`chat send ${Math.round(performance.now() - (t0 ?? performance.now()))}ms`);
   result.messages
-    .filter(shouldRenderCompletedMessage)
+    .filter((message) => shouldRenderCompletedMessage(message, { includeReasoning: true }))
     .forEach((message) => upsertMessage(message, { sessionId: activeSessionId }));
   renderTaskList(result.tasks);
   await refreshGoals();
