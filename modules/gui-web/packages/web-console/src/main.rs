@@ -28479,7 +28479,7 @@ fn context_usage_footer_for_snapshot(
         String::new()
     };
     format!(
-        "---\nContext usage: {}.{}% ({}/{} {token_label} tokens; source={source}). Local estimate: {} tokens; local prompt budget: {}/{} tokens; history truncated: {}.{}",
+        "---\nContext usage: {}.{}% ({}/{} {token_label} tokens; source={source}). Local estimate: {} tokens; local prompt budget: {}/{} tokens; history truncated: {}.\nContext snapshot: {}; history source: {}; history loaded: {}; memory revision: {}{}",
         snapshot.percent_tenths / 10,
         snapshot.percent_tenths % 10,
         snapshot.used_tokens,
@@ -28488,6 +28488,10 @@ fn context_usage_footer_for_snapshot(
         assembly.token_budget.total,
         assembly.token_budget.budget,
         assembly.truncated,
+        assembly.context_snapshot_id,
+        assembly.history_selection.source,
+        assembly.history_selection.selected_ids.len(),
+        assembly.memory_revision,
         warning,
         source = snapshot.source.as_str(),
     )
@@ -44593,6 +44597,9 @@ struct SessionHistoryItemDto {
     attachments: Vec<ChatAttachmentDto>,
     message_count: Option<usize>,
     token_count: Option<u32>,
+    /// 由 Context usage 尾部回填的上下文快照；旧消息没有该字段时保持空值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_snapshot_id: Option<String>,
     /// ToolCall/ToolResult 的可重放元数据；普通消息和 compaction 不填充。
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
@@ -44634,6 +44641,9 @@ struct AgentEventEnvelope {
     thread_id: String,
     turn_id: Option<String>,
     item_id: Option<String>,
+    /// item 若来自模型回复的 Context usage 尾部，则在 envelope 顶层复现同一快照 ID。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_snapshot_id: Option<String>,
     created_at: u64,
     payload: JsonValue,
 }
@@ -44656,6 +44666,14 @@ fn agent_event_id(
         item_id.unwrap_or_default()
     );
     format!("event-{:016x}", hash_bytes(key.as_bytes()))
+}
+
+fn history_message_context_snapshot_id(message: &PersistedChatMessage) -> Option<String> {
+    const MARKER: &str = "Context snapshot:";
+    message.content.lines().find_map(|line| {
+        let value = line.trim().strip_prefix(MARKER)?.split(';').next()?.trim();
+        (!value.is_empty() && value != "-").then(|| value.to_string())
+    })
 }
 
 fn session_history_item_event_type(item: &SessionHistoryItemDto) -> &'static str {
@@ -44698,6 +44716,15 @@ fn session_agent_events_jsonl(history: &SessionHistoryResponse) -> String {
                           item_id: Option<&str>,
                           created_at: u64,
                           payload: JsonValue| {
+        let context_snapshot_id = payload
+            .get("context_snapshot_id")
+            .or_else(|| {
+                payload
+                    .get("item")
+                    .and_then(|item| item.get("context_snapshot_id"))
+            })
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
         let event = AgentEventEnvelope {
             schema: "coolzhu.agent.event.v1".to_string(),
             event_id: agent_event_id(&thread_id, event_type, turn_id, item_id),
@@ -44706,6 +44733,7 @@ fn session_agent_events_jsonl(history: &SessionHistoryResponse) -> String {
             thread_id: thread_id.clone(),
             turn_id: turn_id.map(str::to_string),
             item_id: item_id.map(str::to_string),
+            context_snapshot_id,
             created_at,
             payload,
         };
@@ -44929,6 +44957,7 @@ fn session_history_response(
                     attachments: message.attachments.clone(),
                     message_count: None,
                     token_count: Some(estimate_message_tokens(message)),
+                    context_snapshot_id: history_message_context_snapshot_id(message),
                     tool_call_id,
                     tool_name,
                     tool_status,
@@ -44973,6 +45002,7 @@ fn session_history_response(
             attachments: Vec::new(),
             message_count: None,
             token_count: bead.token_count,
+            context_snapshot_id: None,
             tool_call_id: None,
             tool_name: None,
             tool_status: None,
@@ -61444,7 +61474,16 @@ attach: last_assistant
         session.updated_at = 99;
         session.messages = vec![
             persisted_role_message("u1", "user", "事件第一轮", 10),
-            persisted_role_message("a1", "assistant", "已完成", 20),
+            super::PersistedChatMessage {
+                id: "a1".to_string(),
+                author: "COOLZHU AGENT".to_string(),
+                role: "assistant".to_string(),
+                target: "聊天".to_string(),
+                content: "已完成\n\n---\nContext usage: 1.0% (100/10000 input tokens; source=remote). Local estimate: 80 tokens; local prompt budget: 9000 tokens; history truncated: false.\nContext snapshot: ctx-events; history source: chat_room.messages; history loaded: 1; memory revision: mem-events".to_string(),
+                kind: "assistant-reply".to_string(),
+                attachments: Vec::new(),
+                created_at: 20,
+            },
         ];
         session.memory_beads = vec![super::MemoryBeadDto {
             id: "event-compaction".to_string(),
@@ -61485,6 +61524,12 @@ attach: last_assistant
         assert!(events.iter().all(
             |event| event["thread_id"] == "events-test" && event["event_id"].as_str().is_some()
         ));
+        let context_item = events
+            .iter()
+            .find(|event| event["payload"]["id"] == "a1")
+            .expect("assistant item with context snapshot");
+        assert_eq!(context_item["context_snapshot_id"], "ctx-events");
+        assert_eq!(context_item["payload"]["context_snapshot_id"], "ctx-events");
     }
 
     #[test]
@@ -70935,6 +70980,10 @@ attach: last_assistant
 
         let footer = super::context_usage_footer_for_assembly_with_usage(&agent, &assembly, None);
         assert!(footer.contains("Context usage:"));
+        assert!(footer.contains("Context snapshot: ctx-test"));
+        assert!(footer.contains("history source: chat_room.messages"));
+        assert!(footer.contains("history loaded: 0"));
+        assert!(footer.contains("memory revision: mem-test"));
         // 2026-05-31 容量更正：glm-5.1 上下文 200K。
         assert!(footer.contains("1000/200000"));
     }
