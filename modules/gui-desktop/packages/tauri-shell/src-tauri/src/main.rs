@@ -7,7 +7,7 @@ use std::os::windows::process::CommandExt;
 use std::sync::{Mutex, OnceLock};
 use tauri::{
     menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, PhysicalPosition, Url, WebviewWindowBuilder, WindowEvent,
 };
 
@@ -270,6 +270,12 @@ fn main() {
 }
 
 fn build_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let tray_icon = app.default_window_icon().cloned().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Tauri default window icon is missing",
+        )
+    })?;
     let show_item = MenuItem::with_id(app, "show", "显示控制台", true, None::<&str>)?;
     let hide_item = MenuItem::with_id(app, "hide", "隐藏控制台", true, None::<&str>)?;
     let pet_item = MenuItem::with_id(app, "pet", "显示桌宠", true, None::<&str>)?;
@@ -277,9 +283,10 @@ fn build_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
     let menu = Menu::with_items(app, &[&show_item, &hide_item, &pet_item, &quit_item])?;
 
-    TrayIconBuilder::new()
+    TrayIconBuilder::with_id("main")
+        .icon(tray_icon)
         .menu(&menu)
-        .show_menu_on_left_click(true)
+        .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_console(app),
             "hide" => hide_console(app),
@@ -287,8 +294,15 @@ fn build_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             "quit" => quit_application(app),
             _ => {}
         })
-        .on_tray_icon_event(|tray, _event| {
-            do_toggle_console(tray.app_handle());
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                do_toggle_console(tray.app_handle());
+            }
         })
         .build(app)?;
 

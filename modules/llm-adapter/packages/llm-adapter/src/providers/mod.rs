@@ -64,6 +64,21 @@ pub struct ModelTokenLimit {
     pub max_output_tokens: u32,
 }
 
+pub(crate) const CLAUDE_HAIKU_45_MODEL_ID: &str = "claude-haiku-4-5-20251001";
+pub(crate) const CLAUDE_HAIKU_45_LEGACY_MODEL_ID: &str = "claude-haiku-4-5-20251213";
+
+#[must_use]
+pub(crate) fn canonical_claude_model_id(model: &str) -> String {
+    let trimmed = model.trim();
+    if trimmed.eq_ignore_ascii_case("haiku")
+        || trimmed.eq_ignore_ascii_case(CLAUDE_HAIKU_45_LEGACY_MODEL_ID)
+    {
+        CLAUDE_HAIKU_45_MODEL_ID.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 const CLAW_API_METADATA: ProviderMetadata = ProviderMetadata {
     provider: ProviderKind::ClawApi,
     auth_env: "ANTHROPIC_API_KEY",
@@ -223,7 +238,7 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
     ("haiku", CLAW_API_METADATA),
     ("claude-opus-4-6", CLAW_API_METADATA),
     ("claude-sonnet-4-6", CLAW_API_METADATA),
-    ("claude-haiku-4-5-20251213", CLAW_API_METADATA),
+    ("claude-haiku-4-5-20251001", CLAW_API_METADATA),
     ("grok", XAI_METADATA),
     ("grok-3", XAI_METADATA),
     ("grok-mini", XAI_METADATA),
@@ -289,7 +304,7 @@ const MODEL_TOKEN_LIMITS: &[ModelTokenLimit] = &[
         max_output_tokens: 64_000,
     },
     ModelTokenLimit {
-        model: "claude-haiku-4-5-20251213",
+        model: "claude-haiku-4-5-20251001",
         context_tokens: 200_000,
         max_output_tokens: 64_000,
     },
@@ -481,7 +496,8 @@ pub fn resolve_model_alias(model: &str) -> String {
     match lower.as_str() {
         "opus" => "claude-opus-4-6".to_string(),
         "sonnet" => "claude-sonnet-4-6".to_string(),
-        "haiku" => "claude-haiku-4-5-20251213".to_string(),
+        "haiku" => CLAUDE_HAIKU_45_MODEL_ID.to_string(),
+        CLAUDE_HAIKU_45_LEGACY_MODEL_ID => CLAUDE_HAIKU_45_MODEL_ID.to_string(),
         "grok" | "grok-3" => "grok-3".to_string(),
         "grok-mini" | "grok-3-mini" => "grok-3-mini".to_string(),
         "grok-2" => "grok-2".to_string(),

@@ -1,7 +1,9 @@
 use crate::error::ApiError;
 use crate::providers::ProviderKind;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderProtocol {
     OpenAiChatCompletions,
     AnthropicMessages,

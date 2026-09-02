@@ -248,22 +248,77 @@ foreach ($requiredExclude in @(
     }
 }
 
-# Windows 小尺寸/高 DPI 图标契约：ICO 必须保留完整的 Shell 尺寸集合，且
-# 安装器构建脚本和两个快捷方式都必须显式使用应用 ICO，不能退回 launcher 默认图标。
-$iconAssetRoot = Join-Path $workspace 'docs\design-assets\coolzhu-icons-2026-08-12'
-$applicationIcon = Join-Path $iconAssetRoot 'coolzhu-application-icon.ico'
-$installerIcon = Join-Path $iconAssetRoot 'coolzhu-installer-icon.ico'
-foreach ($iconPath in @($applicationIcon, $installerIcon)) {
+# Windows 小尺寸/高 DPI 图标契约：最终母版、七份 final PNG、最终 ICO、
+# Tauri ICO/PNG 与 desktop-console PNG 必须真实存在并保留 32-bit Alpha。
+$iconFinalRoot = Join-Path $workspace 'docs\design-assets\coolzhu-icons-2026-08-27\final'
+$iconManifestPath = Join-Path $iconFinalRoot 'SOURCE-MANIFEST.json'
+if (-not (Test-Path -LiteralPath $iconManifestPath -PathType Leaf)) {
+    throw "P5-F icon manifest missing: $iconManifestPath"
+}
+$iconManifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $iconManifestPath | ConvertFrom-Json
+if ($iconManifest.asset_id -ne 'app-icon-cz-moon-gate-lantern-v1') {
+    throw 'P5-F icon manifest asset_id mismatch'
+}
+$applicationIcon = Join-Path $iconFinalRoot 'app-icon-cz-moon-gate-lantern-v1.ico'
+$applicationPng = Join-Path $iconFinalRoot 'app-icon-cz-moon-gate-lantern-v1.png'
+$tauriIconRoot = Join-Path $workspace 'modules\gui-desktop\packages\tauri-shell\src-tauri\icons'
+$tauriPng = Join-Path $tauriIconRoot 'app-icon-cz-moon-gate-lantern-v1.png'
+$tauriIco = Join-Path $tauriIconRoot 'app-icon-cz-moon-gate-lantern-v1.ico'
+$desktopConsolePng = Join-Path $workspace 'modules\gui-desktop\packages\desktop-console\assets\app-icon-cz-moon-gate-lantern-v1.png'
+
+Add-Type -AssemblyName System.Drawing
+function Assert-P5fPng {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][int]$ExpectedSize
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "P5-F PNG asset missing: $Path"
+    }
+    $bitmap = $null
+    try {
+        $bitmap = [System.Drawing.Bitmap]::new($Path)
+        if ($bitmap.Width -ne $ExpectedSize -or $bitmap.Height -ne $ExpectedSize) {
+            throw "P5-F PNG size mismatch: $Path -> $($bitmap.Width)x$($bitmap.Height)"
+        }
+        if ($bitmap.PixelFormat.ToString() -ne 'Format32bppArgb') {
+            throw "P5-F PNG must be Format32bppArgb: $Path -> $($bitmap.PixelFormat)"
+        }
+        $last = $ExpectedSize - 1
+        $cornerAlphas = @(
+            $bitmap.GetPixel(0, 0).A,
+            $bitmap.GetPixel($last, 0).A,
+            $bitmap.GetPixel(0, $last).A,
+            $bitmap.GetPixel($last, $last).A
+        )
+        if (@($cornerAlphas | Where-Object { $_ -gt 1 }).Count -gt 0) {
+            throw "P5-F PNG visible corner detected: $Path -> $($cornerAlphas -join ',')"
+        }
+    } finally {
+        if ($null -ne $bitmap) {
+            $bitmap.Dispose()
+        }
+    }
+}
+
+Assert-P5fPng -Path $applicationPng -ExpectedSize 1254
+foreach ($expectedSize in @(16, 24, 32, 48, 64, 128, 256)) {
+    Assert-P5fPng -Path (Join-Path $iconFinalRoot "app-icon-cz-moon-gate-lantern-v1-${expectedSize}.png") -ExpectedSize $expectedSize
+}
+Assert-P5fPng -Path $tauriPng -ExpectedSize 256
+Assert-P5fPng -Path $desktopConsolePng -ExpectedSize 256
+
+foreach ($iconPath in @($applicationIcon, $tauriIco)) {
     if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
-        throw "icon asset missing: $iconPath"
+        throw "P5-F ICO asset missing: $iconPath"
     }
     $iconBytes = [System.IO.File]::ReadAllBytes($iconPath)
     if ($iconBytes.Length -lt 22 -or $iconBytes[0] -ne 0 -or $iconBytes[1] -ne 0 -or $iconBytes[2] -ne 1 -or $iconBytes[3] -ne 0) {
         throw "invalid ICO header: $iconPath"
     }
     $iconCount = [int]$iconBytes[4] + (256 * [int]$iconBytes[5])
-    if ($iconCount -lt 7 -or $iconBytes.Length -lt (6 + (16 * $iconCount))) {
-        throw "ICO does not contain the expected multi-size directory: $iconPath"
+    if ($iconCount -ne 7 -or $iconBytes.Length -lt (6 + (16 * $iconCount))) {
+        throw "ICO does not contain exactly seven multi-size entries: $iconPath"
     }
     $sizes = @(
         for ($index = 0; $index -lt $iconCount; $index += 1) {
@@ -278,6 +333,26 @@ foreach ($iconPath in @($applicationIcon, $installerIcon)) {
         if ($sizes -notcontains $expectedSize) {
             throw "ICO missing ${expectedSize}px entry: $iconPath"
         }
+    }
+}
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $tauriIco).Hash -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $applicationIcon).Hash) {
+    throw 'Tauri ICO SHA256 differs from final ICO'
+}
+$finalRuntimePngHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $iconFinalRoot 'app-icon-cz-moon-gate-lantern-v1-256.png')).Hash
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $tauriPng).Hash -ne $finalRuntimePngHash) {
+    throw 'Tauri PNG SHA256 differs from final 256px PNG'
+}
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $desktopConsolePng).Hash -ne $finalRuntimePngHash) {
+    throw 'desktop-console PNG SHA256 differs from final 256px PNG'
+}
+$retiredRuntimeAssets = @(
+    (Join-Path $workspace 'modules\gui-desktop\packages\tauri-shell\src-tauri\icons\icon.ico'),
+    (Join-Path $workspace 'modules\gui-desktop\packages\tauri-shell\src-tauri\icons\icon.png'),
+    (Join-Path $workspace 'modules\gui-desktop\packages\desktop-console\assets\coolzhu-agent-icon.png')
+)
+foreach ($retiredAsset in $retiredRuntimeAssets) {
+    if (Test-Path -LiteralPath $retiredAsset) {
+        throw "retired runtime icon still exists: $retiredAsset"
     }
 }
 # 由稳定组件拥有安装目录，避免收集得到的文件组件在卸载后遗留空目录。
@@ -324,6 +399,13 @@ $applicationIconNode = $productWxsXml.SelectSingleNode(
 if (-not $applicationIconNode) {
     throw 'Product.wxs missing CoolzhuApplicationIcon source contract'
 }
+$arpProductIconNode = $productWxsXml.SelectSingleNode(
+    '//wix:Property[@Id="ARPPRODUCTICON" and @Value="CoolzhuApplicationIcon"]',
+    $wixNamespace
+)
+if (-not $arpProductIconNode) {
+    throw 'Product.wxs ARPPRODUCTICON must use CoolzhuApplicationIcon'
+}
 foreach ($shortcutId in @('StartMenuShortcut', 'DesktopShortcut')) {
     $shortcut = $launcherComponent.SelectSingleNode(
         "wix:Shortcut[@Id='$shortcutId' and @Icon='CoolzhuApplicationIcon']",
@@ -350,16 +432,36 @@ foreach ($requiredLauncherIconContract in @(
     'COOLZHU_APPLICATION_ICON',
     'find_resource_compiler',
     'cargo:rustc-link-arg-bin=COOLZHU-AGENT=',
-    'coolzhu-application-icon.ico'
+    'app-icon-cz-moon-gate-lantern-v1.ico'
 )) {
     if ($launcherBuildScript.IndexOf($requiredLauncherIconContract, [System.StringComparison]::Ordinal) -lt 0) {
         throw "app-launcher build.rs missing icon embedding contract: $requiredLauncherIconContract"
+    }
+}
+$desktopConsoleBuildPath = Join-Path $workspace 'modules\gui-desktop\packages\desktop-console\build.rs'
+if (-not (Test-Path -LiteralPath $desktopConsoleBuildPath -PathType Leaf)) {
+    throw "desktop-console build.rs missing: $desktopConsoleBuildPath"
+}
+$desktopConsoleBuildScript = Get-Content -Raw -Encoding UTF8 -LiteralPath $desktopConsoleBuildPath
+foreach ($requiredDesktopConsoleIconContract in @(
+    'CARGO_CFG_WINDOWS',
+    'cargo:rerun-if-changed={APPLICATION_ICON}',
+    'cargo:rerun-if-env-changed=RC',
+    'cargo:rerun-if-env-changed=WINDOWS_RC',
+    'find_resource_compiler',
+    'app-icon-cz-moon-gate-lantern-v1.ico',
+    'cargo:rustc-link-arg-bin={BIN_NAME}=',
+    'coolzhu-desktop-console'
+)) {
+    if ($desktopConsoleBuildScript.IndexOf($requiredDesktopConsoleIconContract, [System.StringComparison]::Ordinal) -lt 0) {
+        throw "desktop-console build.rs missing PE icon contract: $requiredDesktopConsoleIconContract"
     }
 }
 
 $buildMsiScript = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $workspace 'scripts\build-msi.ps1')
 $buildMsiIconContracts = @(
     '$applicationIcon = Join-Path',
+    'app-icon-cz-moon-gate-lantern-v1.ico',
     'ApplicationIcon=$applicationIcon',
     'Application icon missing'
 )
@@ -372,12 +474,112 @@ $tauriBuildScript = Get-Content -Raw -Encoding UTF8 -LiteralPath (
     Join-Path $workspace 'modules\gui-desktop\packages\tauri-shell\src-tauri\build.rs'
 )
 foreach ($requiredTauriIconContract in @(
-    'rerun-if-changed=icons/icon.ico',
-    'rerun-if-changed=icons/icon.png'
+    'rerun-if-changed=icons/app-icon-cz-moon-gate-lantern-v1.ico',
+    'rerun-if-changed=icons/app-icon-cz-moon-gate-lantern-v1.png'
 )) {
     if ($tauriBuildScript.IndexOf($requiredTauriIconContract, [System.StringComparison]::Ordinal) -lt 0) {
         throw "Tauri build.rs missing icon rebuild contract: $requiredTauriIconContract"
     }
+}
+$tauriConfigPath = Join-Path $workspace 'modules\gui-desktop\packages\tauri-shell\src-tauri\tauri.conf.json'
+$tauriConfig = Get-Content -Raw -Encoding UTF8 -LiteralPath $tauriConfigPath | ConvertFrom-Json
+$tauriAppPropertyNames = @($tauriConfig.app.PSObject.Properties | Select-Object -ExpandProperty Name)
+if ($tauriAppPropertyNames -contains 'trayIcon') {
+    throw 'tauri.conf.json must not define a duplicate automatic tray icon'
+}
+$expectedTauriBundleIcons = @(
+    'icons/app-icon-cz-moon-gate-lantern-v1.ico',
+    'icons/app-icon-cz-moon-gate-lantern-v1.png'
+)
+$actualTauriBundleIcons = @($tauriConfig.bundle.icon | ForEach-Object { [string]$_ })
+if (
+    $actualTauriBundleIcons.Count -ne $expectedTauriBundleIcons.Count -or
+    (($actualTauriBundleIcons -join "`n") -cne ($expectedTauriBundleIcons -join "`n"))
+) {
+    throw "tauri.conf.json bundle.icon must exactly equal: $($expectedTauriBundleIcons -join ', ')"
+}
+$tauriMain = Get-Content -Raw -Encoding UTF8 -LiteralPath (
+    Join-Path $workspace 'modules\gui-desktop\packages\tauri-shell\src-tauri\src\main.rs'
+)
+$buildTrayStart = $tauriMain.IndexOf('fn build_tray', [System.StringComparison]::Ordinal)
+$buildConsoleStart = if ($buildTrayStart -ge 0) {
+    $tauriMain.IndexOf('fn build_console_window', $buildTrayStart + 1, [System.StringComparison]::Ordinal)
+} else {
+    -1
+}
+if ($buildTrayStart -lt 0 -or $buildConsoleStart -le $buildTrayStart) {
+    throw 'Tauri build_tray function range is missing or malformed'
+}
+$buildTraySource = $tauriMain.Substring($buildTrayStart, $buildConsoleStart - $buildTrayStart)
+if ([regex]::Matches($buildTraySource, 'TrayIconBuilder::').Count -ne 1) {
+    throw 'Tauri build_tray must contain exactly one TrayIconBuilder'
+}
+foreach ($requiredTrayIconContract in @(
+    'TrayIconBuilder::with_id("main")',
+    '.icon(',
+    '.menu(&menu)',
+    '.show_menu_on_left_click(false)',
+    '.on_menu_event(',
+    '.on_tray_icon_event(',
+    'default_window_icon',
+    'TrayIconEvent::Click',
+    'MouseButton::Left',
+    'MouseButtonState::Up'
+)) {
+    if ($buildTraySource.IndexOf($requiredTrayIconContract, [System.StringComparison]::Ordinal) -lt 0) {
+        throw "Tauri build_tray missing manual tray contract: $requiredTrayIconContract"
+    }
+}
+if ($buildTraySource.IndexOf('.show_menu_on_left_click(true)', [System.StringComparison]::Ordinal) -ge 0) {
+    throw 'Tauri build_tray must not open the menu on left click when left click toggles the console'
+}
+$trayEventStart = $buildTraySource.IndexOf('.on_tray_icon_event(', [System.StringComparison]::Ordinal)
+if ($trayEventStart -lt 0) {
+    throw 'Tauri build_tray missing tray event handler range'
+}
+$trayEventSource = $buildTraySource.Substring($trayEventStart)
+if ([regex]::Matches($trayEventSource, 'do_toggle_console').Count -ne 1) {
+    throw 'Tauri tray event handler must toggle the console exactly once'
+}
+if ($trayEventSource -match 'TrayIconEvent::(?:Enter|Move|Leave|DoubleClick)') {
+    throw 'Tauri tray hover/double-click events must not toggle the console'
+}
+if ($trayEventSource -notmatch 'TrayIconEvent::Click\s*\{[\s\S]*button:\s*MouseButton::Left[\s\S]*button_state:\s*MouseButtonState::Up') {
+    throw 'Tauri tray toggle must be restricted to left-button release Click'
+}
+
+$activeIconContractFiles = @(
+    (Join-Path $workspace 'installer\Product.wxs'),
+    (Join-Path $workspace 'scripts\build-msi.ps1'),
+    (Join-Path $workspace 'packages\app-launcher\build.rs'),
+    (Join-Path $workspace 'modules\gui-desktop\packages\desktop-console\build.rs'),
+    (Join-Path $workspace 'modules\gui-desktop\packages\desktop-console\src\main.rs'),
+    (Join-Path $workspace 'modules\gui-desktop\packages\tauri-shell\src-tauri\build.rs'),
+    $tauriConfigPath,
+    (Join-Path $workspace 'modules\gui-desktop\packages\tauri-shell\src-tauri\src\main.rs')
+)
+$forbiddenActiveIconTokens = @(
+    'coolzhu-icons-2026-08-12',
+    'coolzhu-application-icon',
+    'coolzhu-installer-icon',
+    'icons/icon.ico',
+    'icons/icon.png',
+    'coolzhu-agent-icon.png',
+    'InstallerIcon'
+)
+foreach ($activeIconContractFile in $activeIconContractFiles) {
+    $activeIconSource = Get-Content -Raw -Encoding UTF8 -LiteralPath $activeIconContractFile
+    foreach ($forbiddenActiveIconToken in $forbiddenActiveIconTokens) {
+        if ($activeIconSource.IndexOf($forbiddenActiveIconToken, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw "active icon chain still references retired icon token '$forbiddenActiveIconToken': $activeIconContractFile"
+        }
+    }
+}
+$desktopConsoleMain = Get-Content -Raw -Encoding UTF8 -LiteralPath (
+    Join-Path $workspace 'modules\gui-desktop\packages\desktop-console\src\main.rs'
+)
+if ($desktopConsoleMain.IndexOf('app-icon-cz-moon-gate-lantern-v1.png', [System.StringComparison]::Ordinal) -lt 0) {
+    throw 'desktop-console missing P5-F window icon contract'
 }
 $buildMsiTokens = $null
 $buildMsiParseErrors = $null

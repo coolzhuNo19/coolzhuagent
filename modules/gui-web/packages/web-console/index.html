@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>COOLZHU CODE 控制台</title>
-    <link rel="icon" href="./assets/icons/code.png" />
+    <link rel="icon" href="./assets/icons-wuxia/project.svg" />
     <link rel="stylesheet" href="./src/styles.css" />
     <script src="./src/realtime_voice_capture.js" defer></script>
     <script src="./src/realtime_audio_output.js" defer></script>
@@ -13,108 +13,126 @@
   </head>
   <body class="ui-3d">
     <main class="shell ui-redesign" aria-label="COOLZHU CODE 控制台">
-            <section class="layout-top-region" aria-label="顶部状态区">
-        <article class="top-status-card overview-card">
-          <header class="compact-card-head">
-            <strong>Agent 总览</strong>
-            <button class="overview-workspace-name" data-role="overview-workspace-name" type="button" title="点击复制工作区路径">
-              <img src="./assets/icons/folder.png" alt="" /><span data-role="overview-workspace-label">当前工作区</span>
-            </button>
-          </header>
-          <div class="overview-dashboard">
+      <section class="layout-top-region" aria-label="顶部状态区">
+        <section class="brand-banner" aria-label="COOLZHU CODE">
+          <div class="brand-banner-art" aria-hidden="true"></div>
+          <span class="brand-banner-title">COOLZHU CODE</span>
+        </section>
+        <article class="top-status-card overview-card" aria-label="当前 Agent 与工作区">
+          <div class="overview-identity">
             <figure class="overview-mascot" aria-label="当前 Agent 头像">
               <img data-role="overview-mascot-avatar" src="./assets/avatars/wuxia-v3/bamboo-swordsman.png" alt="" />
             </figure>
-            <div class="overview-dashboard-body">
-              <div class="overview-health" data-role="overview-health">
-                <div class="overview-health-head">
-                  <span>System Health</span>
-                  <b data-bind="overview.healthPercent">0%</b>
+            <div class="overview-identity-copy">
+              <div class="overview-field overview-agent-field">
+                <span class="overview-field-label">当前 Agent</span>
+                <button class="overview-agent-name" data-role="overview-agent-trigger" data-action="overview-agent-settings" type="button" aria-label="打开聊天导航中的发送对象配置" title="打开聊天导航中的发送对象配置">
+                  <span data-role="overview-agent-label">未配置</span>
+                  <img src="./assets/icons-wuxia/chevron.svg" alt="" aria-hidden="true" />
+                </button>
+              </div>
+              <span class="overview-field-divider" aria-hidden="true"></span>
+              <div class="overview-field overview-workspace-field">
+                <span class="overview-field-label">工程目录</span>
+                <div class="overview-workspace-control">
+                  <button class="overview-workspace-name" data-role="overview-workspace-name" type="button" aria-label="复制当前工作区路径" title="点击复制工作区路径">
+                    <img src="./assets/icons-wuxia/folder.svg" alt="" aria-hidden="true" /><span data-role="overview-workspace-label">当前工作区</span>
+                  </button>
+                  <button class="overview-workspace-settings" data-action="overview-workspace-settings" type="button" aria-label="打开聊天工作区设置" title="打开聊天导航中的工作区设置">
+                    <img src="./assets/icons-wuxia/settings.svg" alt="" aria-hidden="true" />
+                  </button>
                 </div>
-                <div class="overview-health-track" aria-hidden="true"><span data-role="overview-health-bar" style="width:0%"></span></div>
-                <small data-bind="overview.healthDetail">0/0 ready</small>
               </div>
-              <div class="overview-compact-lines" aria-label="总览精简状态">
-                <p class="overview-line-status"><span>运行状态</span><b data-bind="overview.healthDetail">等待自检</b></p>
-                <p class="overview-line-vision"><span>视觉模型</span><select class="overview-vision-select" data-role="overview-vision-agent" title="选中后作为当前视觉理解模型，可随时更换其它多模态会话"><option value="">未配置</option></select></p>
-              </div>
-              <div class="overview-metrics">
-                <p><span>已激活 Agent 数</span><b data-bind="overview.activeAgentCount">0</b></p>
-                <p><span>聊天室个数</span><b data-bind="overview.chatRoomCount">0</b></p>
-                <p><span>Goal roles</span><b data-bind="overview.activeRoleCount">0</b></p>
-              </div>
-              <div class="overview-active-roles" data-role="overview-active-roles">No active goal roles.</div>
             </div>
           </div>
         </article>
-        <section class="brand-banner" aria-label="COOLZHU CODE">
-          <img class="brand-banner-image" src="./assets/ui-redesign/bamboo-leaf-banner-v1.png" alt="" />
+        <section class="top-chat-context" data-role="top-chat-context" aria-label="当前聊天室与状态">
+          <div class="top-chat-room-slot">
+            <span>当前聊天室</span>
+            <button class="top-chat-room-entry" data-action="top-chat-room" type="button" aria-label="打开聊天导航中的聊天室选择" title="打开聊天导航中的聊天室选择">
+              <strong data-bind="chat.current" data-role="chat-room-title">主聊天室</strong>
+              <img src="./assets/icons-wuxia/chevron.svg" alt="" aria-hidden="true" />
+            </button>
+          </div>
+          <div class="chat-top-statuses" data-role="chat-top-statuses" aria-label="聊天室状态">
+            <span class="chat-top-status-indicator chat-top-status-ready is-dim" data-role="chat-top-status-ready" data-state="idle" role="img" aria-label="系统健康：等待自检" title="系统健康：等待自检">
+              <img src="./assets/ui-redesign/p6/status-jade-ready-v1.png" alt="" aria-hidden="true" />
+              <span>就绪</span>
+            </span>
+            <span class="chat-top-status-indicator chat-top-status-lantern is-dim" data-role="chat-top-status-lantern" data-state="idle" role="img" aria-label="系统状态灯：等待自检" title="系统状态灯：等待自检">
+              <img src="./assets/ui-redesign/three-column/rail-lantern-gold-v1.png" alt="" aria-hidden="true" />
+              <span>灯笼</span>
+            </span>
+            <span class="chat-top-status-indicator chat-top-status-alert is-dim" data-role="chat-top-status-alert" data-state="idle" role="img" aria-label="系统警示：无异常" title="系统警示：无异常">
+              <img src="./assets/ui-redesign/p6/status-vermilion-alert-v1.png" alt="" aria-hidden="true" />
+              <span>警示</span>
+            </span>
+          </div>
         </section>
-        <article class="top-status-card task-summary-card">
-          <header class="compact-card-head">
-            <strong>任务卡片</strong>
-            <button class="task-card-chain-button" data-action="task-card-chain" type="button" title="查看当前任务链">任务链</button>
-          </header>
-          <div class="task-summary-grid task-summary-grid-compact">
-            <p class="task-summary-name"><span>任务</span><b data-bind="task.currentTitle" title="">空闲</b></p>
-            <div class="task-summary-progress" data-role="task-card-progress" aria-label="任务进度">
-              <div class="task-summary-progress-track"><span data-role="task-card-progress-bar" style="width:0%"></span></div>
-              <b data-bind="task.currentProgress">0%</b>
-            </div>
-            <div class="task-status-summary" aria-label="任务状态统计">
-              <span class="task-status-item is-running"><i></i>Running <b data-bind="task.statusRunning">0</b></span>
-              <span class="task-status-item is-queued"><i></i>Queued <b data-bind="task.statusQueued">0</b></span>
-              <span class="task-status-item is-completed"><i></i>Completed <b data-bind="task.statusCompleted">0</b></span>
-              <span class="task-status-item is-failed"><i></i>Failed <b data-bind="task.statusFailed">0</b></span>
-            </div>
-            <p class="task-summary-approval-badge" data-role="task-summary-approval-badge" hidden><span>待审批</span><b data-bind="approval.decisionLabel">等待</b></p>
-          </div>
-        </article>
       </section>
       <section class="layout-workbench" data-role="workbench" data-active-window="chat" aria-label="多窗口工作台">
-        <nav class="window-dock" aria-label="窗口标题栏">
-          <button class="window-tab" data-window-target="project" data-window-icon="project" type="button" title="工程目录">
-            <img class="window-icon window-icon-project" src="./assets/icons-wuxia/project.svg" alt="" /><span>工程目录</span>
-          </button>
-          <button class="window-tab" data-window-target="settings" data-window-icon="settings" type="button" title="设置">
-            <img class="window-icon window-icon-settings" src="./assets/icons-wuxia/settings.svg" alt="" /><span>设置</span>
-          </button>
-          <button class="window-tab" data-window-target="clawbot" data-window-icon="clawbot" type="button" title="微信连接">
-            <img class="window-icon window-icon-clawbot" src="./assets/icons-wuxia/link.svg" alt="" /><span>微信连接</span>
-          </button>
-          <button class="window-tab is-active" data-window-target="chat" data-window-icon="chat" type="button" title="聊天室">
-            <img class="window-icon window-icon-chat" src="./assets/icons-wuxia/chat.svg" alt="" /><span>聊天室</span>
-          </button>
-          <button class="window-tab" data-window-target="browser" data-window-icon="browser" type="button" title="浏览器">
-            <img class="window-icon window-icon-browser" src="./assets/icons-wuxia/browser.svg" alt="" /><span>浏览器</span>
-          </button>
-          <button class="window-tab" data-window-target="terminal" data-window-icon="terminal" type="button" title="终端">
-            <img class="window-icon window-icon-terminal" src="./assets/icons-wuxia/terminal.svg" alt="" /><span>终端</span>
-          </button>
-          <button class="window-tab" data-window-target="tasks" data-window-icon="tasks" type="button" title="任务中心">
-            <img class="window-icon window-icon-tasks" src="./assets/icons-wuxia/tasks.svg" alt="" /><span>任务中心</span>
-          </button>
-          <button class="window-tab" data-window-target="memory" data-window-icon="memory" type="button" title="记忆 / 知识">
-            <img class="window-icon window-icon-memory" src="./assets/icons-wuxia/memory.svg" alt="" /><span>记忆知识</span>
-          </button>
-          <button class="window-tab" data-window-target="vision" data-window-icon="vision" type="button" title="视觉实验室">
-            <img class="window-icon window-icon-vision" src="./assets/icons-wuxia/vision.svg" alt="" /><span>视觉实验</span>
-          </button>
-        </nav>
-
+        <aside class="workbench-quick-rail" data-role="workbench-quick-rail" aria-label="窗口快捷栏">
+          <nav class="window-dock" aria-label="窗口快捷入口">
+            <button class="window-tab is-active" data-window-target="chat" data-window-icon="chat" type="button" title="聊天室" aria-pressed="true">
+              <img class="window-icon window-icon-chat" src="./assets/icons-wuxia/chat.svg" alt="" /><span>聊天室</span>
+            </button>
+            <button class="window-tab" data-window-target="project" data-window-icon="project" type="button" title="工程目录" aria-pressed="false">
+              <img class="window-icon window-icon-project" src="./assets/icons-wuxia/project.svg" alt="" /><span>工程目录</span>
+            </button>
+            <button class="window-tab" data-window-target="tasks" data-window-icon="tasks" type="button" title="任务中心" aria-pressed="false">
+              <img class="window-icon window-icon-tasks" src="./assets/icons-wuxia/tasks.svg" alt="" /><span>任务中心</span>
+            </button>
+            <button class="window-tab" data-window-target="terminal" data-window-icon="terminal" type="button" title="终端" aria-pressed="false">
+              <img class="window-icon window-icon-terminal" src="./assets/icons-wuxia/terminal.svg" alt="" /><span>终端</span>
+            </button>
+            <button class="window-tab" data-window-target="browser" data-window-icon="browser" type="button" title="浏览器" aria-pressed="false">
+              <img class="window-icon window-icon-browser" src="./assets/icons-wuxia/browser.svg" alt="" /><span>浏览器</span>
+            </button>
+            <details class="window-dock-more" data-role="window-dock-more">
+              <summary class="window-tab window-dock-more-toggle" aria-label="更多窗口" title="更多窗口" tabindex="0">
+                <img class="window-icon" src="./assets/icons-wuxia/more-vertical.svg" alt="" /><span>更多</span>
+              </summary>
+              <div class="window-dock-secondary" data-role="window-dock-secondary" aria-label="更多窗口入口">
+                <button class="window-tab" data-window-target="settings" data-window-icon="settings" type="button" title="设置" aria-pressed="false">
+                  <img class="window-icon window-icon-settings" src="./assets/icons-wuxia/settings.svg" alt="" /><span>设置</span>
+                </button>
+                <button class="window-tab" data-window-target="clawbot" data-window-icon="clawbot" type="button" title="微信连接" aria-pressed="false">
+                  <img class="window-icon window-icon-clawbot" src="./assets/icons-wuxia/link.svg" alt="" /><span>微信连接</span>
+                </button>
+                <button class="window-tab" data-window-target="memory" data-window-icon="memory" type="button" title="记忆 / 知识" aria-pressed="false">
+                  <img class="window-icon window-icon-memory" src="./assets/icons-wuxia/memory.svg" alt="" /><span>记忆知识</span>
+                </button>
+                <button class="window-tab" data-window-target="vision" data-window-icon="vision" type="button" title="视觉实验室" aria-pressed="false">
+                  <img class="window-icon window-icon-vision" src="./assets/icons-wuxia/vision.svg" alt="" /><span>视觉实验</span>
+                </button>
+              </div>
+            </details>
+          </nav>
+          <div class="chat-quick-layout-controls" data-role="chat-quick-layout-controls" aria-label="聊天室布局控制">
+            <button class="chat-rail-toggle chat-left-rail-toggle" data-action="chat-left-rail-toggle" type="button" aria-controls="chat-left-rail" aria-expanded="false" aria-label="显示聊天导航侧栏" title="显示或隐藏聊天导航侧栏">
+              <img data-role="chat-left-rail-toggle-icon" src="./assets/ui-redesign/three-column/control-icons/panel-left-open-v1.png" alt="" aria-hidden="true" /><span>导航</span>
+            </button>
+            <button class="chat-main-action" data-action="chat-focus-layout" type="button" aria-pressed="false" title="专注聊天布局">
+              <img data-role="chat-focus-layout-icon" src="./assets/ui-redesign/three-column/control-icons/focus-layout-v1.png" alt="" aria-hidden="true" /><span>专注</span>
+            </button>
+            <button class="chat-rail-toggle chat-right-rail-toggle" data-action="chat-right-rail-toggle" type="button" aria-controls="chat-right-rail" aria-expanded="false" aria-label="显示协作与任务链侧栏" title="显示或隐藏协作与任务链侧栏">
+              <span>协作</span><img data-role="chat-right-rail-toggle-icon" src="./assets/ui-redesign/three-column/control-icons/panel-right-open-v1.png" alt="" aria-hidden="true" />
+            </button>
+          </div>
+        </aside>
         <section class="workbench-stage">
           <article class="workbench-window project-workbench-window" data-window-id="project" data-window-theme="treasure-map" aria-label="工程目录窗口">
             <div class="window-panel project-layout">
               <aside class="project-command-rail">
                 <div class="ide-toolbar">
-                  <button class="mini-button ide-mode-toggle" data-action="project-mode-toggle" type="button" title="切换 View / Diff"><img data-role="ide-mode-toggle-icon" src="./assets/icons-wuxia/diff.svg" alt="" /><span data-role="ide-mode-toggle-label">Diff</span></button>
-                  <button class="mini-button" data-action="project-save" type="button" title="保存当前文件 (Ctrl+S)" disabled>保存</button>
-                  <button class="mini-button" data-action="project-new-file" type="button" title="新建文件">+文件</button>
-                  <button class="mini-button" data-action="project-new-dir" type="button" title="新建目录">+目录</button>
-                  <button class="mini-button" data-action="project-rename" type="button" title="重命名当前文件或目录">重命名</button>
-                  <button class="mini-button is-danger" data-action="project-delete" type="button" title="删除当前文件或目录">删除</button>
-                  <button class="mini-button" data-action="project-refresh" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" />刷新</button>
-                  <button class="mini-button" data-action="project-symbol-index" type="button" title="增量构建符号索引"><img src="./assets/icons-wuxia/search.svg" alt="" />索引</button>
+                  <button class="mini-button ide-mode-toggle" data-action="project-mode-toggle" type="button" title="切换查看 / 对比模式"><img data-role="ide-mode-toggle-icon" src="./assets/icons-wuxia/diff.svg" alt="" aria-hidden="true" /><span data-role="ide-mode-toggle-label">对比</span></button>
+                  <button class="mini-button" data-action="project-save" type="button" title="保存当前文件 (Ctrl+S)" disabled><img src="./assets/icons-wuxia/save.svg" alt="" aria-hidden="true" />保存</button>
+                  <button class="mini-button" data-action="project-new-file" type="button" title="新建文件"><img src="./assets/icons-wuxia/file.svg" alt="" aria-hidden="true" />文件</button>
+                  <button class="mini-button" data-action="project-new-dir" type="button" title="新建目录"><img src="./assets/icons-wuxia/folder.svg" alt="" aria-hidden="true" />目录</button>
+                  <button class="mini-button" data-action="project-rename" type="button" title="重命名当前文件或目录"><img src="./assets/icons-wuxia/rename.svg" alt="" aria-hidden="true" />重命名</button>
+                  <button class="mini-button is-danger" data-action="project-delete" type="button" title="删除当前文件或目录"><img src="./assets/icons-wuxia/delete.svg" alt="" aria-hidden="true" />删除</button>
+                  <button class="mini-button" data-action="project-refresh" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" aria-hidden="true" />刷新</button>
+                  <button class="mini-button" data-action="project-symbol-index" type="button" title="增量构建符号索引"><img src="./assets/icons-wuxia/search.svg" alt="" aria-hidden="true" />索引</button>
                   <input class="ide-omni-search" data-role="ide-omni-search" type="search" placeholder="搜文件 @函数 :行号" spellcheck="false" autocomplete="off" />
                 </div>
                 <p class="ide-index-status" data-role="project-symbol-index-status">符号索引尚未手动刷新。</p>
@@ -126,17 +144,15 @@
                 <div class="ide-omni-host">
                   <div class="ide-omni-results" data-role="ide-omni-results" role="listbox" hidden></div>
                 </div>
-                <p class="path" data-bind="project.path">%USERPROFILE%\coolzhuagent</p>
+                <p class="path" data-bind="project.path">工作区尚未加载</p>
                 <ul class="project-tree" data-role="project-tree">
-                  <li><img src="./assets/icons-wuxia/folder.svg" alt="" />modules</li>
-                  <li><img src="./assets/icons-wuxia/folder.svg" alt="" />docs</li>
-                  <li><img src="./assets/icons-wuxia/file.svg" alt="" />Cargo.toml</li>
+                  <li class="project-tree-empty">工程目录尚未加载。</li>
                 </ul>
               </aside>
               <div class="project-splitter" data-role="project-splitter" title="拖动调节目录树/文件栏宽度"></div>
               <section class="file-preview-pane">
                 <div class="ide-tabbar" data-role="ide-tabbar" aria-label="文件标签条"></div>
-                <div class="project-file-meta" data-role="project-file-meta">Select a file to preview.</div>
+                <div class="project-file-meta" data-role="project-file-meta">请选择文件进行预览。</div>
                 <div class="ide-preview-body">
                   <pre class="file-preview-text" data-role="project-file-preview">从左侧目录树选择文件预览；快捷键：Ctrl+P 搜文件 · @ 搜符号 · :行号 跳转。</pre>
                   <aside class="ide-outline" data-role="ide-outline" aria-label="符号大纲">
@@ -153,13 +169,13 @@
               <section class="settings-section session-settings">
                 <h2>会话与模型</h2>
                 <div class="session-select-wrap">
-                  <div class="session-select-trigger" data-role="session-trigger">mario-demo (glm-4.6)</div>
+                  <div class="session-select-trigger" data-role="session-trigger">尚未选择会话</div>
                   <div class="session-select-dropdown" data-role="session-list" role="listbox"></div>
                 </div>
                 <div class="session-agent-grid">
                   <label class="config-field">
                     <span>会话名称</span>
-                    <input data-role="session-name" maxlength="32" value="mario-demo" />
+                    <input data-role="session-name" maxlength="32" value="" placeholder="请输入会话名称" />
                   </label>
                   <div class="config-field avatar-config-field">
                     <span>头像</span>
@@ -170,30 +186,15 @@
                     <div class="avatar-picker" data-role="avatar-picker" hidden></div>
                   </div>
                   <label class="config-field">
-                    <span>Provider</span>
-                    <select data-role="session-provider">
-                      <option>DeepSeek</option>
-                      <option>智谱 AI</option>
-                      <option>智谱 AI (Z.AI)</option>
-                      <option>Moonshot AI</option>
-                      <option>OpenAI</option>
-                      <option>Anthropic</option>
-                      <option>xAI (Grok)</option>
-                      <option>阿里百炼</option>
-                      <option>火山方舟</option>
-                      <option>百度千帆</option>
-                      <option>Ollama (本地)</option>
-                      <option>Custom</option>
-                    </select>
+                    <span>服务商</span>
+                    <select data-role="session-provider" aria-label="模型供应商"></select>
                   </label>
                   <label class="config-field" data-role="session-model-select-field">
                     <span>模型</span>
-                    <select data-role="session-model">
-                      <option value="deepseek-v4-pro">deepseek-v4-pro</option>
-                    </select>
+                    <select data-role="session-model"></select>
                   </label>
                   <label class="config-field custom-provider-field" hidden>
-                    <span>Custom Model</span>
+                    <span>自定义模型</span>
                     <input data-role="session-custom-model" placeholder="qwen2.5-vl-3b" />
                   </label>
                   <label class="config-field">
@@ -211,17 +212,18 @@
                   <label class="config-field">
                     <span>思考程度</span>
                     <select data-role="session-reasoning-effort"></select>
+                    <small data-role="session-reasoning-hint">配置：供应商自动 · 预计：供应商自动</small>
                   </label>
                   <label class="config-field">
-                    <span>API Key</span>
+                    <span>API 密钥</span>
                     <input data-role="session-api-secret" placeholder="sk-..." autocomplete="off" />
                   </label>
                   <label class="config-field custom-provider-field" hidden>
-                    <span>Base URL</span>
+                    <span>服务地址</span>
                     <input data-role="session-base-url" placeholder="http://127.0.0.1:11434/v1" />
                   </label>
                   <label class="config-field custom-provider-field" hidden>
-                    <span>Endpoint</span>
+                    <span>接口路径</span>
                     <input data-role="session-endpoint" placeholder="chat/completions" />
                   </label>
                   <label class="config-field">
@@ -234,12 +236,12 @@
                   </label>
                 </div>
                 <div class="agent-state-grid">
-                  <p><span>当前</span><b data-bind="agent.current">mario-demo</b></p>
-                  <p><span>Provider</span><b data-bind="agent.provider">智谱 AI</b></p>
-                  <p><span>模型</span><b data-bind="agent.model">glm-4.6</b></p>
-                  <p><span>Key</span><b data-bind="agent.key">待配置</b></p>
+                  <p><span>当前</span><b data-bind="agent.current">尚未选择</b></p>
+                  <p><span>服务商</span><b data-bind="agent.provider">尚未加载</b></p>
+                  <p><span>模型</span><b data-bind="agent.model">尚未加载</b></p>
+                  <p><span>密钥</span><b data-bind="agent.key">待配置</b></p>
                   <p><span>记忆</span><b data-bind="agent.memoryState">会话独立</b></p>
-                  <p><span>会话</span><b data-bind="session.active">mario-demo (glm-4.6)</b></p>
+                  <p><span>会话</span><b data-bind="session.active">尚未选择会话</b></p>
                 </div>
                 <div class="button-row">
                   <button class="mini-button" data-action="session-new" type="button"><img src="./assets/icons-wuxia/chat.svg" alt="" />新建</button>
@@ -284,7 +286,7 @@
                   <article class="tool-inventory-row" data-tool-inventory="skill">
                     <span class="tool-inventory-icon"><img src="./assets/icons-wuxia/skill-star.svg" alt="" /></span>
                     <span class="tool-inventory-copy">
-                      <strong>Skill</strong>
+                      <strong>技能</strong>
                       <small>技能 / 插件扩展</small>
                     </span>
                     <b class="tool-inventory-status is-online" data-role="tool-inventory-status-skill">加载中</b>
@@ -293,7 +295,7 @@
                   <article class="tool-inventory-row" data-tool-inventory="compute-use">
                     <span class="tool-inventory-icon"><img src="./assets/icons-wuxia/compute-use.svg" alt="" /></span>
                     <span class="tool-inventory-copy">
-                      <strong>compute-use</strong>
+                      <strong>计算资源</strong>
                       <small>计算资源使用控制</small>
                     </span>
                     <b class="tool-inventory-status is-offline">未启用</b>
@@ -302,10 +304,10 @@
                   <article class="tool-inventory-row tool-inventory-plan" data-tool-inventory="semantic-dispatch">
                     <span class="tool-inventory-icon"><img src="./assets/icons-wuxia/route-plan.svg" alt="" /></span>
                     <span class="tool-inventory-copy">
-                      <strong>Semantic Dispatch Plan <small>语义调度计划</small></strong>
+                      <strong>语义调度计划</strong>
                       <small>按意图选择合适工具与执行路径</small>
                     </span>
-                    <span class="tool-inventory-status is-muted">dry-run</span>
+                    <span class="tool-inventory-status is-muted">安全预演</span>
                     <button type="button" class="mini-button" data-action="open-dispatch-diagnostics">计划配置</button>
                   </article>
                 </div>
@@ -328,22 +330,22 @@
                   <div class="tool-legacy-section tool-mcp-manager" data-tool-detail="mcp" hidden>
                     <div class="tool-mcp-head">
                       <div>
-                        <strong>MCP Server</strong>
+                        <strong>MCP 服务</strong>
                         <small data-role="mcp-server-status">等待加载 MCP 配置。</small>
                       </div>
                       <button type="button" class="mini-button" data-action="mcp-servers-refresh">刷新</button>
                     </div>
                     <div class="tool-mcp-server-list" data-role="mcp-server-list">
-                      <div class="tool-catalog-empty">打开 MCP 管理后加载 server 状态。</div>
+                      <div class="tool-catalog-empty">打开 MCP 管理后加载服务状态。</div>
                     </div>
                     <section class="tool-mcp-call" aria-label="MCP 原始工具调用">
                       <header>
                         <strong>原始工具调用</strong>
-                        <small>仅用于已连接 server；执行前会显示完整参数并二次确认。</small>
+                        <small>仅用于已连接服务；执行前会显示完整参数并二次确认。</small>
                       </header>
-                      <label><span>Server</span><select data-role="mcp-call-server"><option value="">未选择</option></select></label>
-                      <label><span>Tool</span><input data-role="mcp-call-tool" type="text" placeholder="tool_name" autocomplete="off" /></label>
-                      <label class="tool-mcp-call-arguments"><span>Arguments JSON</span><textarea data-role="mcp-call-arguments" spellcheck="false">{}</textarea></label>
+                      <label><span>服务</span><select data-role="mcp-call-server"><option value="">未选择</option></select></label>
+                      <label><span>工具</span><input data-role="mcp-call-tool" type="text" placeholder="工具名称" autocomplete="off" /></label>
+                      <label class="tool-mcp-call-arguments"><span>参数 JSON</span><textarea data-role="mcp-call-arguments" spellcheck="false">{}</textarea></label>
                       <button type="button" class="mini-button is-primary-control" data-action="mcp-call">确认并调用</button>
                       <pre data-role="mcp-output">尚未执行 MCP 操作。</pre>
                     </section>
@@ -374,13 +376,13 @@
                 <p><span>实时交互</span><b data-bind="realtime.session">待启动</b></p>
                 <div class="realtime-session-controls">
                   <button class="mini-button" data-action="tts-speak" type="button"><img src="./assets/icons-wuxia/speaker.svg" alt="" />朗读回复</button>
-                  <button class="mini-button" data-action="realtime-session-start" type="button"><img src="./assets/icons/monitor-on.png" alt="" />实时开始</button>
+                  <button class="mini-button" data-action="realtime-session-start" type="button"><img src="./assets/icons-wuxia/context-ring.svg" alt="" />实时开始</button>
                   <button class="mini-button" data-action="realtime-session-stop" type="button"><img src="./assets/icons-wuxia/stop.svg" alt="" />实时停止</button>
                 </div>
                 <pre class="realtime-session-status" data-role="realtime-session-status">等待加载实时交互状态。</pre>
                 <div class="audio-realtime-controls">
                   <button class="mini-button" data-action="audio-realtime-start" type="button"><img src="./assets/icons-wuxia/microphone.svg" alt="" />开始</button>
-                  <button class="mini-button" data-action="audio-realtime-stop" type="button"><img src="./assets/icons/stop.png" alt="" />停止</button>
+                  <button class="mini-button" data-action="audio-realtime-stop" type="button"><img src="./assets/icons-wuxia/stop.svg" alt="" />停止</button>
                 </div>
                 <pre class="audio-realtime-status" data-role="audio-realtime-status">等待加载语音状态。</pre>
               </section>
@@ -398,42 +400,42 @@
                   <p>官方 iLink 当前仅支持私聊。绑定联系人后，可继续既有聊天室、模型会话和任务。</p>
                   <dl class="clawbot-metrics">
                     <div><dt>绑定</dt><dd data-role="clawbot-binding-count">0</dd></div>
-                    <div><dt>Inbox 完成</dt><dd data-role="clawbot-inbox-completed">0</dd></div>
-                    <div><dt>Outbox 待发</dt><dd data-role="clawbot-outbox-pending">0</dd></div>
+                    <div><dt>已接收</dt><dd data-role="clawbot-inbox-completed">0</dd></div>
+                    <div><dt>待发送</dt><dd data-role="clawbot-outbox-pending">0</dd></div>
                     <div><dt>死信</dt><dd data-role="clawbot-outbox-dead-letter">0</dd></div>
                   </dl>
                   <small>能力：<span data-role="clawbot-capabilities">—</span></small>
-                  <div class="clawbot-sidecar-card clawbot-sidecar-summary" aria-label="Sidecar 健康状态">
-                    <span>Sidecar</span>
-                    <b data-role="clawbot-sidecar-health">sidecar 不可用</b>
-                    <p data-role="clawbot-sidecar-detail">等待检查 provider sidecar 健康状态。</p>
-                    <small data-role="clawbot-sidecar-provider">provider：—</small>
+                  <div class="clawbot-sidecar-card clawbot-sidecar-summary" aria-label="辅助服务健康状态">
+                    <span>辅助服务</span>
+                    <b data-role="clawbot-sidecar-health">辅助服务不可用</b>
+                    <p data-role="clawbot-sidecar-detail">等待检查连接服务状态。</p>
+                    <small data-role="clawbot-sidecar-provider">服务：—</small>
                   </div>
                   <button class="mini-button is-primary-control" data-action="clawbot-refresh" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" />刷新状态</button>
                 </section>
                 <section class="clawbot-card clawbot-qr-card">
                   <header>
                     <span>扫码登录</span>
-                    <b data-role="clawbot-login-state">Logged out</b>
+                    <b data-role="clawbot-login-state">未登录</b>
                   </header>
                   <div class="clawbot-qr-placeholder" aria-label="微信登录二维码">
                     <i></i><i></i><i></i><i></i>
                     <img id="clawbot-qr-image" alt="微信登录二维码" hidden />
                     <a id="clawbot-qr-link" class="clawbot-qr-link" href="#" target="_blank" rel="noopener noreferrer" hidden>打开微信扫码页</a>
-                    <span data-role="clawbot-qr-hint">点击刷新二维码，等待 sidecar 上报。</span>
+                    <span data-role="clawbot-qr-hint">点击刷新二维码，等待辅助服务上报。</span>
                   </div>
                   <div class="clawbot-login-actions">
                     <button id="clawbot-login-refresh" class="mini-button is-primary-control" data-action="clawbot-login-refresh" type="button">刷新二维码</button>
                     <button id="clawbot-login-logout" class="mini-button" data-action="clawbot-login-logout" type="button">退出登录</button>
                   </div>
-                  <small data-role="clawbot-login-detail">登录凭据由 sidecar 持有，控制台只保存无敏感信息的状态快照。</small>
+                  <small data-role="clawbot-login-detail">登录凭据由辅助服务持有，控制台只保存无敏感信息的状态快照。</small>
                 </section>
               </aside>
 
               <section class="clawbot-main-console" aria-label="微信连接联系人绑定">
                 <header class="clawbot-section-head">
                   <div>
-                    <span>WeChat Bridge</span>
+                    <span>微信桥接</span>
                     <h2>微信连接操作台</h2>
                   </div>
                 </header>
@@ -472,7 +474,7 @@
                         <span>文件读写</span>
                         <small>继承当前聊天室授权范围</small>
                       </div>
-                      <b>Files</b>
+                      <b>文件</b>
                     </header>
                     <label class="config-field">
                       <span>工作区相对路径</span>
@@ -494,13 +496,13 @@
                     <header class="clawbot-subsection-head">
                       <div>
                         <span>任务管理</span>
-                        <small>读取绑定聊天室的 Goal 任务</small>
+                        <small>读取绑定聊天室的目标任务</small>
                       </div>
-                      <b>Tasks</b>
+                      <b>任务</b>
                     </header>
                     <label class="config-field">
                       <span>任务编号或 ID</span>
-                      <input data-role="clawbot-task-selector" placeholder="1 或 goal-id" autocomplete="off" />
+                      <input data-role="clawbot-task-selector" placeholder="1 或目标编号" autocomplete="off" />
                     </label>
                     <div class="clawbot-private-actions">
                       <button class="mini-button is-primary-control" data-action="clawbot-task-refresh" type="button">刷新任务</button>
@@ -543,11 +545,11 @@
                   </label>
                   <label class="config-field">
                     <span>目标 Agent</span>
-                    <input data-role="clawbot-target-agents" placeholder="agent-test001, verifier" autocomplete="off" />
+                    <input data-role="clawbot-target-agents" placeholder="planner, verifier" autocomplete="off" />
                   </label>
                   <label class="clawbot-switch-field">
                     <input data-role="clawbot-allowlisted" type="checkbox" />
-                    <span>Allowlist 放行</span>
+                    <span>允许名单放行</span>
                   </label>
                   <label class="clawbot-switch-field">
                     <input data-role="clawbot-enabled" type="checkbox" checked />
@@ -571,8 +573,8 @@
                   </div>
                 </section>
                 <details class="clawbot-card clawbot-debug-drawer">
-                  <summary><span>调试与事件</span><b>命令试跑 / 事件预览</b></summary>
-                  <section class="clawbot-debug-section clawbot-command-runner" aria-label="命令试跑">
+                  <summary><span>诊断与事件</span><b>安全预演 / 事件预览</b></summary>
+                  <section class="clawbot-debug-section clawbot-command-runner" aria-label="命令安全预演">
                     <label class="config-field">
                       <span>账号</span>
                       <input data-role="clawbot-command-account" placeholder="wx-main" autocomplete="off" />
@@ -586,10 +588,10 @@
                       <input data-role="clawbot-command-text" placeholder="/room room-project-a" autocomplete="off" />
                     </label>
                     <button class="mini-button" data-action="clawbot-apply-command" type="button"><img src="./assets/icons-wuxia/send.svg" alt="" />应用命令</button>
-                    <pre data-role="clawbot-command-result">等待命令。本机执行不会伪造微信入站消息，也不会重复投递到 Provider。</pre>
+                    <pre data-role="clawbot-command-result">等待命令。本机执行不会伪造微信入站消息，也不会重复投递到连接服务。</pre>
                   </section>
                   <section class="clawbot-debug-section clawbot-event-card" aria-label="事件预览">
-                    <header class="clawbot-subsection-head"><div><span>事件预览</span><small>Inbound</small></div></header>
+                    <header class="clawbot-subsection-head"><div><span>事件预览</span><small>入站</small></div></header>
                     <pre data-role="clawbot-preview-output">保存绑定或应用命令后会在这里显示最新结果。</pre>
                   </section>
                 </details>
@@ -598,141 +600,146 @@
           </article>
 
           <article class="workbench-window chat-workbench-window is-active" data-window-id="chat" data-window-theme="communication-bay" aria-label="聊天室窗口">
-            <div class="window-panel chat-window-panel">
-              <aside class="chat-left-rail" aria-label="聊天上下文侧栏">
-                <section class="chat-compact-actions" data-sidebar-group="chat-actions">
-                  <header><strong>聊天室操作</strong><span data-bind="chat.selected">0 条已选历史</span></header>
-                  <div class="chat-sidebar-actions">
-                    <button class="link-button" data-action="chat-room-new" type="button">新建</button>
-                    <button class="link-button" data-action="chat-room-rename" type="button">重命名</button>
-                    <button class="link-button" data-action="chat-room-delete" type="button">删除</button>
+            <div class="window-panel chat-window-panel" data-left-collapsed="true" data-right-collapsed="false" data-focus-mode="false">
+              <aside id="chat-left-rail" class="chat-left-rail" data-role="chat-left-rail" aria-label="聊天导航与上下文侧栏">
+                <button class="chat-rail-overlay-close chat-left-overlay-close" data-action="chat-left-rail-toggle" type="button" aria-controls="chat-left-rail" aria-expanded="true" aria-label="隐藏聊天导航侧栏" title="收起聊天导航侧栏">
+                  <img src="./assets/ui-redesign/three-column/control-icons/panel-left-close-v1.png" alt="" aria-hidden="true" />
+                </button>
+                <section class="chat-workspace-summary" data-sidebar-group="workspace-summary" aria-label="当前工作区与聊天室摘要">
+                  <div class="chat-workspace-summary-mark" aria-hidden="true">
+                    <img src="./assets/icons-wuxia/folder.svg" alt="" />
+                  </div>
+                  <div class="chat-workspace-summary-copy">
+                    <span>当前工作区</span>
+                    <strong data-role="chat-workspace-summary-path" title="当前工作目录">未设置</strong>
+                    <div class="chat-workspace-summary-room">
+                      <img src="./assets/icons-wuxia/chat.svg" alt="" aria-hidden="true" />
+                      <b data-role="chat-room-summary-name">主聊天室</b>
+                      <small data-role="chat-room-summary-status">当前会话</small>
+                    </div>
                   </div>
                 </section>
-                <section class="chat-sidebar-group chat-sidebar-channels" data-sidebar-group="channel-models" hidden aria-hidden="true">
-                  <header><strong>频道 / 模型</strong></header>
-                  <div class="chat-roster-strip" data-role="chat-roster" aria-live="polite"></div>
+                <section class="chat-compact-actions" data-sidebar-group="chat-actions">
+                  <header><strong>聊天室操作</strong></header>
+                  <div class="chat-sidebar-actions">
+                    <button class="link-button" data-action="chat-room-new" data-label="新建" type="button" aria-label="新建聊天室" title="新建聊天室"><img src="./assets/icons-wuxia/plus.svg" alt="" aria-hidden="true" /><span>新建</span></button>
+                    <button class="link-button" data-action="chat-room-rename" data-label="重命名" type="button" aria-label="重命名聊天室" title="重命名聊天室"><img src="./assets/icons-wuxia/rename.svg" alt="" aria-hidden="true" /><span>重命名</span></button>
+                    <button class="link-button" data-action="chat-room-delete" data-label="删除" type="button" aria-label="删除聊天室" title="删除聊天室"><img src="./assets/icons-wuxia/delete.svg" alt="" aria-hidden="true" /><span>删除</span></button>
+                  </div>
                 </section>
                 <section class="chat-sidebar-group chat-room-selector" data-sidebar-group="conversation-list" aria-label="聊天室切换">
-                  <header><strong>聊天室切换</strong></header>
+                  <header><strong>会话导航</strong><span data-role="chat-room-count">0 个会话</span></header>
                   <div class="chat-room-select-wrap">
-                    <button class="link-button chat-room-trigger" data-role="chat-room-trigger" type="button">主聊天室</button>
+                    <label class="chat-room-search-field">
+                      <img src="./assets/icons-wuxia/search.svg" alt="" aria-hidden="true" />
+                      <input data-role="chat-room-search" type="search" aria-label="搜索聊天室" placeholder="搜索聊天室" autocomplete="off" spellcheck="false" />
+                    </label>
                     <span class="chat-room-dropdown" data-role="chat-room-list" role="listbox"></span>
                   </div>
                 </section>
-                <section class="chat-sidebar-group chat-sidebar-recipients" data-sidebar-group="recipient-targets">
-                  <header><strong>发送 / 接收者</strong></header>
-                  <div class="agent-dropdown-wrap" data-role="agent-targets-wrap">
-                    <div class="agent-dropdown-trigger" data-role="agent-trigger">选择发送对象</div>
-                    <div class="agent-dropdown-list" data-role="agent-targets"></div>
-                  </div>
-                </section>
-                <section class="chat-sidebar-group chat-room-permissions" data-sidebar-group="room-permissions" aria-label="聊天室权限">
-                  <header><strong>聊天室权限</strong><span class="chat-permission-status" data-role="chat-permission-status">workspace-write</span></header>
-                  <div class="chat-permission-controls">
-                    <select class="chat-permission-select" data-role="chat-permission-select" aria-label="选择聊天室权限">
-                      <option value="workspace-write">workspace-write（默认）</option>
-                      <option value="full-access">full-access（双重确认）</option>
-                    </select>
-                    <button class="mini-button" data-action="chat-permission-save" type="button">应用</button>
-                  </div>
-                  <small data-role="chat-permission-hint">权限只对当前聊天室生效；full-access 仍需要双重确认。</small>
-                </section>
-                <section class="chat-sidebar-group chat-workspace-settings" data-sidebar-group="workspace-settings" aria-label="聊天室工作目录">
-                  <header><strong>聊天室工作目录</strong></header>
-                  <div class="chat-workspace-control">
-                    <span class="chat-workspace-path" data-role="chat-workspace-path" title="当前工作目录">—</span>
-                    <button class="mini-button" data-action="chat-workspace-edit" type="button">设置</button>
-                  </div>
-                  <small>发送、工具调用和授权默认作用于此目录。</small>
-                </section>
-                <details class="chat-sidebar-group chat-session-auth" data-sidebar-group="session-auth">
-                  <summary><strong>授权详情</strong><span class="auth-tier-status" data-bind="tasks.fullAccessStatus">Off · workspace</span></summary>
-                  <div class="chat-session-auth-body">
-                    <header class="authorization-config-head">
-                      <div>
-                        <strong>授权配置</strong>
-                        <span>对当前会话授权，会话：<b data-role="authorization-selected-room">未选择会话</b></span>
+                <details class="chat-sidebar-group chat-sidebar-advanced" data-sidebar-group="advanced-config">
+                  <summary>
+                    <span class="chat-sidebar-advanced-title"><img src="./assets/icons-wuxia/settings.svg" alt="" aria-hidden="true" /><strong>高级配置</strong></span>
+                    <small>Agent、权限与目录</small>
+                  </summary>
+                  <div class="chat-sidebar-advanced-body">
+                    <section class="chat-sidebar-group chat-sidebar-recipients" data-sidebar-group="recipient-targets">
+                      <header><strong>发送 / 接收者</strong></header>
+                      <div class="agent-dropdown-wrap" data-role="agent-targets-wrap">
+                        <button class="agent-dropdown-trigger" data-role="agent-trigger" type="button" aria-controls="chat-agent-targets" aria-expanded="false">选择发送对象</button>
+                        <div id="chat-agent-targets" class="agent-dropdown-list" data-role="agent-targets"></div>
                       </div>
-                    </header>
-                    <div class="authorization-mode-grid">
-                      <article class="auth-tier-card" data-auth-mode-card="workspace">
-                        <header class="auth-tier-head"><img src="./assets/icons-wuxia/lock.svg" alt="" /><strong>默认权限</strong><button class="mini-button task-refresh-inline" data-action="task-refresh" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" />刷新</button></header>
-                        <p class="auth-tier-desc">workspace 内文件读写与命令执行按默认策略放行。</p>
-                        <p class="auth-tier-meta">当前 workspace：<b data-bind="tasks.currentWorkspace">—</b></p>
-                      </article>
-                      <article class="auth-tier-card" data-auth-mode-card="external-root">
-                        <header class="auth-tier-head"><img src="./assets/icons-wuxia/folder.svg" alt="" /><strong>workspace 外目录</strong></header>
-                        <p class="auth-tier-desc">只授权明确目录，配置持久保存。</p>
-                        <div class="auth-dir-input">
-                          <input data-role="allowed-root-input" type="text" placeholder="C:\Users\you\project" spellcheck="false" />
-                          <button class="mini-button" data-action="allowed-root-add" type="button">授权目录</button>
+                    </section>
+                    <section class="chat-sidebar-group chat-room-permissions" data-sidebar-group="room-permissions" aria-label="聊天室权限">
+                      <header><strong>聊天室权限</strong><span class="chat-permission-status" data-role="chat-permission-status">工作区写入</span></header>
+                      <div class="chat-permission-controls">
+                        <select class="chat-permission-select" data-role="chat-permission-select" aria-label="选择聊天室权限">
+                          <option value="workspace-write">工作区写入（默认）</option>
+                          <option value="full-access">完全访问（双重确认）</option>
+                        </select>
+                        <button class="mini-button" data-action="chat-permission-save" type="button"><img src="./assets/icons-wuxia/check.svg" alt="" />应用</button>
+                      </div>
+                      <small data-role="chat-permission-hint">权限只对当前聊天室生效；完全访问仍需要双重确认。</small>
+                    </section>
+                    <section class="chat-sidebar-group chat-workspace-settings" data-sidebar-group="workspace-settings" aria-label="聊天室工作目录">
+                      <header><strong>聊天室工作目录</strong></header>
+                      <div class="chat-workspace-control">
+                        <span class="chat-workspace-path" data-role="chat-workspace-path" title="当前工作目录">—</span>
+                        <button class="mini-button" data-action="chat-workspace-edit" type="button"><img src="./assets/icons-wuxia/settings.svg" alt="" />设置</button>
+                      </div>
+                      <small>发送、工具调用和授权默认作用于此目录。</small>
+                    </section>
+                    <details class="chat-sidebar-group chat-session-auth" data-sidebar-group="session-auth">
+                      <summary><strong>授权详情</strong><span class="auth-tier-status" data-bind="tasks.fullAccessStatus">关闭 · 工作区</span></summary>
+                      <div class="chat-session-auth-body">
+                        <header class="authorization-config-head">
+                          <div>
+                            <strong>授权配置</strong>
+                            <span>对当前会话授权，会话：<b data-role="authorization-selected-room">未选择会话</b></span>
+                          </div>
+                        </header>
+                        <div class="authorization-mode-grid">
+                          <article class="auth-tier-card" data-auth-mode-card="workspace">
+                            <header class="auth-tier-head"><img src="./assets/icons-wuxia/lock.svg" alt="" /><strong>默认权限</strong><button class="mini-button task-refresh-inline" data-action="task-refresh" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" />刷新</button></header>
+                            <p class="auth-tier-desc">工作区内文件读写与命令执行按默认策略放行。</p>
+                            <p class="auth-tier-meta">当前工作区：<b data-bind="tasks.currentWorkspace">—</b></p>
+                          </article>
+                          <article class="auth-tier-card" data-auth-mode-card="external-root">
+                            <header class="auth-tier-head"><img src="./assets/icons-wuxia/folder.svg" alt="" /><strong>工作区外目录</strong></header>
+                            <p class="auth-tier-desc">只授权明确目录，配置持久保存。</p>
+                            <div class="auth-dir-input">
+                              <input data-role="allowed-root-input" type="text" placeholder="C:\Users\you\project" spellcheck="false" />
+                              <button class="mini-button" data-action="allowed-root-add" type="button"><img src="./assets/icons-wuxia/unlock.svg" alt="" />授权目录</button>
+                            </div>
+                            <div class="auth-dir-list" data-role="allowed-root-list">
+                              <div class="task-window-empty">暂无外部目录授权。</div>
+                            </div>
+                          </article>
+                          <article class="auth-tier-card auth-tier-full task-full-access" data-auth-mode-card="full-access">
+                            <p class="auth-tier-desc">授权范围为当前聊天室；配置随聊天室保存，并在下次启动时恢复。</p>
+                            <header class="auth-tier-head"><img src="./assets/icons-wuxia/shield.svg" alt="" /><strong>完全访问</strong></header>
+                            <p class="auth-tier-desc auth-tier-warn">高风险会话级授权；进程重启或到期后失效，也可随时手动撤销。</p>
+                            <div class="auth-tier-actions">
+                              <button class="mini-button" type="button" data-action="full-access-enable"><img src="./assets/icons-wuxia/unlock.svg" alt="" />开启</button>
+                              <button class="mini-button" type="button" data-action="full-access-revoke"><img src="./assets/icons-wuxia/lock.svg" alt="" />撤销</button>
+                            </div>
+                          </article>
                         </div>
-                        <div class="auth-dir-list" data-role="allowed-root-list">
-                          <div class="task-window-empty">暂无外部目录授权。</div>
-                        </div>
-                      </article>
-                      <article class="auth-tier-card auth-tier-full task-full-access" data-auth-mode-card="full-access">
-                        <p class="auth-tier-desc">Authorization scope: current chat room. Saved with the room and restored on the next launch.</p>
-                        <header class="auth-tier-head"><img src="./assets/icons/permission-shield-lock.png" alt="" /><strong>Full access</strong></header>
-                        <p class="auth-tier-desc auth-tier-warn">高风险会话级授权；进程重启或到期后失效，也可随时手动撤销。</p>
-                        <div class="auth-tier-actions">
-                          <button class="mini-button" type="button" data-action="full-access-enable">开启</button>
-                          <button class="mini-button" type="button" data-action="full-access-revoke">撤销</button>
-                        </div>
-                      </article>
-                    </div>
-                    <footer class="authorization-scope-card">
-                      <p class="auth-tier-meta">生效范围：<b data-role="authorization-scope">workspace 默认</b></p>
-                      <p class="auth-tier-desc auth-tier-warn" data-role="authorization-risk">授权前确认风险：Full access 允许会话执行任意命令与文件写入，进程重启或到期后失效。</p>
-                    </footer>
+                        <footer class="authorization-scope-card">
+                          <p class="auth-tier-meta">生效范围：<b data-role="authorization-scope">工作区默认</b></p>
+                          <p class="auth-tier-desc auth-tier-warn" data-role="authorization-risk">授权前确认风险：完全访问允许会话执行任意命令与文件写入，进程重启或到期后失效。</p>
+                        </footer>
+                      </div>
+                    </details>
                   </div>
                 </details>
-                <aside class="handoff-drawer" data-role="handoff-drawer" hidden>
-                  <div class="handoff-drawer-head">
-                    <strong>任务链</strong>
-                    <span data-role="handoff-status">0 条</span>
-                  </div>
-                  <div class="handoff-list" data-role="handoff-list"></div>
-                </aside>
               </aside>
+              <div class="chat-rail-resizer chat-rail-resizer-left" data-role="chat-left-rail-resizer" role="separator" aria-label="调整聊天导航侧栏宽度" aria-controls="chat-left-rail" aria-orientation="vertical" aria-valuemin="190" aria-valuemax="360" aria-valuenow="285" tabindex="0"></div>
               <div class="chat-main-column">
-                <section class="chat-panel">
-                  <div class="chat-window-state-hooks">
-                    <span class="tool-exec-btns" data-role="tool-exec-actions" style="display:none">
-                      <button class="link-button tool-exec-allow" type="button" style="color:#55d84e">允许执行</button>
-                      <button class="link-button tool-exec-deny" type="button" style="color:#ff4c45">拒绝</button>
-                    </span>
-                    <b data-bind="chat.current" hidden>主聊天室</b>
+                <div class="chat-atmosphere" aria-hidden="true">
+                  <span class="chat-atmosphere-bamboo"></span>
+                  <span class="chat-atmosphere-jade"></span>
+                  <div class="chat-atmosphere-logo" aria-hidden="true">
+                    <img src="./assets/ui-redesign/p5/chat-watermark-jade-sword-v1.png" alt="" aria-hidden="true" />
+                    <span>COOLZHU CODE</span>
                   </div>
+                  <img class="chat-success-sweep" data-role="chat-success-sweep" src="./assets/ui-redesign/three-column/jade-success-sweep-v1.png" alt="" aria-hidden="true" hidden />
+                  <img class="chat-atmosphere-lantern chat-atmosphere-lantern-left" src="./assets/ui-redesign/three-column/rail-lantern-gold-v1.png" alt="" aria-hidden="true" />
+                  <img class="chat-atmosphere-lantern chat-atmosphere-lantern-right" src="./assets/ui-redesign/three-column/rail-lantern-gold-v1.png" alt="" aria-hidden="true" />
+                  <div class="chat-atmosphere-seal" data-role="chat-seal-stamp" data-state="idle" aria-hidden="true">
+                    <img src="./assets/ui-redesign/three-column/vermilion-seal-blank-v1.png" alt="" aria-hidden="true" />
+                    <span class="chat-atmosphere-seal-glyph" data-role="chat-seal-glyph" aria-hidden="true"></span>
+                  </div>
+                </div>
+                <section class="chat-panel">
                   <div class="message-list" data-role="chat-message-list" data-chat-window-lines="50">
-                    <article class="message user" data-message-id="seed-user-1">
-                      <img class="portrait" src="./assets/avatars/wuxia-v3/feather-guard.png" alt="" />
+                    <div class="chat-message-empty-state" data-role="chat-message-empty-state" role="status">
+                      <span aria-hidden="true"><img src="./assets/icons-wuxia/chat.svg" alt="" /></span>
                       <div>
-                        <strong>你</strong>
-                        <p>帮我分析一下当前工程的模块结构，并列出核心模块的职责。</p>
+                        <strong>竹简待书</strong>
+                        <p>选择会话或发送消息，协作记录将在这里展开。</p>
                       </div>
-                      <time>10:21:35</time>
-                    </article>
-                    <article class="message bot" data-message-id="seed-bot-1">
-                      <img class="portrait" src="./assets/avatars/wuxia-v3/bamboo-swordsman.png" alt="" />
-                      <div>
-                        <strong>COOLZHU AGENT</strong>
-                        <p>已理解你的需求，我将分析工程目录并梳理模块结构，稍后给出结果。</p>
-                      </div>
-                      <time>10:21:36</time>
-                    </article>
-                    <article class="message thought" data-message-id="seed-thought-1">
-                      <img class="portrait" src="./assets/icons/task-list.png" alt="" />
-                      <div>
-                        <strong>模型思考（摘要）</strong>
-                        <ul>
-                          <li>扫描工程目录结构</li>
-                          <li>识别核心模块与依赖关系</li>
-                          <li>归纳视觉、工具、Agent 与 GUI 交互关系</li>
-                        </ul>
-                      </div>
-                      <time>10:21:41</time>
-                    </article>
+                    </div>
                   </div>
                 </section>
                 <footer class="composer">
@@ -748,6 +755,136 @@
                   <button data-action="stt-dictate" type="button" title="语音输入：说话→自动识别并发送，大模型回复自动朗读"><img src="./assets/icons-wuxia/microphone.svg" alt="" />语音输入</button>
                 </footer>
               </div>
+              <div class="chat-rail-resizer chat-rail-resizer-right" data-role="chat-right-rail-resizer" role="separator" aria-label="调整协作与任务链侧栏宽度" aria-controls="chat-right-rail" aria-orientation="vertical" aria-valuemin="240" aria-valuemax="760" aria-valuenow="480" tabindex="0"></div>
+              <aside id="chat-right-rail" class="chat-right-rail" data-role="chat-right-rail" aria-labelledby="chat-right-rail-title">
+                <header class="chat-right-rail-heading">
+                  <img class="chat-right-agent-avatar" src="./assets/avatars/wuxia-v3/bamboo-swordsman.png" alt="" />
+                  <div class="chat-right-rail-heading-copy" data-role="chat-right-rail-heading-copy">
+                    <span data-role="chat-right-rail-kicker">协作阵列</span>
+                    <strong id="chat-right-rail-title" data-role="chat-right-rail-title">Agent 与任务链</strong>
+                  </div>
+                  <button class="chat-rail-overlay-close chat-right-overlay-close" data-action="chat-right-rail-toggle" type="button" aria-controls="chat-right-rail" aria-expanded="true" aria-label="隐藏协作与任务链侧栏" title="收起协作与任务链侧栏">
+                    <img src="./assets/ui-redesign/three-column/control-icons/panel-right-close-v1.png" alt="" aria-hidden="true" />
+                  </button>
+                </header>
+                <div class="chat-right-tabs" data-role="chat-right-tabs" role="tablist" aria-label="协作侧栏视图">
+                  <button id="chat-right-tab-collaboration" class="chat-right-tab is-active" type="button" role="tab" data-right-tab="collaboration" aria-selected="true" aria-controls="chat-right-panel-collaboration" tabindex="0">
+                    <img src="./assets/icons-wuxia/branch.svg" alt="" aria-hidden="true" /><span>协作</span><b class="chat-right-tab-badge" data-role="chat-right-roster-count" hidden></b>
+                  </button>
+                  <button id="chat-right-tab-tasks" class="chat-right-tab" type="button" role="tab" data-right-tab="tasks" aria-selected="false" aria-controls="chat-right-panel-tasks" tabindex="-1">
+                    <img src="./assets/icons-wuxia/tasks.svg" alt="" aria-hidden="true" /><span>任务</span><b class="chat-right-tab-badge" data-role="chat-right-handoff-count" hidden></b>
+                  </button>
+                  <button id="chat-right-tab-status" class="chat-right-tab" type="button" role="tab" data-right-tab="status" aria-selected="false" aria-controls="chat-right-panel-status" tabindex="-1">
+                    <img src="./assets/icons-wuxia/shield.svg" alt="" aria-hidden="true" /><span>状态</span>
+                  </button>
+                  <button id="chat-right-tab-tools" class="chat-right-tab" type="button" role="tab" data-right-tab="tools" aria-selected="false" aria-controls="chat-right-panel-tools" tabindex="-1" title="打开当前工具">
+                    <img src="./assets/icons-wuxia/mcp-tools.svg" alt="" aria-hidden="true" /><span>工具</span>
+                  </button>
+                </div>
+                <div class="chat-right-panels" data-role="chat-right-panels">
+                  <section id="chat-right-panel-collaboration" class="chat-right-panel chat-right-collaboration-panel" data-right-panel="collaboration" role="tabpanel" aria-labelledby="chat-right-tab-collaboration" tabindex="0">
+                    <section class="chat-sidebar-group chat-sidebar-channels" data-sidebar-group="channel-models">
+                      <header><strong>协作 Agent</strong></header>
+                      <div class="chat-roster-strip" data-role="chat-roster" aria-live="polite"></div>
+                    </section>
+                  </section>
+                  <section id="chat-right-panel-tasks" class="chat-right-panel chat-right-task-panel" data-right-panel="tasks" role="tabpanel" aria-labelledby="chat-right-tab-tasks" tabindex="0" hidden>
+                    <div class="chat-right-task-content">
+                      <article class="top-status-card chat-right-task-summary" data-role="chat-right-task-summary" aria-label="当前任务摘要">
+                        <div class="task-summary-grid task-summary-grid-compact">
+                          <p class="task-summary-name"><span>任务</span><b data-bind="task.currentTitle" title="">空闲</b></p>
+                          <div class="task-summary-progress" data-role="task-card-progress" aria-label="任务进度">
+                            <div class="task-summary-progress-track"><span data-role="task-card-progress-bar" style="width:0%"></span></div>
+                            <b data-bind="task.currentProgress">0%</b>
+                          </div>
+                          <div class="task-status-summary" aria-label="任务状态统计">
+                            <span class="task-status-item is-running"><i></i>运行中 <b data-bind="task.statusRunning">0</b></span>
+                            <span class="task-status-item is-queued"><i></i>排队中 <b data-bind="task.statusQueued">0</b></span>
+                            <span class="task-status-item is-completed"><i></i>已完成 <b data-bind="task.statusCompleted">0</b></span>
+                            <span class="task-status-item is-failed"><i></i>失败 <b data-bind="task.statusFailed">0</b></span>
+                          </div>
+                          <p class="task-summary-approval-badge" data-role="task-summary-approval-badge" hidden><span>待审批</span><b data-bind="approval.decisionLabel">等待</b></p>
+                        </div>
+                      </article>
+                      <aside class="handoff-drawer" data-role="handoff-drawer" aria-label="任务链">
+                        <div class="handoff-drawer-head">
+                          <strong>任务链</strong>
+                          <span data-role="handoff-status">0 条</span>
+                        </div>
+                        <div class="handoff-list" data-role="handoff-list"></div>
+                      </aside>
+                    </div>
+                  </section>
+                  <section id="chat-right-panel-status" class="chat-right-panel chat-right-status-panel" data-right-panel="status" role="tabpanel" aria-labelledby="chat-right-tab-status" tabindex="0" hidden>
+                    <section class="top-status-card overview-card chat-right-overview-card" data-role="chat-right-overview-card" aria-label="Agent 总览详情">
+                      <header class="compact-card-head"><strong>Agent 总览</strong></header>
+                      <div class="overview-dashboard">
+                        <div class="overview-dashboard-body">
+                          <div class="overview-health" data-role="overview-health">
+                            <div class="overview-health-head">
+                              <span>系统健康度</span>
+                              <b data-bind="overview.healthPercent">0%</b>
+                            </div>
+                            <div class="overview-health-track" aria-hidden="true"><span data-role="overview-health-bar" style="width:0%"></span></div>
+                            <small data-bind="overview.healthDetail">0/0 项就绪</small>
+                          </div>
+                          <div class="overview-compact-lines" aria-label="总览精简状态">
+                            <p class="overview-line-status"><span>运行状态</span><b data-role="overview-health-inline">等待自检</b></p>
+                            <p class="overview-line-vision"><span>视觉模型</span><select class="overview-vision-select" data-role="overview-vision-agent" title="选中后作为当前视觉理解模型，可随时更换其它多模态会话"><option value="">未配置</option></select></p>
+                          </div>
+                          <div class="overview-metrics">
+                            <p><span>已激活 Agent 数</span><b data-bind="overview.activeAgentCount">0</b></p>
+                            <p><span>聊天室个数</span><b data-bind="overview.chatRoomCount">0</b></p>
+                            <p><span>目标角色</span><b data-bind="overview.activeRoleCount">0</b></p>
+                          </div>
+                          <div class="overview-active-roles" data-role="overview-active-roles">暂无活跃目标角色。</div>
+                        </div>
+                      </div>
+                    </section>
+                    <div class="chat-right-status-list" data-role="chat-right-status-list" aria-label="当前会话状态">
+                      <div class="chat-right-status-row"><img src="./assets/icons-wuxia/chat.svg" alt="" aria-hidden="true" /><span>聊天室</span><b data-role="chat-right-status-room">未配置</b></div>
+                      <div class="chat-right-status-row"><img src="./assets/icons-wuxia/folder.svg" alt="" aria-hidden="true" /><span>工作区</span><b data-role="chat-right-status-workspace">未配置</b></div>
+                      <div class="chat-right-status-row"><img src="./assets/icons-wuxia/branch.svg" alt="" aria-hidden="true" /><span>Agent</span><b data-role="chat-right-status-agent">未配置</b></div>
+                      <div class="chat-right-status-row"><img src="./assets/icons-wuxia/model-scroll.svg" alt="" aria-hidden="true" /><span>模型</span><b data-role="chat-right-status-model">未配置</b></div>
+                      <div class="chat-right-status-row"><img src="./assets/icons-wuxia/shield.svg" alt="" aria-hidden="true" /><span>权限</span><b data-role="chat-right-status-permission">未配置</b></div>
+                      <div class="chat-right-status-row"><img src="./assets/icons-wuxia/tasks.svg" alt="" aria-hidden="true" /><span>当前任务</span><b data-role="chat-right-status-task">暂无</b></div>
+                    </div>
+                  </section>
+                  <section id="chat-right-panel-tools" class="chat-right-panel chat-right-tool-panel" data-right-panel="tools" role="tabpanel" aria-labelledby="chat-right-tab-tools" tabindex="0" hidden>
+                    <div class="chat-tool-host" data-role="chat-tool-host" aria-label="当前工具面板" tabindex="-1">
+                      <header class="chat-tool-host-heading">
+                        <img data-role="chat-tool-host-icon" src="./assets/icons-wuxia/mcp-tools.svg" alt="" aria-hidden="true" />
+                        <div class="chat-tool-host-heading-copy">
+                          <span data-role="chat-tool-host-kicker">当前工具</span>
+                          <strong data-role="chat-tool-host-title">选择工具</strong>
+                        </div>
+                        <div class="chat-tool-host-actions">
+                          <button class="chat-tool-host-action" data-action="chat-tool-back" type="button" aria-label="返回右栏协作视图" title="返回此前的右栏视图">
+                            <img src="./assets/icons-wuxia/chevron.svg" alt="" aria-hidden="true" />
+                            <span>返回</span>
+                          </button>
+                          <button class="chat-tool-host-action" data-action="chat-tool-close" type="button" aria-label="关闭当前工具" title="关闭当前工具并回到聊天室">
+                            <img src="./assets/ui-redesign/three-column/control-icons/panel-right-close-v1.png" alt="" aria-hidden="true" />
+                            <span>关闭</span>
+                          </button>
+                        </div>
+                      </header>
+                      <div class="chat-tool-host-content" data-role="chat-tool-host-content"></div>
+                    </div>
+                  </section>
+                </div>
+                <footer class="chat-right-rail-footer" data-role="chat-right-rail-footer">
+                  <button class="chat-right-footer-action is-primary-control" data-action="chat-task-chain" type="button" aria-label="打开任务链" title="打开任务链">
+                    <img src="./assets/ui-redesign/three-column/control-icons/queue-v1.png" alt="" aria-hidden="true" /><span>任务链</span><b class="chat-right-footer-badge" data-role="chat-right-task-count" hidden></b>
+                  </button>
+                  <button class="chat-right-footer-action" data-action="chat-handoff-manual" type="button" aria-label="转交当前任务" title="将当前任务转交给协作 Agent">
+                    <img src="./assets/ui-redesign/three-column/control-icons/steer-now-v1.png" alt="" aria-hidden="true" /><span>转交</span>
+                  </button>
+                  <button class="chat-right-footer-action" data-action="chat-right-rail-toggle" type="button" aria-controls="chat-right-rail" aria-expanded="true" aria-label="收起侧栏" title="收起侧栏">
+                    <img src="./assets/icons-wuxia/chevron.svg" alt="" aria-hidden="true" /><span>收起侧栏</span>
+                  </button>
+                </footer>
+              </aside>
             </div>
           </article>
 
@@ -764,18 +901,18 @@
               </section>
               <details class="browser-utility-drawer">
                 <summary>高级代理设置</summary>
-                <section class="browser-proxy-config" data-role="browser-proxy-config" aria-label="Browser proxy config">
-                  <label><input data-role="browser-proxy-system" type="checkbox" checked /> System proxy</label>
+                <section class="browser-proxy-config" data-role="browser-proxy-config" aria-label="浏览器代理配置">
+                  <label><input data-role="browser-proxy-system" type="checkbox" checked /> 使用系统代理</label>
                   <input data-role="browser-proxy-url" placeholder="http://127.0.0.1:7897（留空自动探测）" spellcheck="false" />
                   <input data-role="browser-proxy-bypass" placeholder="localhost;127.0.0.1" spellcheck="false" />
                   <button class="mini-button is-primary-control" data-action="browser-proxy-save" type="button"><img src="./assets/icons-wuxia/save.svg" alt="" />保存</button>
-                  <span data-role="browser-proxy-status">Proxy config not loaded.</span>
+                  <span data-role="browser-proxy-status">代理配置尚未加载。</span>
                 </section>
               </details>
               <details class="browser-utility-drawer browser-bridge-diagnostics">
-                <summary>Browser Bridge 诊断</summary>
-                <section class="browser-bridge-diagnostic-body" aria-label="Browser Bridge 诊断">
-                  <label class="browser-bridge-target"><span>测试页 URL</span><input data-role="browser-bridge-target-url" type="url" value="" spellcheck="false" /></label>
+                <summary>浏览器桥接诊断</summary>
+                <section class="browser-bridge-diagnostic-body" aria-label="浏览器桥接诊断">
+                  <label class="browser-bridge-target"><span>验证页地址</span><input data-role="browser-bridge-target-url" type="url" value="" spellcheck="false" /></label>
                   <label><span>场景</span><select data-role="browser-bridge-self-test-kind">
                     <option value="slider">滑块</option>
                     <option value="drag">拖拽</option>
@@ -785,11 +922,11 @@
                   </select></label>
                   <label><span>滑块值</span><input data-role="browser-bridge-self-test-value" type="number" min="0" max="100" value="80" /></label>
                   <div class="browser-bridge-actions">
-                    <button class="mini-button" data-action="browser-bridge-health" type="button">Health</button>
-                    <button class="mini-button" data-action="browser-bridge-probe" type="button">Probe</button>
-                    <button class="mini-button is-primary-control" data-action="browser-bridge-self-test" type="button">运行自测</button>
+                    <button class="mini-button" data-action="browser-bridge-health" type="button">连接检查</button>
+                    <button class="mini-button" data-action="browser-bridge-probe" type="button">能力探测</button>
+                    <button class="mini-button is-primary-control" data-action="browser-bridge-self-test" type="button">安全预演</button>
                   </div>
-                  <pre data-role="browser-bridge-output">等待诊断。自测只应指向本地、可逆的测试页。</pre>
+                  <pre data-role="browser-bridge-output">等待诊断。安全预演只应指向本地、可逆的验证页。</pre>
                 </section>
               </details>
               <section class="browser-window-body">
@@ -804,16 +941,16 @@
           <article class="workbench-window terminal-workbench-window" data-window-id="terminal" data-window-theme="reactor-console" aria-label="终端窗口">
             <div class="terminal-console-shell">
               <div class="window-panel terminal-window-panel">
-                <pre class="terminal-window-output" data-role="terminal-window-output">PowerShell is ready in the current project directory.</pre>
+                <pre class="terminal-window-output" data-role="terminal-window-output">当前工程目录中的 PowerShell 已就绪。</pre>
                 <details class="terminal-window-details">
                   <summary>执行详情</summary>
-                  <pre data-role="terminal-window-raw">No execution yet.</pre>
+                  <pre data-role="terminal-window-raw">尚未执行命令。</pre>
                 </details>
                 <section class="terminal-window-command" aria-label="受控工具命令">
                   <label class="terminal-command-input"><span>PS</span><textarea data-role="terminal-command" spellcheck="false">Get-ChildItem</textarea></label>
-                  <label class="terminal-timeout-input"><span>Timeout</span><input data-role="terminal-timeout-ms" value="30000" inputmode="numeric" /></label>
+                  <label class="terminal-timeout-input"><span>超时（毫秒）</span><input data-role="terminal-timeout-ms" value="30000" inputmode="numeric" /></label>
                   <button class="pixel-button wide is-primary-control" data-action="terminal-window-run" type="button"><img src="./assets/icons-wuxia/terminal.svg" alt="" />运行</button>
-                  <button class="mini-button terminal-clear-inline" data-action="terminal-window-clear" type="button" title="清空输出"><img src="./assets/icons/trash.png" alt="" /></button>
+                  <button class="mini-button terminal-clear-inline" data-action="terminal-window-clear" type="button" title="清空输出"><img src="./assets/icons-wuxia/delete.svg" alt="" /></button>
                 </section>
               </div>
             </div>
@@ -822,106 +959,106 @@
           <article class="workbench-window tasks-workbench-window" data-window-id="tasks" data-window-theme="vault-access" aria-label="任务与授权窗口">
             <div class="window-panel task-window-panel">
               <div class="task-permission-layout">
-                <section class="task-permission-column task-pending-column" aria-label="Goal 与计划任务">
-                  <section class="task-window-section goal-role-consult goal-consult-management" aria-label="Goal 创建与列表">
+                <section class="task-permission-column task-pending-column" aria-label="目标与计划任务">
+                  <section class="task-window-section goal-role-consult goal-consult-management" aria-label="目标创建与列表">
                     <header>
                       <div>
-                        <strong>Goal 任务</strong>
+                        <strong>目标任务</strong>
                         <span><b data-bind="tasks.goalCount">0</b> 个目标 · 创建后可规划、派发、暂停和审批。</span>
                       </div>
                     </header>
                     <div class="task-goal-create">
                       <input data-role="goal-consult-title" type="text" maxlength="240" placeholder="输入目标，例如：完成项目回归测试并生成安装包" />
-                      <button class="mini-button is-primary-control" data-action="goal-create" type="button"><img src="./assets/icons/session-new.png" alt="" />创建 Goal</button>
+                      <button class="mini-button is-primary-control" data-action="goal-create" type="button"><img src="./assets/icons-wuxia/plus.svg" alt="" />创建目标</button>
                     </div>
                     <div class="goal-consult-list task-window-scroll" data-role="goal-consult-list">
-                      <div class="task-window-empty">暂无 Goal。创建后可查看阶段和运行状态。</div>
+                      <div class="task-window-empty">暂无目标。创建后可查看阶段和运行状态。</div>
                     </div>
                   </section>
-                  <section class="task-window-section goal-role-consult" data-role="goal-role-consult" aria-label="Goal 角色分配">
+                  <section class="task-window-section goal-role-consult" data-role="goal-role-consult" aria-label="目标角色分配">
                     <header>
                       <div>
-                        <strong>Goal 角色分配</strong>
+                        <strong>目标角色分配</strong>
                         <span>从当前会话配置中选择各角色，任务期临时技能会自动安装和清理。</span>
                       </div>
                       <button class="mini-button is-primary-control" data-action="goal-role-assign" type="button"><img src="./assets/icons-wuxia/save.svg" alt="" />应用分配</button>
                     </header>
                     <div class="goal-role-assignment-grid" data-role="goal-role-assignment-grid">
-                      <label><span>commander</span><select data-goal-role-assignment="commander"></select></label>
-                      <label><span>planner</span><select data-goal-role-assignment="planner"></select></label>
-                      <label><span>implementer</span><select data-goal-role-assignment="implementer"></select></label>
-                      <label><span>verifier</span><select data-goal-role-assignment="verifier"></select></label>
+                      <label><span>指挥者</span><select data-goal-role-assignment="commander"></select></label>
+                      <label><span>规划者</span><select data-goal-role-assignment="planner"></select></label>
+                      <label><span>执行者</span><select data-goal-role-assignment="implementer"></select></label>
+                      <label><span>验证者</span><select data-goal-role-assignment="verifier"></select></label>
                     </div>
                   </section>
-                  <details class="task-window-section goal-role-config" data-role="goal-role-config" aria-label="Goal 角色运行配置">
+                  <details class="task-window-section goal-role-config" data-role="goal-role-config" aria-label="目标角色运行配置">
                     <summary class="task-window-section-head compact">
                       <img src="./assets/icons-wuxia/tasks.svg" alt="" />
                       <div>
-                        <h2>Goal 运行配置</h2>
+                        <h2>目标运行配置</h2>
                         <p>绑定角色、心跳与阶段超时。</p>
                       </div>
                     </summary>
                     <div class="goal-role-config-grid">
                       <label class="config-field">
-                        <span>Goal Role</span>
+                        <span>目标角色</span>
                         <select data-role="session-goal-role">
-                          <option value="">Unassigned</option>
-                          <option value="commander">commander</option>
-                          <option value="planner">planner</option>
-                          <option value="implementer">implementer</option>
-                          <option value="debugger">debugger</option>
-                          <option value="qa">qa</option>
-                          <option value="reviewer">reviewer</option>
-                          <option value="designer">designer</option>
-                          <option value="tester">tester</option>
-                          <option value="releaser">releaser</option>
-                          <option value="documenter">documenter</option>
-                          <option value="verifier">verifier</option>
+                          <option value="">未分配</option>
+                          <option value="commander">指挥者</option>
+                          <option value="planner">规划者</option>
+                          <option value="implementer">执行者</option>
+                          <option value="debugger">调试者</option>
+                          <option value="qa">质量保障</option>
+                          <option value="reviewer">审查者</option>
+                          <option value="designer">设计者</option>
+                          <option value="tester">验证员</option>
+                          <option value="releaser">发布者</option>
+                          <option value="documenter">文档维护者</option>
+                          <option value="verifier">验证者</option>
                         </select>
                       </label>
                       <label class="config-field">
-                        <span>Responsibility</span>
-                        <input data-role="session-goal-responsibility" maxlength="160" placeholder="Phase responsibility rule" />
+                        <span>职责</span>
+                        <input data-role="session-goal-responsibility" maxlength="160" placeholder="阶段职责规则" />
                       </label>
                       <label class="config-field">
-                        <span>Commander</span>
+                        <span>指挥会话</span>
                         <select data-role="session-goal-commander">
-                          <option value="false">No</option>
-                          <option value="true">Yes</option>
+                          <option value="false">否</option>
+                          <option value="true">是</option>
                         </select>
                       </label>
                       <label class="config-field">
-                        <span>Heartbeat ms</span>
+                        <span>心跳间隔（毫秒）</span>
                         <input data-role="session-goal-heartbeat-timeout" type="number" min="10000" max="86400000" step="1000" value="60000" />
                       </label>
                       <label class="config-field">
-                        <span>Task timeout ms</span>
+                        <span>任务超时（毫秒）</span>
                         <input data-role="session-goal-task-timeout" type="number" min="60000" max="86400000" step="10000" value="600000" />
                       </label>
                     </div>
-                    <div class="goal-role-status" data-role="goal-role-status">Goal role config not loaded.</div>
+                    <div class="goal-role-status" data-role="goal-role-status">目标角色配置尚未加载。</div>
                     <div class="goal-role-actions">
-                      <button class="mini-button" data-action="goal-role-bootstrap" type="button"><img src="./assets/icons/session-new.png" alt="" />Bootstrap role session</button>
-                      <button class="mini-button" data-action="goal-role-heartbeat" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" />Heartbeat</button>
+                      <button class="mini-button" data-action="goal-role-bootstrap" type="button"><img src="./assets/icons-wuxia/plus.svg" alt="" />初始化角色会话</button>
+                      <button class="mini-button" data-action="goal-role-heartbeat" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" />心跳检查</button>
                     </div>
                   </details>
-                  <section class="task-window-section task-window-schedules task-window-schedules-always-open" data-role="task-schedule-section" aria-label="Scheduled tasks">
+                  <section class="task-window-section task-window-schedules task-window-schedules-always-open" data-role="task-schedule-section" aria-label="定时任务">
                     <header class="task-window-section-head compact task-schedule-section-head">
                       <img src="./assets/icons-wuxia/tasks.svg" alt="" />
                       <div>
                         <h2>定时任务</h2>
-                        <p>轮询任务或 Goal 阶段推进。</p>
+                        <p>轮询任务或目标阶段推进。</p>
                       </div>
-                      <b data-bind="tasks.scheduleDue">0 due</b>
+                      <b data-bind="tasks.scheduleDue">0 待执行</b>
                     </header>
                       <div class="task-schedule-create">
                         <div class="task-schedule-main-grid">
                           <select data-role="task-schedule-session"></select>
-                          <select data-role="task-schedule-task-kind" title="任务类型：轮询型每次发送相同内容；Goal 推进型逐阶段推进绑定目标，完成后自动停止">
+                          <select data-role="task-schedule-task-kind" title="任务类型：轮询型每次发送相同内容；目标推进型逐阶段推进绑定目标，完成后自动停止">
                             <option value="poll">轮询型</option>
-                            <option value="goal">Goal 推进型</option>
+                            <option value="goal">目标推进型</option>
                           </select>
-                          <select data-role="task-schedule-goal" title="绑定目标（Goal 推进型）" hidden></select>
+                          <select data-role="task-schedule-goal" title="绑定目标（目标推进型）" hidden></select>
                           <select data-role="task-schedule-kind" title="计划类型">
                             <option value="daily">每天</option>
                             <option value="weekly">每周</option>
@@ -946,8 +1083,8 @@
                         </div>
                         <div class="task-schedule-footer-row">
                           <div class="task-schedule-permissions">
-                            <label><input data-role="task-schedule-permission-full" type="checkbox" checked /> full-access</label>
-                            <label><input data-role="task-schedule-permission-files" type="checkbox" checked /> external-files</label>
+                            <label><input data-role="task-schedule-permission-full" type="checkbox" checked /> 完全访问</label>
+                            <label><input data-role="task-schedule-permission-files" type="checkbox" checked /> 外部文件</label>
                           </div>
                           <div class="task-schedule-actions">
                             <button class="mini-button" data-action="task-schedule-create" type="button">添加</button>
@@ -1010,7 +1147,7 @@
                   <header class="module-selfcheck-head">
                     <div>
                       <strong>模块自检</strong>
-                      <span>使用真实 health endpoint</span>
+                      <span>使用真实健康检查接口</span>
                     </div>
                     <div class="button-row">
                       <button class="mini-button" data-action="diagnostics-window-refresh" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" />刷新</button>
@@ -1019,18 +1156,22 @@
                   </header>
                   <article class="logs-window-health-card is-unknown">
                     <strong data-role="logs-window-health-status">等待刷新</strong>
-                    <span data-role="logs-window-health-counts">ok 0 / warn 0 / error 0</span>
+                    <span data-role="logs-window-health-counts">正常 0 / 警告 0 / 错误 0</span>
+                    <div class="module-selfcheck-runtime-meta" aria-label="运行环境">
+                      <span><b>端口</b><span data-role="system-port">—</span></span>
+                      <span><b>构建</b><span data-role="system-build">—</span></span>
+                    </div>
                   </article>
                   <div class="module-selfcheck-list logs-window-checks" data-role="logs-window-checks">
-                    <div class="module-selfcheck-row" data-selfcheck-module="web-console"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">Web Console</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="web-console" type="button">重试</button></div>
-                    <div class="module-selfcheck-row" data-selfcheck-module="desktop-pet"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">Desktop Pet</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="desktop-pet" type="button">重试</button></div>
-                    <div class="module-selfcheck-row" data-selfcheck-module="local-model"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">Local Model</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="local-model" type="button">重试</button></div>
-                    <div class="module-selfcheck-row" data-selfcheck-module="vision"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">Vision</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="vision" type="button">重试</button></div>
-                    <div class="module-selfcheck-row" data-selfcheck-module="tts-stt"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">TTS/STT</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="tts-stt" type="button">重试</button></div>
+                    <div class="module-selfcheck-row" data-selfcheck-module="web-console"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">Web 控制台</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="web-console" type="button">重试</button></div>
+                    <div class="module-selfcheck-row" data-selfcheck-module="desktop-pet"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">桌面助手</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="desktop-pet" type="button">重试</button></div>
+                    <div class="module-selfcheck-row" data-selfcheck-module="local-model"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">本地模型</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="local-model" type="button">重试</button></div>
+                    <div class="module-selfcheck-row" data-selfcheck-module="vision"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">视觉服务</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="vision" type="button">重试</button></div>
+                    <div class="module-selfcheck-row" data-selfcheck-module="tts-stt"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">语音输入输出</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="tts-stt" type="button">重试</button></div>
                     <div class="module-selfcheck-row" data-selfcheck-module="mcp"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">MCP</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="mcp" type="button">重试</button></div>
-                    <div class="module-selfcheck-row" data-selfcheck-module="plugin"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">Plugin</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="plugin" type="button">重试</button></div>
-                    <div class="module-selfcheck-row" data-selfcheck-module="packaging"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/package-crate.svg" alt="" /><span class="module-selfcheck-name">Packaging</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="packaging" type="button">重试</button></div>
-                    <div class="module-selfcheck-row" data-selfcheck-module="logs"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">Logs</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="logs" type="button">重试</button></div>
+                    <div class="module-selfcheck-row" data-selfcheck-module="plugin"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">插件</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="plugin" type="button">重试</button></div>
+                    <div class="module-selfcheck-row" data-selfcheck-module="packaging"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/package-crate.svg" alt="" /><span class="module-selfcheck-name">打包服务</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="packaging" type="button">重试</button></div>
+                    <div class="module-selfcheck-row" data-selfcheck-module="logs"><img class="module-selfcheck-icon" src="./assets/icons-wuxia/alert-triangle.svg" alt="" /><span class="module-selfcheck-name">日志</span><span class="module-selfcheck-status" data-selfcheck-field="status">—</span><span class="module-selfcheck-time" data-selfcheck-field="time">—</span><span class="module-selfcheck-detail" data-selfcheck-field="detail">—</span><button class="mini-button module-selfcheck-retry" data-selfcheck-retry="logs" type="button">重试</button></div>
                   </div>
                   <section class="logs-window-suggestions module-selfcheck-suggestions" aria-label="修复建议">
                     <header><strong>修复建议</strong><span data-role="logs-window-suggestion-count">0</span></header>
@@ -1042,42 +1183,42 @@
                     <header><strong>常用功能自检</strong><span data-role="functional-selfcheck-status">未运行</span></header>
                     <pre data-role="functional-selfcheck-output">点击“常用功能自检”执行只读本地检查。</pre>
                   </section>
-                  <section class="logs-window-self-update module-selfcheck-plan" aria-label="Self update plan">
-                    <header><strong>Self update</strong><span data-role="self-update-status">not loaded</span></header>
-                    <button class="mini-button" data-action="self-update-plan-refresh" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" />Plan</button>
-                    <div class="self-update-plan-summary" data-role="self-update-plan-summary">Self update plan is not loaded.</div>
+                  <section class="logs-window-self-update module-selfcheck-plan" aria-label="自更新计划">
+                    <header><strong>自更新</strong><span data-role="self-update-status">尚未加载</span></header>
+                    <button class="mini-button" data-action="self-update-plan-refresh" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" />刷新计划</button>
+                    <div class="self-update-plan-summary" data-role="self-update-plan-summary">自更新计划尚未加载。</div>
                   </section>
                   <details class="module-selfcheck-diagnostic module-selfcheck-voice-diagnostic">
-                    <summary><strong>语音诊断</strong><span>模型流 / 流式 TTS 探活</span></summary>
+                    <summary><strong>语音诊断</strong><span>模型流 / 流式语音能力探测</span></summary>
                     <div class="module-selfcheck-diagnostic-body">
                       <div class="realtime-session-controls">
-                        <button class="mini-button" data-action="realtime-model-probe" type="button"><img src="./assets/icons/robot-message.png" alt="" />模型流探活</button>
-                        <button class="mini-button" data-action="realtime-tts-probe" type="button"><img src="./assets/icons-wuxia/speaker.svg" alt="" />流式TTS探活</button>
+                        <button class="mini-button" data-action="realtime-model-probe" type="button"><img src="./assets/icons-wuxia/model-scroll.svg" alt="" />模型流能力探测</button>
+                        <button class="mini-button" data-action="realtime-tts-probe" type="button"><img src="./assets/icons-wuxia/speaker.svg" alt="" />流式语音能力探测</button>
                       </div>
                     </div>
                   </details>
                   <details class="module-selfcheck-diagnostic module-selfcheck-dispatch-diagnostic" data-role="dispatch-diagnostic">
-                    <summary><strong>调度诊断</strong><span>Semantic dispatch dry-run</span></summary>
+                    <summary><strong>调度诊断</strong><span>语义调度安全预演</span></summary>
                     <div class="module-selfcheck-diagnostic-body">
                       <div class="tool-governance-grid">
                         <div class="tool-dispatch-card">
                           <div class="tool-dispatch-head">
-                            <strong>Semantic dispatch dry-run</strong>
-                            <button type="button" class="mini-button" data-action="tool-dispatch-run">Plan</button>
+                            <strong>语义调度安全预演</strong>
+                            <button type="button" class="mini-button" data-action="tool-dispatch-run">生成计划</button>
                           </div>
                           <div class="tool-status-strip" data-role="tool-status-strip" aria-label="工具调用状态灯"></div>
                           <label class="tool-dispatch-input">
-                            <span>Intent</span>
+                            <span>操作意图</span>
                             <input
                               data-role="tool-dispatch-intent"
                               value="Ctrl+L hotkey focus browser address bar"
                               autocomplete="off"
                             />
                           </label>
-                          <pre data-role="tool-dispatch-output">Waiting for a dry-run intent...</pre>
+                          <pre data-role="tool-dispatch-output">等待输入安全预演意图…</pre>
                         </div>
                         <div class="tool-scenario-matrix" data-role="tool-scenario-matrix">
-                          <div class="tool-catalog-empty">Scenario matrix will load with the tool catalog...</div>
+                          <div class="tool-catalog-empty">工具场景矩阵将随工具目录加载…</div>
                         </div>
                       </div>
                     </div>
@@ -1090,12 +1231,12 @@
           <article class="workbench-window memory-workbench-window" data-window-id="memory" data-window-theme="crystal-archive" aria-label="记忆与知识窗口">
             <div class="window-panel memory-window-panel">
               <section class="memory-window-filters" data-role="memory-window-filters" aria-label="记忆筛选">
-                <label>关键词<input data-role="memory-window-query" type="search" placeholder="summary / source / id" /></label>
-                <label>Kind<select data-role="memory-window-kind"><option value="">全部</option></select></label>
-                <label>Layer<select data-role="memory-window-layer"><option value="">全部</option></select></label>
-                <label>Pinned<select data-role="memory-window-pinned"><option value="">全部</option><option value="true">已固定</option><option value="false">未固定</option></select></label>
-                <label>Source<select data-role="memory-window-source-filter"><option value="">全部</option></select></label>
-                <label>Memory mode<select data-role="memory-window-mode">
+                <label>关键词<input data-role="memory-window-query" type="search" placeholder="摘要 / 来源 / 标识" /></label>
+                <label>类型<select data-role="memory-window-kind"><option value="">全部</option></select></label>
+                <label>层级<select data-role="memory-window-layer"><option value="">全部</option></select></label>
+                <label>固定状态<select data-role="memory-window-pinned"><option value="">全部</option><option value="true">已固定</option><option value="false">未固定</option></select></label>
+                <label>来源<select data-role="memory-window-source-filter"><option value="">全部</option></select></label>
+                <label>记忆模式<select data-role="memory-window-mode">
                   <option value="enabled">启用自动召回</option>
                   <option value="disabled">停用自动召回</option>
                   <option value="polluted">污染隔离</option>
@@ -1103,15 +1244,15 @@
                 <button class="mini-button memory-window-refresh" data-action="memory-window-refresh" type="button"><img src="./assets/icons-wuxia/refresh.svg" alt="" />刷新</button>
               </section>
               <section class="memory-window-insights" data-role="memory-window-insights" aria-label="记忆摘要">
-                <article><span>Total</span><strong data-role="memory-summary-total">0</strong></article>
-                <article><span>Pinned</span><strong data-role="memory-summary-pinned">0</strong></article>
-                <article><span>Prompt</span><strong data-role="memory-summary-prompt">0</strong></article>
-                <article><span>Context tokens</span><strong data-role="memory-context-total">0</strong></article>
+                <article><span>总数</span><strong data-role="memory-summary-total">0</strong></article>
+                <article><span>已固定</span><strong data-role="memory-summary-pinned">0</strong></article>
+                <article><span>提示内容</span><strong data-role="memory-summary-prompt">0</strong></article>
+                <article><span>上下文令牌</span><strong data-role="memory-context-total">0</strong></article>
               </section>
               <section class="memory-window-jobs" data-role="memory-window-jobs" aria-label="记忆生命周期作业">
                 <div class="memory-window-jobs-head">
                   <div>
-                    <strong>Memory lifecycle</strong>
+                    <strong>记忆生命周期</strong>
                     <span>作业状态可追踪，失败后可重试</span>
                   </div>
                   <span class="memory-window-job-status" data-role="memory-job-status">暂无作业</span>
@@ -1127,8 +1268,8 @@
               <section class="memory-window-history" data-role="memory-window-history" aria-label="会话历史分页">
                 <div class="memory-window-history-head">
                   <div>
-                    <strong>Thread history</strong>
-                    <span>turn / item 分页投影，压缩摘要单独标记</span>
+                    <strong>会话历史</strong>
+                    <span>轮次 / 条目分页视图，压缩摘要单独标记</span>
                   </div>
                   <span data-role="memory-history-status">暂无历史</span>
                   <button class="mini-button" data-action="memory-history-refresh" type="button">刷新历史</button>
@@ -1138,22 +1279,22 @@
                 <div class="memory-window-history-list" data-role="memory-history-list" aria-live="polite"></div>
               </section>
               <section class="memory-window-layout">
-                <aside class="memory-window-list-pane" aria-label="记忆 bead 列表">
+                <aside class="memory-window-list-pane" aria-label="记忆珠列表">
                   <header class="memory-window-section-head">
-                    <img src="./assets/icons/favorite.png" alt="" />
+                    <img src="./assets/icons-wuxia/pin.svg" alt="" />
                     <div>
-                      <h2>Beads</h2>
+                      <h2>记忆珠</h2>
                       <p data-bind="memoryWindow.count">0 条记忆</p>
                     </div>
                   </header>
-                  <div class="memory-bead-list" data-role="memory-bead-list" aria-label="记忆 beads"></div>
+                  <div class="memory-bead-list" data-role="memory-bead-list" aria-label="记忆珠列表"></div>
                 </aside>
                 <section class="memory-window-center-pane">
                   <header class="memory-window-section-head compact memory-constellation-head">
-                    <img src="./assets/icons/overview.png" alt="" />
+                    <img src="./assets/icons-wuxia/context-ring.svg" alt="" />
                     <div>
                       <h2>记忆星图</h2>
-                      <p>中心=会话 · 环=Layer · 色=Kind · 大小/亮度=关联度(价值) · 暗淡=易老化</p>
+                      <p>中心=会话 · 环=层级 · 色=类型 · 大小/亮度=关联度（价值） · 暗淡=易老化</p>
                     </div>
                   </header>
                   <div class="memory-constellation" data-role="memory-constellation" aria-label="记忆星状图"></div>
@@ -1163,19 +1304,19 @@
                 </section>
                 <aside class="memory-window-source" data-role="memory-window-source" aria-label="来源追踪">
                   <header class="memory-window-section-head compact">
-                    <img src="./assets/icons/file-tree.png" alt="" />
+                    <img src="./assets/icons-wuxia/branch.svg" alt="" />
                     <div>
                       <h2>来源追踪</h2>
-                      <p>origin table / message id / Goal phase 占位。</p>
+                      <p>展示来源记录、消息标识和目标阶段。</p>
                     </div>
                   </header>
                   <div class="memory-window-source-body">暂无选中来源。</div>
                   <section class="memory-window-preview-card">
-                    <h3>Prompt Preview</h3>
+                    <h3>提示词预览</h3>
                     <pre data-role="memory-prompt-preview">等待加载。</pre>
                   </section>
                   <section class="memory-window-preview-card">
-                    <h3>Context Preview</h3>
+                    <h3>上下文预览</h3>
                     <pre data-role="memory-context-preview">等待加载。</pre>
                   </section>
                 </aside>
@@ -1187,42 +1328,42 @@
             <div class="window-panel vision-window-layout">
               <section class="vision-command-rail" aria-label="视觉操作区">
                 <div class="showui-service-control vision-showui-service-control" data-role="showui-service-control">
-                  <span data-bind="showui.serviceStatus">ShowUI unknown</span>
+                  <span data-bind="showui.serviceStatus">ShowUI 状态未知</span>
                   <button class="showui-service-toggle" data-role="showui-service-toggle" data-action="showui-service-toggle" type="button" aria-pressed="false">启动</button>
                 </div>
                 <article class="vision-window-action-card" data-vision-command="capture">
-                  <h2><img src="./assets/icons-wuxia/camera.svg" alt="" />Capture</h2>
+                  <h2><img src="./assets/icons-wuxia/camera.svg" alt="" />屏幕采集</h2>
                   <p>采集最新桌面截图，保存为证据。</p>
                   <button class="pixel-button wide is-primary-control" data-action="capture" type="button"><img src="./assets/icons-wuxia/camera.svg" alt="" />采集桌面</button>
                 </article>
                 <article class="vision-window-action-card" data-vision-command="describe">
-                  <h2><img src="./assets/icons-wuxia/vision.svg" alt="" />Describe</h2>
-                  <p>描述当前屏幕内容（dry-run）。</p>
-                  <button class="pixel-button wide" data-action="vision-describe-dry-run" type="button"><img src="./assets/icons/result.png" alt="" />Describe dry-run</button>
+                  <h2><img src="./assets/icons-wuxia/vision.svg" alt="" />画面描述</h2>
+                  <p>在安全预演模式下描述当前屏幕内容。</p>
+                  <button class="pixel-button wide" data-action="vision-describe-dry-run" type="button"><img src="./assets/icons-wuxia/check.svg" alt="" />描述预演</button>
                 </article>
                 <article class="vision-window-action-card" data-vision-command="locate">
-                  <h2><img src="./assets/icons-wuxia/crosshair.svg" alt="" />Locate</h2>
-                  <p>定位目标控件并汇总 bbox。</p>
-                  <input class="vision-window-target-input" data-role="vision-locate-target" type="text" value="Windows Start button" aria-label="Locate target" />
-                  <button class="pixel-button wide" data-action="vision-locate-dry-run" type="button"><img src="./assets/icons-wuxia/crosshair.svg" alt="" />Locate dry-run</button>
-                  <button class="pixel-button wide" data-action="vision-locate-native" type="button"><img src="./assets/icons-wuxia/crosshair.svg" alt="" />Router locate</button>
+                  <h2><img src="./assets/icons-wuxia/crosshair.svg" alt="" />控件定位</h2>
+                  <p>定位目标控件并汇总边界框。</p>
+                  <input class="vision-window-target-input" data-role="vision-locate-target" type="text" value="Windows Start button" aria-label="定位目标" />
+                  <button class="pixel-button wide" data-action="vision-locate-dry-run" type="button"><img src="./assets/icons-wuxia/crosshair.svg" alt="" />定位预演</button>
+                  <button class="pixel-button wide" data-action="vision-locate-native" type="button"><img src="./assets/icons-wuxia/crosshair.svg" alt="" />路由定位</button>
                 </article>
                 <article class="vision-window-action-card" data-vision-command="closed-loop">
-                  <h2><img src="./assets/icons-wuxia/link.svg" alt="" />Closed-loop</h2>
-                  <p>闭环执行默认关闭，只做安全 dry-run。</p>
+                  <h2><img src="./assets/icons-wuxia/link.svg" alt="" />闭环验证</h2>
+                  <p>闭环执行默认关闭，仅进行安全预演。</p>
                   <div class="vision-window-action-buttons">
-                    <button class="pixel-button wide" data-action="stability-run" type="button"><img src="./assets/icons/combo-key.png" alt="" />矩阵测试</button>
-                    <button class="pixel-button wide" data-action="closed-loop" type="button"><img src="./assets/icons/monitor-on.png" alt="" />闭环 dry-run</button>
-                    <button class="pixel-button wide" data-action="safe-click-test" type="button" title="打开隔离测试窗口并执行一次真实鼠标点击"><img src="./assets/icons/mouse-left.png" alt="" />真实点击测试</button>
-                    <button class="pixel-button wide" data-action="safe-context-menu-test" type="button" title="打开隔离测试窗口并执行一次真实右键菜单选择"><img src="./assets/icons/mouse-right.png" alt="" />隔离右键菜单</button>
-                    <button class="pixel-button wide" data-action="safe-drag-select-test" type="button" title="打开隔离测试窗口并执行一次真实鼠标拖拽"><img src="./assets/icons-wuxia/crosshair.svg" alt="" />隔离拖拽选择</button>
+                    <button class="pixel-button wide" data-action="stability-run" type="button"><img src="./assets/icons-wuxia/context-ring.svg" alt="" />稳定性矩阵</button>
+                    <button class="pixel-button wide" data-action="closed-loop" type="button"><img src="./assets/icons-wuxia/context-ring.svg" alt="" />闭环预演</button>
+                    <button class="pixel-button wide" data-action="safe-click-test" type="button" title="打开隔离验证窗口并执行一次真实鼠标点击"><img src="./assets/icons-wuxia/crosshair.svg" alt="" />真实点击验证</button>
+                    <button class="pixel-button wide" data-action="safe-context-menu-test" type="button" title="打开隔离验证窗口并执行一次真实右键菜单选择"><img src="./assets/icons-wuxia/context-ring.svg" alt="" />隔离右键验证</button>
+                    <button class="pixel-button wide" data-action="safe-drag-select-test" type="button" title="打开隔离验证窗口并执行一次真实鼠标拖拽"><img src="./assets/icons-wuxia/crosshair.svg" alt="" />隔离拖拽验证</button>
                   </div>
                 </article>
                 <article class="vision-window-action-card" data-vision-command="verify">
-                  <h2><img src="./assets/icons-wuxia/shield.svg" alt="" />Verify</h2>
+                  <h2><img src="./assets/icons-wuxia/shield.svg" alt="" />定位验证</h2>
                   <p>验证定位点可用性并检查后端状态。</p>
-                  <button class="pixel-button wide" data-action="vision-verify-native" type="button"><img src="./assets/icons-wuxia/shield.svg" alt="" />Verify point</button>
-                  <button class="pixel-button wide" data-action="profile-run" type="button"><img src="./assets/icons/loading.png" alt="" />耗时分析</button>
+                  <button class="pixel-button wide" data-action="vision-verify-native" type="button"><img src="./assets/icons-wuxia/shield.svg" alt="" />验证定位点</button>
+                  <button class="pixel-button wide" data-action="profile-run" type="button"><img src="./assets/icons-wuxia/compute-use.svg" alt="" />耗时分析</button>
                 </article>
               </section>
               <section class="vision-window-evidence" aria-label="截图证据区">
@@ -1236,46 +1377,46 @@
                   <div class="vision-realtime-overlay" data-role="vision-realtime-overlay" aria-hidden="true"></div>
                 </div>
               </section>
-              <aside class="vision-window-summary" aria-label="grounding 摘要区">
+              <aside class="vision-window-summary" aria-label="定位摘要区">
                 <div class="vision-window-safety">
                   <img src="./assets/icons-wuxia/lock.svg" alt="" />
-                  <span>execute=false / 真实输入关闭</span>
+                  <span>执行开关关闭 · 真实输入已禁用</span>
                 </div>
                 <dl class="vision-window-metrics">
-                  <div><dt>Backend</dt><dd data-role="grounding-backend">未运行</dd></div>
-                  <div><dt>Point</dt><dd data-role="grounding-point">-</dd></div>
-                  <div><dt>BBox</dt><dd data-role="grounding-bbox">-</dd></div>
-                  <div><dt>Confidence</dt><dd data-role="grounding-confidence">-</dd></div>
-                  <div><dt>Profile</dt><dd data-bind="profile.total">未分析</dd></div>
-                  <div><dt>Mode</dt><dd data-bind="stability.mode">dry-run 安全测试</dd></div>
+                  <div><dt>定位后端</dt><dd data-role="grounding-backend">未运行</dd></div>
+                  <div><dt>坐标点</dt><dd data-role="grounding-point">-</dd></div>
+                  <div><dt>边界框</dt><dd data-role="grounding-bbox">-</dd></div>
+                  <div><dt>置信度</dt><dd data-role="grounding-confidence">-</dd></div>
+                  <div><dt>性能分析</dt><dd data-bind="profile.total">未分析</dd></div>
+                  <div><dt>运行模式</dt><dd data-bind="stability.mode">安全预演</dd></div>
                 </dl>
                 <section class="vision-window-plan">
-                  <strong>Dry-run plan</strong>
-                  <pre data-role="grounding-plan">等待 describe / locate / closed-loop 结果...</pre>
+                  <strong>安全预演计划</strong>
+                  <pre data-role="grounding-plan">等待画面描述、控件定位或闭环验证结果…</pre>
                 </section>
                 <details class="vision-window-details">
                   <summary>高级诊断详情</summary>
                   <section class="vision-window-profile">
-                    <strong>Profile phases</strong>
+                    <strong>耗时阶段</strong>
                     <ul class="profile-list" data-role="profile-phases"></ul>
                   </section>
                   <section class="vision-window-backends">
-                    <strong>Grounding backends</strong>
+                    <strong>定位后端</strong>
                     <ul data-role="vision-backends"></ul>
                   </section>
                   <section class="vision-window-realtime">
-                    <strong>Realtime perception</strong>
+                    <strong>实时感知</strong>
                     <div class="vision-window-realtime-controls">
                       <button class="mini-button" data-action="vision-realtime-start" type="button">启动</button>
                       <button class="mini-button" data-action="vision-realtime-stop" type="button">停止</button>
-                      <button class="mini-button" data-action="vision-realtime-dry-run-selected" type="button" disabled>选中 dry-run</button>
+                      <button class="mini-button" data-action="vision-realtime-dry-run-selected" type="button" disabled>对选中项预演</button>
                       <span class="vision-realtime-selected" data-role="vision-realtime-selected">未选择检测框</span>
                     </div>
                     <pre data-role="vision-realtime-status">等待加载实时感知状态。</pre>
                     <ul data-role="vision-realtime-elements"></ul>
                   </section>
                   <section class="vision-window-capabilities">
-                    <strong>Vision tool service</strong>
+                    <strong>视觉工具服务</strong>
                     <pre data-role="vision-capabilities">等待加载能力。</pre>
                   </section>
                 </details>
@@ -1287,9 +1428,8 @@
       </section>
 
       <footer class="global-system-bar" data-role="global-system-bar" aria-label="全局系统状态栏">
-        <span><i class="system-dot is-ok" data-role="system-status-dot"></i><b>工作区</b><span data-role="system-workspace">—</span></span>
-        <span><b>端口</b><span data-role="system-port">—</span></span>
-        <span><b>构建</b><span data-role="system-build">—</span></span>
+        <span><b>工作区</b><span data-role="system-workspace">—</span></span>
+        <span><i class="system-dot is-pending" data-role="system-status-dot" role="img" aria-label="系统连接状态：连接中"></i><b>连接</b><span class="is-pending" data-role="system-connection" aria-live="polite">连接中</span></span>
         <span><b>会话</b><span data-role="system-sessions">—</span></span>
       </footer>
 
@@ -1311,13 +1451,12 @@
           <dd data-bind="approval.affectedPaths">-</dd>
         </dl>
         <div class="approval-actions">
-          <button data-action="approval-reject" type="button">拒绝</button>
-          <button data-action="approval-approve-once" type="button">授权本次</button>
-          <button data-action="approval-approve-session" type="button">授权本会话</button>
+          <button data-action="approval-reject" type="button"><img src="./assets/ui-redesign/three-column/control-icons/reject-feedback-v1.png" alt="" aria-hidden="true" /><span>拒绝</span></button>
+          <button data-action="approval-approve-once" type="button"><img src="./assets/ui-redesign/three-column/control-icons/approve-once-v1.png" alt="" aria-hidden="true" /><span>授权本次</span></button>
+          <button data-action="approval-approve-session" type="button"><img src="./assets/ui-redesign/three-column/control-icons/approve-rule-v1.png" alt="" aria-hidden="true" /><span>授权本会话</span></button>
         </div>
       </aside>
     </main>
-    <script type="module" src="./assets/bridge3d.js"></script>
     <script type="module" src="./assets/bamboo-banner-wind.js"></script>
   </body>
 </html>

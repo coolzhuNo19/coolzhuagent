@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::error::ApiError;
 use crate::resolver::{EndpointResolver, ProviderProtocol};
+use crate::reasoning::{resolve_reasoning, ReasoningWire};
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -59,6 +60,22 @@ const CUSTOM_BASE_URL_ENV_VARS: &[&str] = &[
 ];
 
 impl OpenAiCompatConfig {
+    /// 从既有配置对象得到 canonical provider id，避免在请求构造处依赖显示名。
+    #[must_use]
+    pub fn provider_id(self) -> &'static str {
+        match self.provider_name {
+            "xAI" => "xai",
+            "OpenAI" => "openai",
+            "ZhipuAI" => "zhipuai",
+            "AlibabaDashScope" | "AlibabaBailian" => "alibaba-bailian",
+            "BaiduQianfan" => "baidu",
+            "ByteDanceArk" => "bytedance",
+            "DeepSeek" => "deepseek",
+            "CustomOpenAICompatible" => "custom",
+            _ => "unknown",
+        }
+    }
+
     #[must_use]
     pub const fn xai() -> Self {
         Self {
@@ -359,7 +376,7 @@ impl OpenAiCompatClient {
             .http
             .post(&request_url)
             .header("content-type", "application/json")
-            .json(&build_chat_completion_request(request));
+            .json(&build_chat_completion_request_for(self.config.provider_id(), request));
         if let Some(api_key) = self
             .api_key
             .as_deref()
@@ -840,7 +857,11 @@ struct ErrorBody {
     message: Option<String>,
 }
 
-fn build_chat_completion_request(request: &MessageRequest) -> Value {
+/// 构造 provider-aware Chat Completions payload。
+///
+/// `MessageRequest.reasoning_effort` 是兼容旧调用方的字符串，但不会被直接
+/// 序列化；先交给统一 resolver，再按 provider/model 的原生协议应用字段。
+pub fn build_chat_completion_request_for(provider_id: &str, request: &MessageRequest) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
         messages.push(json!({
@@ -869,31 +890,37 @@ fn build_chat_completion_request(request: &MessageRequest) -> Value {
     if let Some(tool_choice) = &request.tool_choice {
         payload["tool_choice"] = openai_tool_choice(tool_choice);
     }
-    if let Some(reasoning_effort) = request
-        .reasoning_effort
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| normalize_openai_reasoning_effort(value))
-    {
-        payload["reasoning_effort"] = json!(reasoning_effort);
-    }
+    let wire = resolve_reasoning(
+        provider_id,
+        &request.model,
+        request.reasoning_effort.as_deref(),
+    )
+    .map(|resolution| resolution.preflight_wire)
+    .unwrap_or(ReasoningWire::Omit);
+    wire.apply_to_payload(&mut payload);
 
     payload
 }
 
-/// 归一 reasoning_effort 到 OpenAI Chat Completions 协议合法取值（low/medium/high）。
-///
-/// 上游（web-console）内部有 5 档 low/medium/high/xhigh/max；但 OpenAI 兼容端
-/// （含阿里百炼 compatible-mode/v1）仅接受 low/medium/high，直接下发 xhigh/max 会被
-/// 服务端判为非法取值返回 400，表现为"思考模式/协议"冲突。故此处把更高档钳到 high
-/// （协议内最强思考），未知值归一到 medium，确保链路协议不冲突。
-fn normalize_openai_reasoning_effort(value: &str) -> &'static str {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "low" => "low",
-        "high" | "xhigh" | "extra_high" | "extra-high" | "超高" | "max" | "maximum" | "最"
-        | "最高" => "high",
-        _ => "medium",
-    }
+/// 兼容旧的仅 request 入口；没有 provider 身份时按未知/custom 安全处理，
+/// 不主动添加 reasoning 字段。真实客户端一律调用带 canonical provider id 的入口。
+#[cfg(test)]
+fn build_chat_completion_request(request: &MessageRequest) -> Value {
+    let model = request.model.trim().to_ascii_lowercase();
+    let provider = if model.starts_with("deepseek") {
+        "deepseek"
+    } else if model.starts_with("glm") {
+        "zhipuai"
+    } else if model.starts_with("gpt") {
+        "openai"
+    } else if model.starts_with("grok") {
+        "xai"
+    } else if model.starts_with("claude") {
+        "clawapi"
+    } else {
+        "custom"
+    };
+    build_chat_completion_request_for(provider, request)
 }
 
 fn translate_message(message: &InputMessage) -> Vec<Value> {
@@ -1305,9 +1332,9 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, normalize_finish_reason,
-        openai_tool_choice, parse_tool_arguments, read_base_url, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        build_chat_completion_request, build_chat_completion_request_for, chat_completions_endpoint,
+        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, read_base_url,
+        OpenAiCompatClient, OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1322,7 +1349,7 @@ mod tests {
     #[test]
     fn request_translation_uses_openai_compatible_shape() {
         let payload = build_chat_completion_request(&MessageRequest {
-            model: "grok-3".to_string(),
+            model: "deepseek-v4-pro".to_string(),
             max_tokens: 64,
             messages: vec![InputMessage {
                 role: "user".to_string(),
@@ -1415,12 +1442,12 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_above_protocol_max_is_clamped_to_high() {
-        // web-console 的 xhigh/max（含中文别名）必须钳到 high，避免阿里百炼等
-        // OpenAI 兼容端因取值非法返回 400（"思考模式/协议"冲突）。
-        for raw in ["max", "xhigh", "maximum", "最高", "超高"] {
+    fn reasoning_effort_uses_provider_native_mapping() {
+        // DeepSeek V4 的 medium/xhigh 均有明确的预解析结果，不能再统一钳位或
+        // 把未知值默认为 medium。
+        for (raw, expected) in [("max", "max"), ("xhigh", "high")] {
             let payload = build_chat_completion_request(&MessageRequest {
-                model: "glm-5.2".to_string(),
+                model: "deepseek-v4-pro".to_string(),
                 max_tokens: 64,
                 messages: vec![InputMessage::user_text("hi")],
                 system: None,
@@ -1431,13 +1458,29 @@ mod tests {
             });
             assert_eq!(
                 payload["reasoning_effort"],
-                json!("high"),
-                "reasoning_effort={raw} 应钳到 high"
+                json!(expected),
+                "reasoning_effort={raw} 应使用 DeepSeek 原生映射"
             );
         }
-        // 未知值归一到 medium。
+        // Zhipu GLM-5.2 的 xhigh 按兼容语义映射为 max。
+        let payload = build_chat_completion_request_for(
+            "zhipuai",
+            &MessageRequest {
+                model: "glm-5.2".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hi")],
+                system: None,
+                tools: None,
+                tool_choice: None,
+                reasoning_effort: Some("xhigh".to_string()),
+                stream: false,
+            },
+        );
+        assert_eq!(payload["reasoning_effort"], json!("max"));
+
+        // 未知值不能静默变 medium，安全结果是 omission。
         let payload = build_chat_completion_request(&MessageRequest {
-            model: "glm-5.2".to_string(),
+            model: "deepseek-v4-pro".to_string(),
             max_tokens: 64,
             messages: vec![InputMessage::user_text("hi")],
             system: None,
@@ -1446,7 +1489,58 @@ mod tests {
             reasoning_effort: Some("turbo".to_string()),
             stream: false,
         });
-        assert_eq!(payload["reasoning_effort"], json!("medium"));
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn xai_current_models_emit_only_explicit_native_reasoning_effort() {
+        let request = |model: &str, effort: &str| MessageRequest {
+            model: model.to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage::user_text("hi")],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: Some(effort.to_string()),
+            stream: false,
+        };
+        let grok46 = build_chat_completion_request_for("xai", &request("grok-4.6", "xhigh"));
+        assert_eq!(grok46["reasoning_effort"], json!("xhigh"));
+        assert!(grok46.get("thinking").is_none());
+
+        let grok45 = build_chat_completion_request_for("xai", &request("grok-4.5", "xhigh"));
+        assert_eq!(grok45["reasoning_effort"], json!("high"));
+
+        let old = build_chat_completion_request_for("xai", &request("grok-3", "max"));
+        assert!(old.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn provider_payload_reasoning_safety_matrix_has_no_cross_provider_leaks() {
+        let request = |model: &str, effort: &str| MessageRequest {
+            model: model.to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage::user_text("hi")],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: Some(effort.to_string()),
+            stream: false,
+        };
+
+        let openai = build_chat_completion_request_for("openai", &request("gpt-4.1", "medium"));
+        assert!(openai.get("reasoning_effort").is_none());
+
+        let deepseek =
+            build_chat_completion_request_for("deepseek", &request("deepseek-v4-pro", "none"));
+        assert_eq!(deepseek["thinking"]["type"], json!("disabled"));
+        assert!(deepseek.get("reasoning_effort").is_none());
+
+        let custom = build_chat_completion_request_for("custom", &request("my-local-model", "high"));
+        assert!(custom.get("reasoning_effort").is_none());
+
+        let grok43 = build_chat_completion_request_for("xai", &request("grok-4.3", "none"));
+        assert_eq!(grok43["reasoning_effort"], json!("none"));
     }
 
     #[test]

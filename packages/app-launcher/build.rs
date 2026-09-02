@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const APPLICATION_ICON: &str =
-    "docs/design-assets/coolzhu-icons-2026-08-12/coolzhu-application-icon.ico";
+    "docs/design-assets/coolzhu-icons-2026-08-27/final/app-icon-cz-moon-gate-lantern-v1.ico";
 
 fn main() {
     println!("cargo:rerun-if-changed={APPLICATION_ICON}");

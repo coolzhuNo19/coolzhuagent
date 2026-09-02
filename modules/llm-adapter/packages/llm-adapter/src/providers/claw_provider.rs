@@ -9,8 +9,9 @@ use serde::Deserialize;
 
 use crate::error::ApiError;
 
-use super::{Provider, ProviderFuture};
+use super::{canonical_claude_model_id, Provider, ProviderFuture};
 use crate::resolver::{EndpointResolver, ProviderProtocol};
+use crate::reasoning::{resolve_reasoning, ReasoningWire};
 use crate::sse::SseParser;
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 
@@ -266,8 +267,8 @@ impl ClawApiClient {
     fn api_model_for(&self, requested_model: &str) -> String {
         self.model_aliases
             .get(requested_model)
-            .cloned()
-            .unwrap_or_else(|| requested_model.to_string())
+            .map(|model| canonical_claude_model_id(model))
+            .unwrap_or_else(|| canonical_claude_model_id(requested_model))
     }
 
     pub async fn exchange_oauth_code(
@@ -359,7 +360,7 @@ impl ClawApiClient {
             .header("content-type", "application/json");
         let mut request_builder = self.auth.apply(request_builder);
 
-        request_builder = request_builder.json(request);
+        request_builder = request_builder.json(&build_anthropic_messages_request(request));
         request_builder.send().await.map_err(ApiError::from)
     }
 
@@ -375,6 +376,33 @@ impl ClawApiClient {
             .checked_mul(multiplier)
             .map_or(self.max_backoff, |delay| delay.min(self.max_backoff)))
     }
+}
+
+/// 构造 Anthropic Messages payload，并将兼容字符串映射为 Anthropic 原生 thinking。
+///
+/// 特别重要的是移除旧的顶层 `reasoning_effort`：Anthropic Messages 不接受该
+/// OpenAI-compatible 字段。未知/不支持值由 resolver 安全回到 auto 并省略。
+pub fn build_anthropic_messages_request(request: &MessageRequest) -> serde_json::Value {
+    let mut payload = serde_json::to_value(request).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("reasoning_effort");
+        if let Some(model) = object
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(canonical_claude_model_id)
+        {
+            object.insert("model".to_string(), serde_json::json!(model));
+        }
+    }
+    let wire = resolve_reasoning(
+        "clawapi",
+        &request.model,
+        request.reasoning_effort.as_deref(),
+    )
+    .map(|resolution| resolution.preflight_wire)
+    .unwrap_or(ReasoningWire::Omit);
+    wire.apply_to_payload(&mut payload);
+    payload
 }
 
 impl AuthSource {
@@ -690,10 +718,11 @@ mod tests {
     use runtime::{clear_oauth_credentials, save_oauth_credentials, OAuthConfig};
 
     use super::{
-        now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
-        resolve_startup_auth_source, AuthSource, ClawApiClient, OAuthTokenSet,
+        build_anthropic_messages_request, now_unix_timestamp, oauth_token_is_expired,
+        resolve_saved_oauth_token, resolve_startup_auth_source, AuthSource, ClawApiClient,
+        OAuthTokenSet,
     };
-    use crate::types::{ContentBlockDelta, MessageRequest};
+    use crate::types::{ContentBlockDelta, InputMessage, MessageRequest};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1082,5 +1111,62 @@ mod tests {
             headers.get("authorization").and_then(|v| v.to_str().ok()),
             Some("Bearer proxy-token")
         );
+    }
+
+    #[test]
+    fn anthropic_payload_uses_native_thinking_and_never_top_level_effort() {
+        let adaptive = build_anthropic_messages_request(&MessageRequest {
+            model: "claude-opus-4-6".to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage::user_text("hello")],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: Some("high".to_string()),
+            stream: false,
+        });
+        assert_eq!(adaptive["thinking"]["type"], "adaptive");
+        assert_eq!(adaptive["output_config"]["effort"], "high");
+        assert!(adaptive.get("reasoning_effort").is_none());
+
+        let disabled = build_anthropic_messages_request(&MessageRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage::user_text("hello")],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: Some("none".to_string()),
+            stream: false,
+        });
+        assert_eq!(disabled["thinking"]["type"], "disabled");
+        assert!(disabled.get("reasoning_effort").is_none());
+
+        let legacy_auto = build_anthropic_messages_request(&MessageRequest {
+            model: "claude-haiku-4-5-20251213".to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage::user_text("hello")],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            stream: false,
+        });
+        assert_eq!(legacy_auto["model"], "claude-haiku-4-5-20251001");
+        assert!(legacy_auto.get("thinking").is_none());
+
+        let legacy_disabled = build_anthropic_messages_request(&MessageRequest {
+            model: "claude-haiku-4-5-20251213".to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage::user_text("hello")],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: Some("none".to_string()),
+            stream: false,
+        });
+        assert_eq!(legacy_disabled["model"], "claude-haiku-4-5-20251001");
+        assert_eq!(legacy_disabled["thinking"]["type"], "disabled");
+        assert!(legacy_disabled.get("reasoning_effort").is_none());
     }
 }

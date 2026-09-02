@@ -5,6 +5,7 @@ mod error;
 mod model_info;
 mod providers;
 mod registry;
+mod reasoning;
 mod resolver;
 mod sse;
 mod types;
@@ -20,14 +21,26 @@ pub use error::ApiError;
 pub use model_info::{
     Modality, ModelCost, ModelInfo, ModelLimit, ModelModalities, ModelStatus, ProviderInfo,
 };
-pub use providers::claw_provider::{AuthSource, ClawApiClient, ClawApiClient as ApiClient};
-pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig};
+pub use providers::claw_provider::{
+    build_anthropic_messages_request, AuthSource, ClawApiClient, ClawApiClient as ApiClient,
+};
+pub use providers::openai_compat::{
+    build_chat_completion_request_for, OpenAiCompatClient, OpenAiCompatConfig,
+};
 pub use providers::{
     context_tokens_for_model, detect_provider_kind, max_tokens_for_model, model_token_limit,
     provider_catalog, provider_kind_from_name, provider_option, resolve_model_alias,
     ModelTokenLimit, ProviderKind, ProviderMetadata, ProviderOption,
 };
 pub use registry::{ModelRegistry, ResolvedModel};
+pub use reasoning::{
+    parse_legacy_reasoning_effort, parse_reasoning_effort, reasoning_capability_catalog,
+    reasoning_capability_for_provider, reasoning_model_aliases, resolve_legacy_reasoning,
+    resolve_reasoning,
+    LegacyReasoningValue, ReasoningCapability, ReasoningCapabilityStatus, ReasoningEffort,
+    ReasoningOption, ReasoningParseError, ReasoningResolution, ReasoningResolutionStatus,
+    ReasoningStrategy, ReasoningWire,
+};
 pub use resolver::{
     AuthPolicy, EndpointResolver, ProviderProtocol, RequestCapability, ResolvedProviderRoute,
 };

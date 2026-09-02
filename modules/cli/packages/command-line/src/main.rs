@@ -786,7 +786,7 @@ fn format_model_report(model: &str, message_count: usize, turns: u32) -> String 
 Aliases
   opus             claude-opus-4-6
   sonnet           claude-sonnet-4-6
-  haiku            claude-haiku-4-5-20251213
+  haiku            claude-haiku-4-5-20251001
   glm              glm-4.7
   glm-free         glm-4.7-flash
   zhipu-free       glm-4.7-flash
@@ -4646,7 +4646,7 @@ mod tests {
     fn resolves_known_model_aliases() {
         assert_eq!(resolve_model_alias("opus"), "claude-opus-4-6");
         assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-6");
-        assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251213");
+        assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251001");
         assert_eq!(resolve_model_alias("glm"), "glm-4.7");
         assert_eq!(resolve_model_alias("glm-free"), "glm-4.7-flash");
         assert_eq!(resolve_model_alias("custom-opus"), "custom-opus");
