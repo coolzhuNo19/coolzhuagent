@@ -29240,24 +29240,49 @@ fn webview2_runtime_candidates() -> Vec<PathBuf> {
     if let Ok(folder) = env::var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER") {
         let trimmed = folder.trim();
         if !trimmed.is_empty() {
-            candidates.push(PathBuf::from(trimmed).join("msedgewebview2.exe"));
-            candidates.push(PathBuf::from(trimmed));
+            let override_path = PathBuf::from(trimmed);
+            candidates.push(override_path.join("msedgewebview2.exe"));
+            candidates.push(override_path);
         }
     }
     #[cfg(windows)]
     {
-        candidates.push(PathBuf::from(
-            r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\msedgewebview2.exe",
-        ));
-        candidates.push(PathBuf::from(
-            r"C:\Program Files\Microsoft\EdgeWebView\Application\msedgewebview2.exe",
-        ));
+        let roots = vec![
+            PathBuf::from(r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application"),
+            PathBuf::from(r"C:\Program Files\Microsoft\EdgeWebView\Application"),
+        ];
+        candidates.extend(webview2_runtime_candidates_for_roots(&roots));
+    }
+    candidates
+}
+
+/// 为已知的 WebView2 Application 根目录生成候选，不做全盘或递归搜索。
+/// 标准安装通常把真实 exe 放在 Application\\<版本>\\ 下，同时保留根目录直放候选以兼容既有布局。
+fn webview2_runtime_candidates_for_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for root in roots {
+        candidates.push(root.join("msedgewebview2.exe"));
+
+        let mut version_dirs = std::fs::read_dir(root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        version_dirs.sort();
+        candidates.extend(
+            version_dirs
+                .into_iter()
+                .map(|version_dir| version_dir.join("msedgewebview2.exe")),
+        );
     }
     candidates
 }
 
 fn webview2_runtime_check_for(candidates: &[PathBuf]) -> DiagnosticsCheck {
-    if let Some(path) = candidates.iter().find(|path| path.exists()) {
+    if let Some(path) = candidates.iter().find(|path| path.is_file()) {
         diagnostics_check(
             "desktop.webview2",
             "WebView2 Runtime",
@@ -74231,6 +74256,41 @@ attach: last_assistant
             .as_deref()
             .unwrap_or("")
             .contains("WebView2 Runtime"));
+    }
+
+    #[test]
+    fn diagnostics_webview2_candidates_find_versioned_executable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let application_root = temp.path().join("Application");
+        let version_dir = application_root.join("151.0.0.0");
+        std::fs::create_dir_all(&version_dir).expect("create version directory");
+        let executable = version_dir.join("msedgewebview2.exe");
+        std::fs::write(&executable, b"webview2-test").expect("write runtime marker");
+
+        let candidates = super::webview2_runtime_candidates_for_roots(&[application_root]);
+        assert!(candidates.iter().any(|path| path == &executable));
+        let check = super::webview2_runtime_check_for(&candidates);
+        assert_eq!(check.status, "ok");
+        assert!(check.detail.contains("msedgewebview2.exe"));
+    }
+
+    #[test]
+    fn diagnostics_webview2_candidates_report_missing_versioned_executable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let application_root = temp.path().join("Application");
+        std::fs::create_dir_all(application_root.join("152.0.0.0"))
+            .expect("create version directory");
+
+        let candidates = super::webview2_runtime_candidates_for_roots(&[application_root]);
+        let check = super::webview2_runtime_check_for(&candidates);
+        assert_eq!(check.status, "warn");
+    }
+
+    #[test]
+    fn diagnostics_webview2_check_does_not_treat_directory_as_runtime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let check = super::webview2_runtime_check_for(&[temp.path().to_path_buf()]);
+        assert_eq!(check.status, "warn");
     }
 
     #[test]
