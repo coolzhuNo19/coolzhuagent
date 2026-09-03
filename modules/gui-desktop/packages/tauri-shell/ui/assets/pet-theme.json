@@ -11,6 +11,14 @@
       "min_duration_ms": 0,
       "message": "我在后台待命。"
     },
+    "blink": {
+      "frame_pattern": "assets/pet-actions/idle-{index}.png",
+      "frame_count": 8,
+      "interval_ms": 90,
+      "priority": 1,
+      "min_duration_ms": 0,
+      "message": "正在聆听。"
+    },
     "thinking": {
       "frame_pattern": "assets/pet-actions/thinking-{index}.png",
       "frame_count": 8,
