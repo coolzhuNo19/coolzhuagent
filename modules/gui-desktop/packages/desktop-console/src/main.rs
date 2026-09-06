@@ -193,5 +193,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn window_icon() -> Option<eframe::egui::IconData> {
-    eframe::icon_data::from_png_bytes(include_bytes!("../assets/coolzhu-agent-icon.png")).ok()
+    eframe::icon_data::from_png_bytes(
+        include_bytes!("../assets/app-icon-cz-moon-gate-lantern-v1.png"),
+    )
+    .ok()
 }

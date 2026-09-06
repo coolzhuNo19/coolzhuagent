@@ -9,19 +9,14 @@
   },
   "app": {
     "withGlobalTauri": true,
-    "windows": [],
-    "trayIcon": {
-      "iconPath": "icons/icon.png",
-      "iconAsTemplate": true,
-      "menuOnLeftClick": false
-    }
+    "windows": []
   },
   "bundle": {
     "active": true,
     "targets": "all",
     "icon": [
-      "icons/icon.ico",
-      "icons/icon.png"
+      "icons/app-icon-cz-moon-gate-lantern-v1.ico",
+      "icons/app-icon-cz-moon-gate-lantern-v1.png"
     ],
     "windows": {
       "certificateThumbprint": null,

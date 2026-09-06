@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 
 use crate::config::{load_config, AdapterConfig, ModelConfig};
 use crate::model_info::{ModelInfo, ProviderInfo};
-use crate::providers::ProviderKind;
+use crate::providers::{ProviderKind, CLAUDE_HAIKU_45_MODEL_ID, CLAUDE_HAIKU_45_LEGACY_MODEL_ID};
 
 static DEFAULT_REGISTRY: OnceLock<ModelRegistry> = OnceLock::new();
 
@@ -192,7 +192,7 @@ impl ModelRegistry {
                 }),
         );
         self.register_model(
-            ModelInfo::new("claude-haiku-4-5-20251213", "clawapi")
+            ModelInfo::new(CLAUDE_HAIKU_45_MODEL_ID, "clawapi")
                 .with_name("Claude Haiku 4.5")
                 .with_base_url("https://api.anthropic.com/v1")
                 .with_limit(crate::model_info::ModelLimit {
@@ -360,7 +360,8 @@ impl ModelRegistry {
     fn register_aliases(&mut self) {
         self.add_alias("opus", "claude-opus-4-6");
         self.add_alias("sonnet", "claude-sonnet-4-6");
-        self.add_alias("haiku", "claude-haiku-4-5-20251213");
+        self.add_alias("haiku", CLAUDE_HAIKU_45_MODEL_ID);
+        self.add_alias(CLAUDE_HAIKU_45_LEGACY_MODEL_ID, CLAUDE_HAIKU_45_MODEL_ID);
         self.add_alias("grok", "grok-3");
         self.add_alias("grok-mini", "grok-3-mini");
         self.add_alias("glm", "glm-4.7");
@@ -631,6 +632,17 @@ mod tests {
         let resolved = registry.resolve_model("opus");
         assert_eq!(resolved.canonical_id, "claude-opus-4-6");
         assert_eq!(resolved.provider, ProviderKind::ClawApi);
+    }
+
+    #[test]
+    fn registry_resolves_haiku_alias_and_legacy_id_to_official_api_model() {
+        let registry = ModelRegistry::default_registry();
+        for input in ["haiku", "claude-haiku-4-5-20251213"] {
+            let resolved = registry.resolve_model(input);
+            assert_eq!(resolved.canonical_id, "claude-haiku-4-5-20251001");
+            assert_eq!(resolved.api_model_id, "claude-haiku-4-5-20251001");
+            assert_eq!(resolved.provider, ProviderKind::ClawApi);
+        }
     }
 
     #[test]

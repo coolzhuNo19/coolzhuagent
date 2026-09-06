@@ -1,6 +1,6 @@
 # CoolzhuAgent 图标设计稿（2026-08-12）
 
-本目录保存图标设计母版。应用图标已同步到 Tauri `src-tauri/icons`，安装器图标已接入 WiX `ARPPRODUCTICON`；母版仍保留在此处，便于后续重新导出。
+本目录仅保存 2026-08-12 的历史图标设计母版与旧派生资源，不再是活动运行图标链；旧 PNG/ICO 保留用于历史追溯。当前应用安装、启动器、Tauri、desktop-console、托盘与 WiX 图标统一见 `docs/design-assets/coolzhu-icons-2026-08-27/final/` 及其 manifest。
 
 ## 风格依据
 

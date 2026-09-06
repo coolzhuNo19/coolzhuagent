@@ -7,7 +7,7 @@ use std::os::windows::process::CommandExt;
 use std::sync::{Mutex, OnceLock};
 use tauri::{
     menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, PhysicalPosition, Url, WebviewWindowBuilder, WindowEvent,
 };
 
@@ -133,15 +133,21 @@ struct StartupVisibility {
 }
 
 fn startup_visibility(args: &[String]) -> StartupVisibility {
-    let pet_only = args.iter().any(|arg| {
+    let show_console = args.iter().any(|arg| arg == "--show-console");
+    let state_update_requested = args
+        .iter()
+        .any(|arg| arg == "--pet-state" || arg.starts_with("--pet-state="));
+    let pet_requested = args.iter().any(|arg| {
         arg == "--pet"
             || arg == "--show-pet"
+            || arg == "--pet-action"
             || arg.starts_with("--pet-action=")
+            || arg == "--pet-event"
             || arg.starts_with("--pet-event=")
     });
     StartupVisibility {
-        show_console: args.iter().any(|arg| arg == "--show-console") || !pet_only,
-        show_pet: true,
+        show_console: show_console || (!pet_requested && !state_update_requested),
+        show_pet: pet_requested,
     }
 }
 
@@ -177,13 +183,18 @@ fn main() {
     let run_result = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             spawn_web_console_parent_monitor_if_requested(app, &args);
+            let visibility = startup_visibility(&args);
             if handle_pet_action_args(app, &args) {
+                if visibility.show_console {
+                    show_console(app);
+                }
                 return;
             }
-            if args.iter().any(|arg| arg == "--pet" || arg == "--show-pet") {
+            if visibility.show_pet {
                 show_pet(app);
                 emit_pet_status(app, "success", "桌宠已由 Web 控制台唤起");
-            } else {
+            }
+            if visibility.show_console {
                 show_console(app);
             }
         }))
@@ -245,12 +256,12 @@ fn main() {
             }
             let startup_args: Vec<String> = std::env::args().collect();
             spawn_web_console_parent_monitor_if_requested(&handle, &startup_args);
-            handle_pet_action_args(&handle, &startup_args);
+            let handled_pet_action = handle_pet_action_args(&handle, &startup_args);
             let visibility = startup_visibility(&startup_args);
             if visibility.show_console {
                 show_console(&handle);
             }
-            if visibility.show_pet {
+            if visibility.show_pet && !handled_pet_action {
                 show_pet(&handle);
             }
             Ok(())
@@ -270,25 +281,50 @@ fn main() {
 }
 
 fn build_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let tray_icon = app.default_window_icon().cloned().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Tauri default window icon is missing",
+        )
+    })?;
     let show_item = MenuItem::with_id(app, "show", "显示控制台", true, None::<&str>)?;
     let hide_item = MenuItem::with_id(app, "hide", "隐藏控制台", true, None::<&str>)?;
     let pet_item = MenuItem::with_id(app, "pet", "显示桌宠", true, None::<&str>)?;
+    let hide_pet_item = MenuItem::with_id(app, "hide-pet", "隐藏桌宠", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出 COOLZHU AGENT", true, None::<&str>)?;
 
-    let menu = Menu::with_items(app, &[&show_item, &hide_item, &pet_item, &quit_item])?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &show_item,
+            &hide_item,
+            &pet_item,
+            &hide_pet_item,
+            &quit_item,
+        ],
+    )?;
 
-    TrayIconBuilder::new()
+    TrayIconBuilder::with_id("main")
+        .icon(tray_icon)
         .menu(&menu)
-        .show_menu_on_left_click(true)
+        .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_console(app),
             "hide" => hide_console(app),
             "pet" => show_pet(app),
+            "hide-pet" => hide_pet(app),
             "quit" => quit_application(app),
             _ => {}
         })
-        .on_tray_icon_event(|tray, _event| {
-            do_toggle_console(tray.app_handle());
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                do_toggle_console(tray.app_handle());
+            }
         })
         .build(app)?;
 
@@ -397,7 +433,6 @@ fn build_pet_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
     strip_pet_window_chrome(&pet_window);
     normalize_pet_window_bounds(&pet_window);
-    pet_window.show().ok();
     stabilize_pet_window(&pet_window);
 
     Ok(())
@@ -451,6 +486,12 @@ fn show_pet(app: &AppHandle) {
     if let Some(pet) = app.get_webview_window(PET_LABEL) {
         pet.show().ok();
         stabilize_pet_window(&pet);
+    }
+}
+
+fn hide_pet(app: &AppHandle) {
+    if let Some(pet) = app.get_webview_window(PET_LABEL) {
+        pet.hide().ok();
     }
 }
 
@@ -1279,7 +1320,9 @@ fn pet_event_mapping_matches(mapping: &PetEventMapping, event_type: &str) -> boo
 
 fn handle_pet_action_args(app: &AppHandle, args: &[String]) -> bool {
     if let Some((state, message)) = pet_action_from_args(args) {
-        show_pet(app);
+        if startup_visibility(args).show_pet {
+            show_pet(app);
+        }
         emit_pet_status(app, &state, &message);
         true
     } else {
@@ -1553,19 +1596,18 @@ struct PetStatus {
 mod tests {
     use super::{
         console_toggle_decision, default_pet_state_message, normalize_gui_web_url,
-        normalize_pet_state, owned_web_console_pid, pet_action_frame_offsets,
-        pet_action_frame_scales, pet_action_frames, pet_action_from_args, pet_bubble_asset,
-        pet_status_for_event, startup_visibility, throne_drop_contains, throne_snap_position,
-        web_console_parent_pid_from_args_or_env, ConsoleToggleDecision, ThroneZone, PET_THEME_JSON,
-        PET_WINDOW_SIZE,
+        normalize_pet_state, owned_web_console_pid, pet_action_frame_offsets, pet_action_frames,
+        pet_action_from_args, pet_bubble_asset, pet_status_for_event, startup_visibility,
+        throne_drop_contains, throne_snap_position, web_console_parent_pid_from_args_or_env,
+        ConsoleToggleDecision, ThroneZone, PET_THEME_JSON, PET_WINDOW_SIZE,
     };
     use std::{collections::VecDeque, fs::File, path::PathBuf};
 
     const MAIN_RS: &str = include_str!("main.rs");
     const CARGO_TOML: &str = include_str!("../Cargo.toml");
     const PET_MINI_HTML: &str = include_str!("../../ui/pet-mini.html");
-    const PET_STABILIZED_METRICS_JSON: &str = include_str!(
-        "../../ui/assets/pet-actions/generated-previews-20260617/stabilized-metrics.json"
+    const PET_STABILIZER_PY: &str = include_str!(
+        "../../ui/assets/pet-actions/generated-sheets-20260617/stabilize_pet_frames.py"
     );
     const PET_FRAME_CANVAS: u32 = 256;
     const PET_FRAME_RENDER_SCALE: f32 = 0.5;
@@ -1574,19 +1616,203 @@ mod tests {
     const PET_FRAME_VISUAL_DRIFT_TOLERANCE: f32 = 14.0;
     const PET_FRAME_EDGE_CUT_RATIO_TOLERANCE: f32 = 0.35;
 
+    fn normalized_main_source() -> String {
+        MAIN_RS.replace("\r\n", "\n").replace('\r', "\n")
+    }
+
+    fn normalized_pet_stabilizer_source() -> String {
+        PET_STABILIZER_PY.replace("\r\n", "\n").replace('\r', "\n")
+    }
+
+    fn bounded_source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start_index = source
+            .find(start)
+            .unwrap_or_else(|| panic!("未找到源码契约起点: {start}"));
+        let section_start = start_index + start.len();
+        let end_index = source[section_start..]
+            .find(end)
+            .unwrap_or_else(|| panic!("未找到源码契约终点: {end}"));
+        &source[section_start..section_start + end_index]
+    }
+
+    fn assert_stabilizer_source_line(section: &str, expected: &str, description: &str) {
+        assert!(
+            section.lines().any(|line| line.trim() == expected),
+            "{description}源码契约缺少精确语句: {expected}"
+        );
+    }
+
+    fn assert_pet_stabilizer_policy_contract() {
+        let source = normalized_pet_stabilizer_source();
+        let policies = bounded_source_section(
+            &source,
+            "STATE_POLICIES = {",
+            "\n}\n\nSTATE_FRAME_SELECTIONS",
+        );
+        for (state, expected) in [
+            (
+                "working",
+                "\"working\": {\"mode\": \"uniform_fit\", \"anchor\": \"baseline\"},",
+            ),
+            (
+                "sweeping",
+                "\"sweeping\": {\"mode\": \"uniform_fit\", \"anchor\": \"baseline\"},",
+            ),
+            (
+                "sword-flight",
+                "\"sword-flight\": {\"mode\": \"uniform_fit\", \"anchor\": \"center\", \"center_y\": 132},",
+            ),
+            (
+                "sleeping",
+                "\"sleeping\": {\"mode\": \"uniform_fit\", \"anchor\": \"center\", \"center_y\": 134},",
+            ),
+            (
+                "success",
+                "\"success\": {\"mode\": \"face_scale\", \"anchor\": \"baseline\"},",
+            ),
+            (
+                "perform_martial",
+                "\"perform_martial\": {\"mode\": \"face_scale\", \"anchor\": \"baseline\"},",
+            ),
+        ] {
+            assert_stabilizer_source_line(
+                policies,
+                expected,
+                &format!("{state} 的状态策略"),
+            );
+        }
+
+        let stabilize =
+            bounded_source_section(&source, "def stabilize() -> None:\n", "\n\nif __name__");
+        let uniform_fit = bounded_source_section(
+            stabilize,
+            "        if policy[\"mode\"] == \"uniform_fit\":\n",
+            "        elif policy[\"mode\"] == \"face_scale\":\n",
+        );
+        assert_stabilizer_source_line(
+            uniform_fit,
+            "scales = [uniform_fit_scale(frames, state)] * len(frames)",
+            "uniform_fit 分支的共享 scale",
+        );
+
+        let face_scale = bounded_source_section(
+            stabilize,
+            "        elif policy[\"mode\"] == \"face_scale\":\n",
+            "        elif policy[\"mode\"] == \"height_crop\":\n",
+        );
+        assert_stabilizer_source_line(
+            face_scale,
+            "scales = [per_frame_face_scale(frame) for frame in frames]",
+            "face_scale 分支",
+        );
+    }
+
     #[test]
-    fn launcher_startup_shows_console_while_pet_only_startup_does_not() {
+    fn launcher_startup_visibility_respects_console_and_pet_intent() {
+        let default = startup_visibility(&["coolzhu-tauri-shell.exe".to_string()]);
+        assert!(default.show_console);
+        assert!(!default.show_pet);
+
         let launcher = startup_visibility(&[
             "coolzhu-tauri-shell.exe".to_string(),
             "--show-console".to_string(),
         ]);
         assert!(launcher.show_console);
-        assert!(launcher.show_pet);
+        assert!(!launcher.show_pet);
 
-        let pet_only =
-            startup_visibility(&["coolzhu-tauri-shell.exe".to_string(), "--pet".to_string()]);
-        assert!(!pet_only.show_console);
-        assert!(pet_only.show_pet);
+        for pet_flag in [
+            "--pet",
+            "--show-pet",
+            "--pet-action=perform_martial",
+            "--pet-event=chat.completed",
+        ] {
+            let pet_only =
+                startup_visibility(&["coolzhu-tauri-shell.exe".to_string(), pet_flag.to_string()]);
+            assert!(!pet_only.show_console, "{pet_flag} should be pet-only");
+            assert!(pet_only.show_pet, "{pet_flag} should show the pet");
+        }
+
+        let state_only = startup_visibility(&[
+            "coolzhu-tauri-shell.exe".to_string(),
+            "--pet-state=sleeping".to_string(),
+        ]);
+        assert!(!state_only.show_console);
+        assert!(!state_only.show_pet);
+
+        let state_with_pet = startup_visibility(&[
+            "coolzhu-tauri-shell.exe".to_string(),
+            "--pet-state=sleeping".to_string(),
+            "--pet".to_string(),
+        ]);
+        assert!(!state_with_pet.show_console);
+        assert!(state_with_pet.show_pet);
+
+        let state_with_console = startup_visibility(&[
+            "coolzhu-tauri-shell.exe".to_string(),
+            "--pet-state=sleeping".to_string(),
+            "--show-console".to_string(),
+        ]);
+        assert!(state_with_console.show_console);
+        assert!(!state_with_console.show_pet);
+
+        let both = startup_visibility(&[
+            "coolzhu-tauri-shell.exe".to_string(),
+            "--show-console".to_string(),
+            "--pet".to_string(),
+        ]);
+        assert!(both.show_console);
+        assert!(both.show_pet);
+    }
+
+    #[test]
+    fn tray_exposes_safe_pet_hide_action() {
+        let production = MAIN_RS
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source should precede tests");
+        assert!(production
+            .contains("MenuItem::with_id(app, \"hide-pet\", \"隐藏桌宠\", true, None::<&str>)?"));
+        assert!(production.contains("\"hide-pet\" => hide_pet(app)"));
+
+        let action_handler = production
+            .split("fn handle_pet_action_args(")
+            .nth(1)
+            .expect("handle_pet_action_args helper should exist")
+            .split("\nfn ")
+            .next()
+            .expect("handle_pet_action_args helper should have a bounded body");
+        assert!(action_handler.contains("if startup_visibility(args).show_pet"));
+
+        let build_pet = production
+            .split("fn build_pet_window(")
+            .nth(1)
+            .expect("build_pet_window helper should exist")
+            .split("\nfn ")
+            .next()
+            .expect("build_pet_window helper should have a bounded body");
+        assert!(
+            !build_pet.contains("pet_window.show().ok();"),
+            "building the pet window must not make it visible without an explicit request"
+        );
+
+        let hide_pet = production
+            .split("fn hide_pet(")
+            .nth(1)
+            .expect("hide_pet helper should exist")
+            .split("\nfn ")
+            .next()
+            .expect("hide_pet helper should have a bounded body");
+        assert!(hide_pet.contains("pet.hide().ok();"));
+        for forbidden in [
+            "quit_application",
+            "terminate_owned_web_console_process",
+            "console.hide()",
+        ] {
+            assert!(
+                !hide_pet.contains(forbidden),
+                "hide_pet must not call {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -1610,11 +1836,12 @@ mod tests {
             "the standalone Tauri workspace should use the shared diagnostics crate by relative path"
         );
 
-        let main = MAIN_RS.find("fn main()").expect("main should exist");
-        let init = MAIN_RS
+        let main_rs = normalized_main_source();
+        let main = main_rs.find("fn main()").expect("main should exist");
+        let init = main_rs
             .find("diagnostics::init(\"coolzhu-tauri-shell\")")
             .expect("diagnostics should initialize during startup");
-        let proxy_probe = MAIN_RS[main..]
+        let proxy_probe = main_rs[main..]
             .find("detect_local_proxy_port()")
             .map(|index| main + index)
             .expect("proxy detection should exist");
@@ -1623,14 +1850,14 @@ mod tests {
             "diagnostics should initialize before other startup work"
         );
         assert_eq!(
-            MAIN_RS.matches("diagnostics::error_event(\n").count(),
+            main_rs.matches("diagnostics::error_event(\n").count(),
             9,
             "init failure and every Tauri shell error should use diagnostics::error_event"
         );
         for removed_helper in ["log_tauri_shell_error", "escape_json", "unix_millis"] {
             let declaration = format!("fn {removed_helper}(");
             assert!(
-                !MAIN_RS.contains(&declaration),
+                !main_rs.contains(&declaration),
                 "{removed_helper} should be removed from the Tauri shell"
             );
         }
@@ -1712,8 +1939,13 @@ mod tests {
         }
         assert_eq!(
             pet_action_frames("blink").len(),
-            6,
-            "blink should only use the stable wuxia blink frames"
+            8,
+            "blink signal should reuse all eight idle frames for the overlay"
+        );
+        assert!(PET_THEME_JSON.contains("\"blink\""));
+        assert!(
+            pet_action_frames("blink")[0].contains("idle-"),
+            "blink signal should reuse idle frames instead of a separate animation"
         );
         assert_eq!(pet_action_frames("warning").len(), 7);
     }
@@ -1923,7 +2155,8 @@ mod tests {
 
     #[test]
     fn pet_exit_path_reclaims_web_console_before_app_exit() {
-        let production = MAIN_RS
+        let source = normalized_main_source();
+        let production = source
             .split("#[cfg(test)]")
             .next()
             .expect("production source should precede tests");
@@ -2024,12 +2257,16 @@ mod tests {
         let scheduler = &PET_MINI_HTML[idle_blink..idle_autonomy];
 
         assert!(
-            scheduler.contains("setState(\"blink\")"),
-            "automatic idle blink should use setState so frame index, interval, priority, and first frame are applied consistently"
+            scheduler.contains("blinkOverlayUntil = performance.now() + 240;"),
+            "automatic idle blink should use the closed-eye overlay window"
         );
         assert!(
-            scheduler.contains("if (state === \"blink\")"),
-            "automatic idle blink return should not overwrite a newer higher-priority state"
+            scheduler.contains("applyFrame(frameIndex);"),
+            "automatic idle blink should preserve the current idle frame index"
+        );
+        assert!(
+            scheduler.contains("if (state !== \"idle\")"),
+            "automatic idle blink should stop when a newer state is active"
         );
         assert!(
             !scheduler.contains("state = \"blink\""),
@@ -2038,6 +2275,14 @@ mod tests {
         assert!(
             !scheduler.contains("activeFrames = frames.blink"),
             "automatic idle blink must not bypass setState by mutating activeFrames directly"
+        );
+        assert!(
+            !scheduler.contains("frameIndex = 0"),
+            "automatic idle blink must not reset the idle frame sequence"
+        );
+        assert!(
+            !scheduler.contains("setState(\"idle\")"),
+            "automatic idle blink must not restart the idle state"
         );
     }
 
@@ -2216,8 +2461,9 @@ mod tests {
         assert!(throne_drop_contains(zone, 300, 150));
         assert!(!throne_drop_contains(zone, 80, 150));
         assert_eq!(throne_snap_position(zone, 76, 76), (262, 92));
-        assert!(MAIN_RS.contains("#[tauri::command]\nfn report_throne_zone"));
-        assert!(MAIN_RS.contains("\"pet-throne\""));
+        let main_rs = normalized_main_source();
+        assert!(main_rs.contains("#[tauri::command]\nfn report_throne_zone"));
+        assert!(main_rs.contains("\"pet-throne\""));
     }
 
     #[test]
@@ -2396,21 +2642,9 @@ mod tests {
 
     #[test]
     fn pet_wuxia_frames_keep_policy_stable_scale_and_anchors() {
-        let metrics: serde_json::Value = serde_json::from_str(PET_STABILIZED_METRICS_JSON)
-            .expect("stabilized pet metrics must be valid JSON");
-        for state in ["working", "sweeping", "sword-flight", "sleeping"] {
-            let summary = &metrics[state]["summary"];
-            assert_eq!(
-                metrics[state]["policy"]["mode"], "uniform_fit",
-                "{state} should preserve one generated-sheet scale across the whole action"
-            );
-            let min_scale = summary["scale_min"].as_f64().unwrap_or_default();
-            let max_scale = summary["scale_max"].as_f64().unwrap_or_default();
-            assert!(
-                (max_scale - min_scale).abs() <= f64::EPSILON,
-                "{state} should not have per-frame scale changes: min={min_scale}, max={max_scale}"
-            );
-        }
+        // 生成时的 uniform_fit scale 无法从最终 PNG 反推；这里仅锁定已跟踪脚本的
+        // 四个状态策略与共享 scale 分支，几何断言仍直接读取当前运行时 PNG。
+        assert_pet_stabilizer_policy_contract();
 
         for state in [
             "idle",
@@ -2473,26 +2707,32 @@ mod tests {
 
     #[test]
     fn pet_martial_frames_keep_character_scale_consistent_with_idle() {
-        let metrics: serde_json::Value = serde_json::from_str(PET_STABILIZED_METRICS_JSON)
-            .expect("stabilized pet metrics must be valid JSON");
-        let martial = &metrics["perform_martial"];
-        assert_eq!(
-            martial["policy"]["mode"], "face_scale",
-            "martial effects must not control the character scale"
-        );
-
-        let martial_min = martial["summary"]["face_height_min"]
-            .as_f64()
-            .expect("martial face height minimum");
-        let martial_max = martial["summary"]["face_height_max"]
-            .as_f64()
-            .expect("martial face height maximum");
-        let idle_min = metrics["idle"]["summary"]["face_height_min"]
-            .as_f64()
-            .expect("idle face height minimum");
-        let idle_max = metrics["idle"]["summary"]["face_height_max"]
-            .as_f64()
-            .expect("idle face height maximum");
+        // 面部测量只覆盖当前 pet_action_frames 指向的 PNG；不读取、生成或回填历史 metrics。
+        assert_pet_stabilizer_policy_contract();
+        let martial = pet_face_measurements("perform_martial");
+        let idle = pet_face_measurements("idle");
+        let martial_min = martial
+            .iter()
+            .map(|measurement| measurement.height)
+            .min()
+            .expect("perform_martial 当前 PNG 必须识别到至少一帧面部")
+            as f64;
+        let martial_max = martial
+            .iter()
+            .map(|measurement| measurement.height)
+            .max()
+            .expect("perform_martial 当前 PNG 必须识别到至少一帧面部")
+            as f64;
+        let idle_min = idle
+            .iter()
+            .map(|measurement| measurement.height)
+            .min()
+            .expect("idle 当前 PNG 必须识别到至少一帧面部") as f64;
+        let idle_max = idle
+            .iter()
+            .map(|measurement| measurement.height)
+            .max()
+            .expect("idle 当前 PNG 必须识别到至少一帧面部") as f64;
 
         assert!(
             martial_max / martial_min <= 1.08,
@@ -2507,126 +2747,271 @@ mod tests {
     }
 
     #[test]
-    fn pet_blink_active_frames_match_idle_character_scale() {
+    fn pet_blink_overlay_reuses_idle_character_scale() {
         let idle_frames = pet_action_frames("idle");
         let blink_frames = pet_action_frames("blink");
-        let blink_scales = pet_action_frame_scales("blink");
         assert_eq!(
             blink_frames.len(),
-            6,
-            "blink runtime should only play the active stable close-eye frames"
+            idle_frames.len(),
+            "blink signal should reuse the complete idle frame sequence"
         );
-        assert_eq!(blink_scales.len(), blink_frames.len());
         assert!(
-            blink_scales
-                .iter()
-                .all(|scale| (*scale - 1.035).abs() <= f32::EPSILON),
-            "blink group should retain the XSXB reference-frame tuning"
-        );
-        let blink_scale = blink_scales[0];
-
-        let idle_mid = median_u32(
-            idle_frames
-                .iter()
-                .map(|frame| read_png_alpha_bounds(frame).primary_height)
-                .collect(),
-        );
-        let blink_mid = median_u32(
             blink_frames
                 .iter()
-                .map(|frame| read_png_alpha_bounds(frame).primary_height)
-                .collect(),
-        );
-        assert!(
-            (blink_mid / idle_mid - 1.0).abs() <= 0.03,
-            "blink source frames should preserve idle body height: blink={blink_mid}, idle={idle_mid}"
+                .zip(idle_frames.iter())
+                .all(|(blink, idle)| blink == idle),
+            "blink signal should reuse idle assets instead of a separate animation"
         );
 
-        let idle_width_mid = median_u32(
-            idle_frames
-                .iter()
-                .map(|frame| read_png_alpha_bounds(frame).primary_width)
-                .collect(),
-        );
-        let blink_width_mid = median_u32(
-            blink_frames
-                .iter()
-                .map(|frame| read_png_alpha_bounds(frame).primary_width)
-                .collect(),
-        );
-        assert!(
-            (blink_width_mid / idle_width_mid - 1.0).abs() <= 0.03,
-            "blink source frames should preserve idle body width: blink={blink_width_mid}, idle={idle_width_mid}"
-        );
-
-        let idle_area_mid = median_u32(
-            idle_frames
-                .iter()
-                .map(|frame| read_png_alpha_bounds(frame).primary_area)
-                .collect(),
-        );
-        let blink_area_mid = median_u32(
-            blink_frames
-                .iter()
-                .map(|frame| read_png_alpha_bounds(frame).primary_area)
-                .collect(),
-        );
-        assert!(
-            (blink_area_mid / idle_area_mid - 1.0).abs() <= 0.03,
-            "blink source frames should preserve idle body area: blink={blink_area_mid}, idle={idle_area_mid}"
-        );
-
-        let metrics: serde_json::Value = serde_json::from_str(PET_STABILIZED_METRICS_JSON)
-            .expect("stabilized pet metrics must be valid JSON");
-        let metric_frames = metrics["blink"]["frames"]
-            .as_array()
-            .expect("blink metrics frames");
-        assert_eq!(
-            metric_frames.len(),
-            blink_frames.len(),
-            "blink metrics should describe the same active frames as the runtime theme"
-        );
-        let face_height_mid = |state: &str| {
-            median_u32(
-                metrics[state]["frames"]
-                    .as_array()
-                    .expect("pet metric frames")
-                    .iter()
-                    .map(|frame| {
-                        frame["face_height"]
-                            .as_u64()
-                            .expect("pet metric face height") as u32
-                    })
-                    .collect(),
-            )
-        };
-        let idle_face_mid = face_height_mid("idle");
-        let blink_face_mid = face_height_mid("blink");
-        assert!(
-            (blink_face_mid * blink_scale / idle_face_mid - 1.0).abs() <= 0.02,
-            "XSXB group tuning should align blink face scale with idle: blink={blink_face_mid}, scale={blink_scale}, idle={idle_face_mid}"
-        );
+        assert!(PET_MINI_HTML.contains("let idleClosedFrames = actionFrames(\"idle-closed\", 8)"));
+        assert!(PET_MINI_HTML
+            .contains("if (state === \"idle\" && performance.now() < blinkOverlayUntil)"));
+        for (index, (idle, blink)) in idle_frames.iter().zip(blink_frames.iter()).enumerate() {
+            let idle_bounds = read_png_alpha_bounds(idle);
+            let closed_path = format!("assets/pet-actions/idle-closed-{index}.png");
+            let closed_bounds = read_png_alpha_bounds(&closed_path);
+            assert_eq!(
+                closed_bounds.width, PET_FRAME_CANVAS,
+                "closed frame {index} canvas width"
+            );
+            assert_eq!(
+                closed_bounds.height, PET_FRAME_CANVAS,
+                "closed frame {index} canvas height"
+            );
+            assert!(
+                (closed_bounds.primary_width as f32 / idle_bounds.primary_width as f32 - 1.0).abs()
+                    <= 0.02,
+                "closed frame {index} should preserve idle body width: closed={}, idle={}",
+                closed_bounds.primary_width,
+                idle_bounds.primary_width
+            );
+            assert!(
+                (closed_bounds.primary_height as f32 / idle_bounds.primary_height as f32 - 1.0)
+                    .abs()
+                    <= 0.02,
+                "closed frame {index} should preserve idle body height: closed={}, idle={}",
+                closed_bounds.primary_height,
+                idle_bounds.primary_height
+            );
+            assert!(
+                closed_bounds
+                    .primary_bottom
+                    .abs_diff(idle_bounds.primary_bottom)
+                    <= 2,
+                "closed frame {index} should preserve idle baseline: closed={}, idle={}",
+                closed_bounds.primary_bottom,
+                idle_bounds.primary_bottom
+            );
+            assert!(
+                (closed_bounds.primary_center_x - idle_bounds.primary_center_x).abs() <= 2.0,
+                "closed frame {index} should preserve idle center: closed={}, idle={}",
+                closed_bounds.primary_center_x,
+                idle_bounds.primary_center_x
+            );
+            assert_eq!(
+                blink, idle,
+                "blink signal should point at idle frame {index}"
+            );
+        }
     }
 
     #[test]
     fn pet_success_frames_do_not_mix_closeup_character_scales() {
-        let metrics: serde_json::Value = serde_json::from_str(PET_STABILIZED_METRICS_JSON)
-            .expect("stabilized pet metrics must be valid JSON");
-        let success = &metrics["success"];
-        assert_eq!(
-            success["policy"]["mode"], "face_scale",
-            "success poses should be normalized by the character face, not effects"
-        );
-        let min = success["summary"]["face_height_min"]
-            .as_f64()
-            .expect("success face height minimum");
-        let max = success["summary"]["face_height_max"]
-            .as_f64()
-            .expect("success face height maximum");
+        // 成功帧同样只验证当前 PNG 的 face_bbox；无法识别面部时 helper 会直接失败。
+        assert_pet_stabilizer_policy_contract();
+        let success = pet_face_measurements("success");
+        let min = success
+            .iter()
+            .map(|measurement| measurement.height)
+            .min()
+            .expect("success 当前 PNG 必须识别到至少一帧面部") as f64;
+        let max = success
+            .iter()
+            .map(|measurement| measurement.height)
+            .max()
+            .expect("success 当前 PNG 必须识别到至少一帧面部") as f64;
         assert!(
             max / min <= 1.05,
             "success frames should not jump in size: min={min}, max={max}"
         );
+    }
+
+    #[derive(Debug)]
+    struct PetFaceMeasurement {
+        bbox: (u32, u32, u32, u32),
+        width: u32,
+        height: u32,
+    }
+
+    fn pet_face_measurements(state: &str) -> Vec<PetFaceMeasurement> {
+        pet_action_frames(state)
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let bbox = read_png_face_bbox(frame);
+                let measurement = PetFaceMeasurement {
+                    bbox,
+                    width: bbox.2 - bbox.0,
+                    height: bbox.3 - bbox.1,
+                };
+                println!(
+                    "pet_face_measurement state={state} frame={index} path={frame} bbox=[{}, {}, {}, {}] face_width={} face_height={}",
+                    measurement.bbox.0,
+                    measurement.bbox.1,
+                    measurement.bbox.2,
+                    measurement.bbox.3,
+                    measurement.width,
+                    measurement.height
+                );
+                measurement
+            })
+            .collect()
+    }
+
+    fn read_png_face_bbox(frame: &str) -> (u32, u32, u32, u32) {
+        let asset_path = frame.split('?').next().unwrap_or(frame);
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../ui")
+            .join(asset_path);
+        let file = File::open(&path).unwrap_or_else(|error| {
+            panic!("无法打开当前桌宠 PNG {}: {error}", path.display());
+        });
+        let decoder = png::Decoder::new(file);
+        let mut reader = decoder.read_info().unwrap_or_else(|error| {
+            panic!("无法读取当前桌宠 PNG {}: {error}", path.display());
+        });
+        let mut buffer = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buffer).unwrap_or_else(|error| {
+            panic!("无法解码当前桌宠 PNG {}: {error}", path.display());
+        });
+        assert!(
+            info.width > 0 && info.height > 0,
+            "当前桌宠 PNG {} 不能为空尺寸",
+            path.display()
+        );
+        assert!(
+            matches!(info.bit_depth, png::BitDepth::Eight),
+            "当前桌宠 PNG {} 必须是 8-bit，实际为 {:?}",
+            path.display(),
+            info.bit_depth
+        );
+        let bytes = &buffer[..info.buffer_size()];
+        let channels = match info.color_type {
+            png::ColorType::Rgba => 4,
+            png::ColorType::Rgb => 3,
+            png::ColorType::GrayscaleAlpha => 2,
+            png::ColorType::Grayscale => 1,
+            png::ColorType::Indexed => {
+                panic!(
+                    "当前桌宠 PNG {} 使用了不支持的 indexed 色彩类型",
+                    path.display()
+                );
+            }
+        };
+        let pixel_count = (info.width * info.height) as usize;
+        let mut skin = vec![false; pixel_count];
+        for y in 0..info.height {
+            for x in 0..info.width {
+                let index = ((y * info.width + x) as usize) * channels;
+                let (red, green, blue, alpha) = match info.color_type {
+                    png::ColorType::Rgba => (
+                        bytes[index],
+                        bytes[index + 1],
+                        bytes[index + 2],
+                        bytes[index + 3],
+                    ),
+                    png::ColorType::Rgb => (bytes[index], bytes[index + 1], bytes[index + 2], 255),
+                    png::ColorType::GrayscaleAlpha => {
+                        let gray = bytes[index];
+                        (gray, gray, gray, bytes[index + 1])
+                    }
+                    png::ColorType::Grayscale => {
+                        let gray = bytes[index];
+                        (gray, gray, gray, 255)
+                    }
+                    png::ColorType::Indexed => unreachable!("indexed 色彩类型已在上方拒绝"),
+                };
+                if alpha > 80
+                    && red > 145
+                    && green > 70
+                    && green < 220
+                    && blue > 45
+                    && f64::from(red) > f64::from(green) * 1.04
+                    && f64::from(green) > f64::from(blue) * 1.03
+                    && red - blue > 45
+                {
+                    skin[(y * info.width + x) as usize] = true;
+                }
+            }
+        }
+
+        let mut seen = vec![false; pixel_count];
+        let mut candidates = Vec::new();
+        for y in 0..info.height {
+            for x in 0..info.width {
+                let start = (y * info.width + x) as usize;
+                if !skin[start] || seen[start] {
+                    continue;
+                }
+
+                let mut queue = VecDeque::from([(x, y)]);
+                seen[start] = true;
+                let mut area = 0u32;
+                let mut left = x;
+                let mut right = x + 1;
+                let mut top = y;
+                let mut bottom = y + 1;
+
+                while let Some((current_x, current_y)) = queue.pop_front() {
+                    area += 1;
+                    left = left.min(current_x);
+                    right = right.max(current_x + 1);
+                    top = top.min(current_y);
+                    bottom = bottom.max(current_y + 1);
+
+                    let x_start = current_x.saturating_sub(1);
+                    let x_end = current_x.saturating_add(1).min(info.width - 1);
+                    let y_start = current_y.saturating_sub(1);
+                    let y_end = current_y.saturating_add(1).min(info.height - 1);
+                    for next_y in y_start..=y_end {
+                        for next_x in x_start..=x_end {
+                            if next_x == current_x && next_y == current_y {
+                                continue;
+                            }
+                            let index = (next_y * info.width + next_x) as usize;
+                            if skin[index] && !seen[index] {
+                                seen[index] = true;
+                                queue.push_back((next_x, next_y));
+                            }
+                        }
+                    }
+                }
+
+                let face_width = right - left;
+                let face_height = bottom - top;
+                let aspect = f64::from(face_width) / f64::from(face_height.max(1));
+                let center_x = f64::from(left + right) / 2.0;
+                if area >= 200
+                    && (0.7..=1.4).contains(&aspect)
+                    && (20..=120).contains(&face_width)
+                    && (20..=120).contains(&face_height)
+                    && (center_x - f64::from(info.width) / 2.0).abs()
+                        <= f64::from(info.width) * 0.28
+                    && f64::from(top) < f64::from(info.height) * 0.65
+                {
+                    // 元组顺序与 Python max(candidates) 相同，保留同面积时的 tie-break。
+                    candidates.push((area, left, top, right, bottom));
+                }
+            }
+        }
+
+        let (_, left, top, right, bottom) = candidates.into_iter().max().unwrap_or_else(|| {
+            panic!(
+                "当前桌宠 PNG {} 无法识别角色面部（skin_components 无合格候选）",
+                path.display()
+            )
+        });
+        (left, top, right, bottom)
     }
 
     #[derive(Debug)]

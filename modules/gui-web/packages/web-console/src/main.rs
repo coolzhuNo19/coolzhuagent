@@ -40,6 +40,7 @@ fn decode_console_output(bytes: &[u8]) -> String {
 
 use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet};
 use std::env;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::net::SocketAddr;
@@ -84,10 +85,11 @@ use runtime::{
     ToolOutcome, ToolOutcomeStatus,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use tokio::process::Command;
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::{broadcast, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tools::{mvp_tool_specs, path_effect::extractor_for, GlobalToolRegistry};
 use tracing::{error, info, instrument, warn};
@@ -151,7 +153,10 @@ const COMPUTER_USE_PERMISSION_GATE: &str =
 static VOICE_MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 static PET_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static REALTIME_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static MEMORY_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static SHOWUI_SERVICE_ENABLED: AtomicBool = AtomicBool::new(true);
+static CHAT_TURN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const CHAT_TURN_TERMINAL_TTL: Duration = Duration::from_secs(300);
 const AUDIO_HEALTH_CACHE_TTL_MS: u64 = 3_000;
 const DETECTION_HEALTH_CACHE_TTL_MS: u64 = 3_000;
 const REALTIME_MODE_HALF_DUPLEX_GUARDED: &str = "half_duplex_guarded";
@@ -169,6 +174,347 @@ const REALTIME_TTS_CHUNKED_STREAM: &str = "chunked_tts_stream";
 const REALTIME_SEGMENT_ASR_OFF: &str = "off";
 const REALTIME_SEGMENT_ASR_FINAL_STT: &str = "final_segment_stt";
 const REALTIME_SEGMENT_ASR_PROVIDER_LOCAL_STT_FINAL: &str = "local_stt_final";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ChatTurnStatus {
+    Running,
+    InterruptRequested,
+    Interrupted,
+    Completed,
+    Failed,
+}
+
+impl ChatTurnStatus {
+    fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Interrupted | Self::Completed | Self::Failed
+        )
+    }
+}
+
+#[derive(Debug)]
+struct ChatTurnCancellation {
+    requested: AtomicBool,
+    notify: Notify,
+}
+
+impl ChatTurnCancellation {
+    fn new() -> Self {
+        Self {
+            requested: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    fn request(&self) -> bool {
+        let first_request = !self.requested.swap(true, Ordering::AcqRel);
+        if first_request {
+            // notify_one 保留一个 permit，避免请求恰好发生在检查与 await 之间时丢唤醒。
+            self.notify.notify_one();
+        }
+        first_request
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_requested() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ChatTurnRegistryEntry {
+    run_id: Option<String>,
+    session_id: Option<String>,
+    chat_room_id: String,
+    cancellation: Arc<ChatTurnCancellation>,
+    status: ChatTurnStatus,
+    created_at: Instant,
+    finished_at: Option<Instant>,
+}
+
+fn chat_turn_registry() -> &'static Mutex<HashMap<String, ChatTurnRegistryEntry>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, ChatTurnRegistryEntry>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn new_chat_turn_id() -> String {
+    let sequence = CHAT_TURN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("chat-turn-{}-{sequence}", unix_timestamp_millis())
+}
+
+/// 运行时持久 run 的公开 id 与 claim token 必须来自系统随机源；失败时不回退到
+/// 时间戳/伪随机值，调用方应拒绝创建 run（fail-closed）。
+fn random_hex_identifier(byte_len: usize, label: &str) -> Result<String, String> {
+    let mut bytes = vec![0u8; byte_len];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("{label} random generation failed: {error}"))?;
+    Ok(bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>())
+}
+
+fn new_runtime_run_identifiers() -> Result<(String, String), String> {
+    Ok((
+        format!(
+            "run-chat-{}",
+            random_hex_identifier(24, "runtime run id")?
+        ),
+        format!(
+            "claim-{}",
+            random_hex_identifier(32, "runtime claim token")?
+        ),
+    ))
+}
+
+fn prune_chat_turn_registry(registry: &mut HashMap<String, ChatTurnRegistryEntry>) {
+    let now = Instant::now();
+    registry.retain(|_, entry| {
+        if !entry.status.is_terminal() {
+            return true;
+        }
+        entry
+            .finished_at
+            .or(Some(entry.created_at))
+            .is_some_and(|finished_at| now.duration_since(finished_at) < CHAT_TURN_TERMINAL_TTL)
+    });
+}
+
+#[cfg(test)]
+fn clear_chat_turn_registry_for_test() {
+    if let Ok(mut registry) = chat_turn_registry().lock() {
+        registry.clear();
+    }
+}
+
+fn register_chat_turn(
+    turn_id: &str,
+    session_id: Option<String>,
+    chat_room_id: String,
+) -> Arc<ChatTurnCancellation> {
+    register_chat_turn_with_run(turn_id, None, session_id, chat_room_id)
+}
+
+fn register_chat_turn_with_run(
+    turn_id: &str,
+    run_id: Option<String>,
+    session_id: Option<String>,
+    chat_room_id: String,
+) -> Arc<ChatTurnCancellation> {
+    let cancellation = Arc::new(ChatTurnCancellation::new());
+    if let Ok(mut registry) = chat_turn_registry().lock() {
+        prune_chat_turn_registry(&mut registry);
+        registry.insert(
+            turn_id.to_string(),
+            ChatTurnRegistryEntry {
+                run_id,
+                session_id,
+                chat_room_id,
+                cancellation: Arc::clone(&cancellation),
+                status: ChatTurnStatus::Running,
+                created_at: Instant::now(),
+                finished_at: None,
+            },
+        );
+    }
+    cancellation
+}
+
+fn chat_turn_is_cancelled(turn_id: &str) -> bool {
+    chat_turn_registry()
+        .lock()
+        .ok()
+        .and_then(|mut registry| {
+            prune_chat_turn_registry(&mut registry);
+            registry
+                .get(turn_id)
+                .map(|entry| entry.cancellation.is_requested())
+        })
+        .unwrap_or(false)
+}
+
+/// 通用 run interrupt 成功后唤醒同进程聊天 worker；重启后的 run 没有 registry
+/// 条目时仅保留 SQLite stop_requested 事实，不伪造内存 worker。
+fn request_chat_turn_by_run_id(run_id: &str) -> bool {
+    let Ok(mut registry) = chat_turn_registry().lock() else {
+        return false;
+    };
+    prune_chat_turn_registry(&mut registry);
+    let Some(entry) = registry
+        .values_mut()
+        .find(|entry| entry.run_id.as_deref() == Some(run_id))
+    else {
+        return false;
+    };
+    if entry.status.is_terminal() {
+        return false;
+    }
+    entry.status = ChatTurnStatus::InterruptRequested;
+    entry.cancellation.request();
+    true
+}
+
+fn set_chat_turn_status(turn_id: &str, requested: ChatTurnStatus) -> Option<ChatTurnStatus> {
+    let mut registry = chat_turn_registry().lock().ok()?;
+    prune_chat_turn_registry(&mut registry);
+    let entry = registry.get_mut(turn_id)?;
+    if entry.status.is_terminal() {
+        return Some(entry.status);
+    }
+    let status = if entry.cancellation.is_requested()
+        && matches!(requested, ChatTurnStatus::Completed | ChatTurnStatus::Failed)
+    {
+        ChatTurnStatus::Interrupted
+    } else {
+        requested
+    };
+    entry.status = status;
+    if status.is_terminal() {
+        entry.finished_at = Some(Instant::now());
+    }
+    Some(status)
+}
+
+fn set_chat_turn_status_exact(turn_id: &str, status: ChatTurnStatus) -> Option<ChatTurnStatus> {
+    let mut registry = chat_turn_registry().lock().ok()?;
+    prune_chat_turn_registry(&mut registry);
+    let entry = registry.get_mut(turn_id)?;
+    if entry.status.is_terminal() {
+        return Some(entry.status);
+    }
+    entry.status = status;
+    if status.is_terminal() {
+        entry.finished_at = Some(Instant::now());
+    }
+    Some(status)
+}
+
+struct ChatTurnGuard {
+    turn_id: String,
+    run_id: Option<String>,
+    claim_token: Option<String>,
+    db_path: Option<PathBuf>,
+    finished: bool,
+}
+
+impl ChatTurnGuard {
+    fn new(turn_id: String) -> Self {
+        Self {
+            turn_id,
+            run_id: None,
+            claim_token: None,
+            db_path: None,
+            finished: false,
+        }
+    }
+
+    fn new_runtime(
+        turn_id: String,
+        run_id: String,
+        claim_token: String,
+        db_path: PathBuf,
+    ) -> Self {
+        Self {
+            turn_id,
+            run_id: Some(run_id),
+            claim_token: Some(claim_token),
+            db_path: Some(db_path),
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, status: ChatTurnStatus) -> ChatTurnStatus {
+        let requested = if chat_turn_is_cancelled(&self.turn_id)
+            && matches!(status, ChatTurnStatus::Completed | ChatTurnStatus::Failed)
+        {
+            ChatTurnStatus::Interrupted
+        } else {
+            status
+        };
+        let actual = match (
+            self.db_path.as_deref(),
+            self.run_id.as_deref(),
+            self.claim_token.as_deref(),
+        ) {
+            (Some(path), Some(run_id), Some(claim_token)) => {
+                match finalize_chat_runtime_run_sqlite(path, run_id, claim_token, requested) {
+                    Ok(actual) => set_chat_turn_status_exact(&self.turn_id, actual).unwrap_or(actual),
+                    Err(error) => {
+                        diag!("[CHAT-RUN] terminal persistence failed for {run_id}: {error}");
+                        let fallback = if requested == ChatTurnStatus::Interrupted {
+                            ChatTurnStatus::Interrupted
+                        } else {
+                            ChatTurnStatus::Failed
+                        };
+                        let _ = set_chat_turn_status_exact(&self.turn_id, fallback);
+                        self.finished = true;
+                        return fallback;
+                    }
+                }
+            }
+            _ => set_chat_turn_status(&self.turn_id, requested).unwrap_or(requested),
+        };
+        self.finished = true;
+        actual
+    }
+}
+
+impl Drop for ChatTurnGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let requested = if chat_turn_is_cancelled(&self.turn_id) {
+                ChatTurnStatus::Interrupted
+            } else {
+                ChatTurnStatus::Failed
+            };
+            let actual = match (
+                self.db_path.as_deref(),
+                self.run_id.as_deref(),
+                self.claim_token.as_deref(),
+            ) {
+                (Some(path), Some(run_id), Some(claim_token)) => {
+                    match finalize_chat_runtime_run_sqlite(path, run_id, claim_token, requested) {
+                        Ok(actual) => actual,
+                        Err(error) => {
+                            diag!("[CHAT-RUN] drop terminal persistence failed for {run_id}: {error}");
+                            requested
+                        }
+                    }
+                }
+                _ => requested,
+            };
+            let _ = set_chat_turn_status_exact(&self.turn_id, actual);
+            self.finished = true;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ChatTurnCancelled;
+
+async fn await_chat_turn<F, T>(
+    cancellation: &ChatTurnCancellation,
+    future: F,
+) -> Result<T, ChatTurnCancelled>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(ChatTurnCancelled),
+        output = future => Ok(output),
+    }
+}
 
 #[derive(Debug, Clone)]
 struct AudioHealthSnapshot {
@@ -412,6 +758,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("浏览器 Computer Use 运行时握手文件初始化失败: {error}");
     }
 
+    // 进程重启后先恢复持久化 run，再 bind/scheduler；已有数据库恢复失败必须 fail-closed，
+    // 避免旧任务 worker 在状态未校正时继续运行。数据库尚不存在时恢复函数是 no-op。
+    let runtime_run_db_path = default_session_sqlite_path();
+    match recover_incomplete_runtime_runs(&runtime_run_db_path) {
+        Ok(recovered) if recovered > 0 => {
+            info!(
+                "runtime run 启动恢复完成: recovered={}, path={}",
+                recovered,
+                runtime_run_db_path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            diagnostics::error_event(
+                "gui-web",
+                "runtime_run_recovery_failed",
+                "Failed to recover incomplete runtime runs",
+                &error,
+                &[("path", runtime_run_db_path.display().to_string())],
+            );
+            return Err(Box::new(error) as Box<dyn std::error::Error>);
+        }
+    }
+
     let bind_addr = config_web_bind_addr();
     let address: SocketAddr = match bind_addr.parse() {
         Ok(address) => address,
@@ -634,11 +1004,25 @@ fn app() -> Router {
             "/api/sessions/{session_id}/activate",
             post(api_activate_session),
         )
+        .route(
+            "/api/sessions/{session_id}/resume",
+            post(api_resume_session),
+        )
+        .route("/api/sessions/{session_id}/fork", post(api_fork_session))
+        .route(
+            "/api/sessions/{session_id}/rollback",
+            post(api_rollback_session),
+        )
         .route("/api/sessions/{session_id}/reset", post(api_reset_session))
         .route(
             "/api/sessions/{session_id}/messages",
             get(api_session_messages),
         )
+        .route(
+            "/api/sessions/{session_id}/history",
+            get(api_session_history),
+        )
+        .route("/api/sessions/{session_id}/events", get(api_session_events))
         .route(
             "/api/sessions/{session_id}/beads",
             get(api_session_beads).post(api_session_add_bead),
@@ -662,6 +1046,18 @@ fn app() -> Router {
         .route(
             "/api/sessions/{session_id}/memory/consolidate",
             post(api_session_consolidate_memory),
+        )
+        .route(
+            "/api/sessions/{session_id}/memory/jobs",
+            get(api_session_memory_jobs).post(api_session_start_memory_job),
+        )
+        .route(
+            "/api/sessions/{session_id}/memory/jobs/{job_id}",
+            get(api_session_memory_job),
+        )
+        .route(
+            "/api/sessions/{session_id}/memory-mode",
+            patch(api_session_memory_mode),
         )
         .route(
             "/api/sessions/{session_id}/context-preview",
@@ -828,6 +1224,9 @@ fn app() -> Router {
         .route("/api/goals/{goal_id}", get(api_goal_detail))
         .route("/api/goals/{goal_id}/status", get(api_goal_status))
         .route("/api/goals/{goal_id}/events", get(api_goal_events))
+        .route("/api/runs/{run_id}", get(api_run_status))
+        .route("/api/runs/{run_id}/events", get(api_run_events))
+        .route("/api/runs/{run_id}/interrupt", post(api_run_interrupt))
         .route("/api/goals/{goal_id}/plan", post(api_set_goal_plan))
         .route(
             "/api/goals/{goal_id}/commander/review",
@@ -887,6 +1286,7 @@ fn app() -> Router {
         )
         .route("/api/chat/send", post(api_chat_send))
         .route("/api/chat/send/stream", post(api_chat_send_stream))
+        .route("/api/chat/turn/interrupt", post(api_chat_turn_interrupt))
         .route("/api/chat/send/relay", post(api_chat_send_relay))
         .route(
             "/api/agents/{agent_id}/diagnostics",
@@ -1027,7 +1427,7 @@ fn app() -> Router {
                 .post(api_tools_allowed_roots_add)
                 .delete(api_tools_allowed_roots_remove),
         )
-        .route("/api/tools/pending", get(api_tools_pending))
+        .route("/api/tools/pending", get(api_tools_pending_query))
         .route(
             "/api/tools/full-access",
             get(api_tools_full_access_status)
@@ -2303,6 +2703,21 @@ fn subscribe_goal_events() -> broadcast::Receiver<GoalEventDto> {
     goal_event_bus().subscribe()
 }
 
+/// Run 事件独立于 Goal 事件总线：SQLite 是事实源，broadcast 仅用于降低实时订阅延迟。
+/// 任何事务都必须在 commit 成功后调用 `broadcast_runtime_run_event`，避免幽灵事件。
+fn runtime_run_event_bus() -> &'static broadcast::Sender<RuntimeRunEventDto> {
+    static BUS: OnceLock<broadcast::Sender<RuntimeRunEventDto>> = OnceLock::new();
+    BUS.get_or_init(|| broadcast::channel::<RuntimeRunEventDto>(256).0)
+}
+
+fn broadcast_runtime_run_event(event: RuntimeRunEventDto) {
+    let _ = runtime_run_event_bus().send(event);
+}
+
+fn subscribe_runtime_run_events() -> broadcast::Receiver<RuntimeRunEventDto> {
+    runtime_run_event_bus().subscribe()
+}
+
 fn vision_realtime_event_bus() -> &'static broadcast::Sender<VisionRealtimeEventDto> {
     static BUS: OnceLock<broadcast::Sender<VisionRealtimeEventDto>> = OnceLock::new();
     BUS.get_or_init(|| broadcast::channel::<VisionRealtimeEventDto>(128).0)
@@ -2517,6 +2932,8 @@ struct PetStateResponse {
 struct ShowUiServiceResponse {
     enabled: bool,
     running: bool,
+    /// 桌宠壳进程存活不等于 ShowUI grounding 端点已就绪；以前端显示真实可用性。
+    available: bool,
     pid: Option<u32>,
     disabled: bool,
     desktop_pet_exe: Option<String>,
@@ -2665,6 +3082,7 @@ fn showui_service_status_with_message(message: impl Into<String>) -> ShowUiServi
         enabled: SHOWUI_SERVICE_ENABLED.load(Ordering::Relaxed)
             && !showui_service_config_disabled(),
         running,
+        available: local_port_listening(LOCAL_SHOWUI_PORT),
         pid,
         disabled: showui_service_config_disabled(),
         desktop_pet_exe: desktop_pet_executable().map(|path| path.display().to_string()),
@@ -2693,6 +3111,7 @@ fn managed_showui_service_status(message: impl Into<String>) -> ShowUiServiceRes
     ShowUiServiceResponse {
         enabled: true,
         running: true,
+        available: local_port_listening(LOCAL_SHOWUI_PORT),
         pid: None,
         disabled: false,
         desktop_pet_exe: desktop_pet_executable().map(|path| path.display().to_string()),
@@ -2721,6 +3140,7 @@ fn start_showui_service(console_url: &str) -> ShowUiServiceResponse {
         return ShowUiServiceResponse {
             enabled: true,
             running: true,
+            available: local_port_listening(LOCAL_SHOWUI_PORT),
             pid: Some(pid),
             disabled: false,
             desktop_pet_exe: desktop_pet_executable().map(|path| path.display().to_string()),
@@ -2733,6 +3153,7 @@ fn start_showui_service(console_url: &str) -> ShowUiServiceResponse {
     ShowUiServiceResponse {
         enabled: true,
         running: pid.is_some(),
+        available: local_port_listening(LOCAL_SHOWUI_PORT),
         pid,
         disabled: false,
         desktop_pet_exe: desktop_pet_executable().map(|path| path.display().to_string()),
@@ -4123,6 +4544,46 @@ struct PendingApprovalsResponse {
     pending: Vec<PendingApprovalRecord>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PendingApprovalsQuery {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    chat_room_id: Option<String>,
+}
+
+fn normalized_scope_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn pending_approval_scope_matches(
+    record: &PendingApprovalRecord,
+    session_id: Option<&str>,
+    chat_room_id: Option<&str>,
+) -> bool {
+    normalized_scope_value(record.session_id.as_deref())
+        == normalized_scope_value(session_id)
+        && normalized_scope_value(record.chat_room_id.as_deref())
+            == normalized_scope_value(chat_room_id)
+}
+
+fn pending_approval_matches_filter(
+    record: &PendingApprovalRecord,
+    session_id: Option<&str>,
+    chat_room_id: Option<&str>,
+) -> bool {
+    let session_matches = normalized_scope_value(session_id).is_none_or(|requested| {
+        normalized_scope_value(record.session_id.as_deref()).as_deref() == Some(requested.as_str())
+    });
+    let room_matches = normalized_scope_value(chat_room_id).is_none_or(|requested| {
+        normalized_scope_value(record.chat_room_id.as_deref()).as_deref() == Some(requested.as_str())
+    });
+    session_matches && room_matches
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct FullAccessGrantRequest {
     #[serde(default)]
@@ -4232,18 +4693,36 @@ fn validate_chat_room_permission_update(
     }
 }
 
-async fn api_tools_pending() -> Json<PendingApprovalsResponse> {
+async fn api_tools_pending_for_scope(query: PendingApprovalsQuery) -> Json<PendingApprovalsResponse> {
     let pending = pending_approvals()
         .lock()
         .map(|map| {
             let now = Instant::now();
             map.values()
-                .filter(|record| now.duration_since(record.created_at) < PENDING_APPROVAL_TTL)
+                .filter(|record| {
+                    now.duration_since(record.created_at) < PENDING_APPROVAL_TTL
+                        && pending_approval_matches_filter(
+                            record,
+                            query.session_id.as_deref(),
+                            query.chat_room_id.as_deref(),
+                        )
+                })
                 .cloned()
                 .collect()
         })
         .unwrap_or_default();
     Json(PendingApprovalsResponse { pending })
+}
+
+async fn api_tools_pending_query(
+    Query(query): Query<PendingApprovalsQuery>,
+) -> Json<PendingApprovalsResponse> {
+    api_tools_pending_for_scope(query).await
+}
+
+#[cfg(test)]
+async fn api_tools_pending() -> Json<PendingApprovalsResponse> {
+    api_tools_pending_for_scope(PendingApprovalsQuery::default()).await
 }
 
 fn resolve_full_access_session_id(requested: Option<String>) -> ApiResult<Option<String>> {
@@ -4304,7 +4783,7 @@ async fn api_tools_full_access_revoke() -> ApiResult<Json<FullAccessGrantStatus>
     Ok(Json(status))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct ApproveRequest {
     call_id: String,
     /// "once" / "session"。默""once"。
@@ -4313,6 +4792,12 @@ struct ApproveRequest {
     /// 针对 Protected / Danger 外部的二次确认。
     #[serde(default)]
     confirmed_twice: bool,
+    /// 审批所属会话；带作用域的 pending 必须精确匹配，避免只凭 call_id 跨会话消费。
+    #[serde(default)]
+    session_id: Option<String>,
+    /// 审批所属聊天室；带作用域的 pending 必须精确匹配。
+    #[serde(default)]
+    chat_room_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4331,24 +4816,28 @@ async fn api_tools_approve(
     Json(payload): Json<ApproveRequest>,
 ) -> ApiResult<Json<ApproveResponse>> {
     let scope = payload.scope.as_deref().unwrap_or("once").to_string();
+    let mut needs_second_confirmation = false;
     let record = pending_approvals().lock().ok().and_then(|mut pending| {
+        let now = Instant::now();
+        pending.retain(|_, record| now.duration_since(record.created_at) < PENDING_APPROVAL_TTL);
         let record = pending.get(&payload.call_id)?.clone();
+        if !pending_approval_scope_matches(
+            &record,
+            payload.session_id.as_deref(),
+            payload.chat_room_id.as_deref(),
+        ) {
+            return None;
+        }
         if record.permission.decision == PermissionDecision::RequireConfirm.as_str()
             && !payload.confirmed_twice
         {
+            needs_second_confirmation = true;
             return None;
         }
         pending.remove(&payload.call_id)
     });
     let Some(record) = record else {
-        let needs_second_confirmation = pending_approvals()
-            .lock()
-            .ok()
-            .and_then(|pending| pending.get(&payload.call_id).cloned())
-            .is_some_and(|record| {
-                record.permission.decision == PermissionDecision::RequireConfirm.as_str()
-            });
-        if needs_second_confirmation && !payload.confirmed_twice {
+        if needs_second_confirmation {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
                 "该工具调用需要 confirmed_twice=true 的二次确认",
@@ -4416,11 +4905,15 @@ async fn execute_approved_pending_record(
     outcome
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct RejectRequest {
     call_id: String,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    chat_room_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4430,10 +4923,19 @@ struct RejectResponse {
 }
 
 async fn api_tools_reject(Json(payload): Json<RejectRequest>) -> ApiResult<Json<RejectResponse>> {
-    let removed = pending_approvals()
-        .lock()
-        .ok()
-        .and_then(|mut pending| pending.remove(&payload.call_id));
+    let removed = pending_approvals().lock().ok().and_then(|mut pending| {
+        let now = Instant::now();
+        pending.retain(|_, record| now.duration_since(record.created_at) < PENDING_APPROVAL_TTL);
+        let record = pending.get(&payload.call_id)?.clone();
+        if !pending_approval_scope_matches(
+            &record,
+            payload.session_id.as_deref(),
+            payload.chat_room_id.as_deref(),
+        ) {
+            return None;
+        }
+        pending.remove(&payload.call_id)
+    });
     let Some(record) = removed else {
         return Err(api_error(StatusCode::NOT_FOUND, "未找到对应待审批的工具调"));
     };
@@ -8047,7 +8549,7 @@ async fn deliver_goal_scheduled_task(task: &ConfigScheduledTask) -> ApiResult<Go
     };
 
     // 推进一个阶段（指派对象为该阶段在 Goal 模式中绑定的角色会话）。
-    let result = run_goal_phase_once(&workspace_id, goal_id, &phase_id).await?;
+    let result = run_goal_phase_once(&workspace_id, goal_id, &phase_id, &db_path).await?;
     let mirrored = {
         let mut store = session_store().lock().map_err(|_| {
             api_error(
@@ -10299,6 +10801,39 @@ async fn api_activate_session(
     Ok(Json(SessionMutationResponse { session }))
 }
 
+/// P1-2：恢复一个已持久化会话，统一返回最近一页 thread/turn/item 历史，
+/// 让网页、CLI 和重启后的宿主使用同一份可重放快照。
+async fn api_resume_session(
+    AxumPath(session_id): AxumPath<String>,
+) -> ApiResult<Json<SessionResumeResponse>> {
+    let mut store = session_store()
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+    Ok(Json(store.resume_session(&session_id)?))
+}
+
+/// P1-2：从指定历史游标创建一个独立会话分支。
+async fn api_fork_session(
+    AxumPath(session_id): AxumPath<String>,
+    Json(payload): Json<SessionForkRequest>,
+) -> ApiResult<Json<SessionForkResponse>> {
+    let mut store = session_store()
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+    Ok(Json(store.fork_session(&session_id, payload)?))
+}
+
+/// P1-2：将会话回滚到一个已完成 turn 或 message item，后续内容不再进入上下文。
+async fn api_rollback_session(
+    AxumPath(session_id): AxumPath<String>,
+    Json(payload): Json<SessionRollbackRequest>,
+) -> ApiResult<Json<SessionRollbackResponse>> {
+    let mut store = session_store()
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+    Ok(Json(store.rollback_session(&session_id, payload)?))
+}
+
 async fn api_config_vision_agent() -> ApiResult<Json<VisionAgentConfigResponse>> {
     let store = session_store()
         .lock()
@@ -10360,6 +10895,29 @@ async fn api_session_messages(
         .lock()
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
     store.session_messages(&session_id, query)
+}
+
+/// P1-1：按 Codex harness 的 thread/turn/item 形态返回兼容历史投影。
+/// 旧的 `/messages` 保持不变；新端点只负责稳定游标和类型化 item，不改变现有存储。
+async fn api_session_history(
+    AxumPath(session_id): AxumPath<String>,
+    Query(query): Query<SessionHistoryQuery>,
+) -> ApiResult<Json<SessionHistoryResponse>> {
+    let store = session_store()
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+    store.session_history(&session_id, query)
+}
+
+/// P1-3：将同一份 thread/turn/item history 投影为稳定 JSONL，供 CLI/headless/录放测试消费。
+async fn api_session_events(
+    AxumPath(session_id): AxumPath<String>,
+    Query(query): Query<SessionHistoryQuery>,
+) -> ApiResult<Response<Body>> {
+    let store = session_store()
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+    store.session_events(&session_id, query)
 }
 
 async fn api_session_beads(
@@ -10533,7 +11091,11 @@ async fn api_session_context_preview(
         &room_history,
         &prompt,
         &[],
-        context_build_options_for_agent_with_floor(&agent, context_reset_floor),
+        context_build_options_for_agent_with_floor_and_room(
+            &agent,
+            context_reset_floor,
+            Some(&room_id),
+        ),
     )))
 }
 
@@ -10579,6 +11141,230 @@ async fn api_session_consolidate_memory(
     };
     let consolidated = consolidate_session_memory(&agent).await;
     Ok(Json(MemoryConsolidateResponse { consolidated }))
+}
+
+const MEMORY_JOB_EXTRACTION: &str = "extraction";
+const MEMORY_JOB_EDGES: &str = "edges";
+const MEMORY_JOB_CONSOLIDATION: &str = "consolidation";
+
+#[derive(Debug, Clone, Serialize)]
+struct MemoryJobDto {
+    id: String,
+    session_id: String,
+    job_type: String,
+    status: String,
+    requested_at: u64,
+    started_at: Option<u64>,
+    completed_at: Option<u64>,
+    progress: u8,
+    result_count: Option<usize>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct MemoryJobStartRequest {
+    job_type: Option<String>,
+    #[serde(default)]
+    retry: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct MemoryJobListQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryJobListResponse {
+    session: SessionSummaryDto,
+    jobs: Vec<MemoryJobDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryJobStartResponse {
+    session: SessionSummaryDto,
+    job: MemoryJobDto,
+    reused: bool,
+}
+
+/// P1-1：记忆生命周期作业的统一入口。作业记录先落 SQLite，再异步执行，
+/// 前端可轮询同一记录；失败不会静默丢失，携带 retry=true 即可重新排队。
+async fn api_session_start_memory_job(
+    AxumPath(session_id): AxumPath<String>,
+    Json(payload): Json<MemoryJobStartRequest>,
+) -> ApiResult<Json<MemoryJobStartResponse>> {
+    let job_type = normalize_memory_job_type(payload.job_type.as_deref()).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "job_type 必须是 extraction、edges 或 consolidation",
+        )
+    })?;
+    let (agent, session, path) = {
+        let store = session_store()
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+        let Some(session) = store.find_session(&session_id).cloned() else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存在"));
+        };
+        (
+            session.to_agent_session(store.is_active(&session_id)),
+            session.summary(store.is_active(&session_id)),
+            store.path.clone(),
+        )
+    };
+    let (job, reused) = create_memory_job_sqlite(&path, &session_id, job_type, payload.retry)
+        .map_err(sqlite_api_error)?;
+    if !reused {
+        let job_id = job.id.clone();
+        let session_id_for_job = session_id.clone();
+        let job_type_for_job = job_type.to_string();
+        tokio::spawn(async move {
+            run_memory_job(job_id, session_id_for_job, job_type_for_job, path, agent).await;
+        });
+    }
+    Ok(Json(MemoryJobStartResponse {
+        session,
+        job,
+        reused,
+    }))
+}
+
+async fn api_session_memory_jobs(
+    AxumPath(session_id): AxumPath<String>,
+    Query(query): Query<MemoryJobListQuery>,
+) -> ApiResult<Json<MemoryJobListResponse>> {
+    let (session, path) = {
+        let store = session_store()
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+        let Some(session) = store.find_session(&session_id) else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存在"));
+        };
+        (
+            session.summary(store.is_active(&session_id)),
+            store.path.clone(),
+        )
+    };
+    let limit = query.limit.unwrap_or(12).clamp(1, 50);
+    let jobs = list_memory_jobs_sqlite(&path, &session_id, limit).map_err(sqlite_api_error)?;
+    Ok(Json(MemoryJobListResponse { session, jobs }))
+}
+
+async fn api_session_memory_job(
+    AxumPath((session_id, job_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<MemoryJobStartResponse>> {
+    let (session, path) = {
+        let store = session_store()
+            .lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+        let Some(session) = store.find_session(&session_id) else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存在"));
+        };
+        (
+            session.summary(store.is_active(&session_id)),
+            store.path.clone(),
+        )
+    };
+    let job = get_memory_job_sqlite(&path, &session_id, &job_id)
+        .map_err(sqlite_api_error)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "记忆作业不存在"))?;
+    Ok(Json(MemoryJobStartResponse {
+        session,
+        job,
+        reused: false,
+    }))
+}
+
+async fn run_memory_job(
+    job_id: String,
+    session_id: String,
+    job_type: String,
+    path: PathBuf,
+    agent: AgentSessionDto,
+) {
+    if let Err(error) = update_memory_job_sqlite(&path, &job_id, "running", 10, None, None) {
+        warn!("memory job {job_id} could not enter running state: {error}");
+        return;
+    }
+    let result = match job_type.as_str() {
+        MEMORY_JOB_EXTRACTION => extract_session_memory(&session_id),
+        MEMORY_JOB_EDGES => Ok(build_session_edges(&agent).await),
+        MEMORY_JOB_CONSOLIDATION => Ok(consolidate_session_memory(&agent).await),
+        _ => Err("unsupported memory job type".to_string()),
+    };
+    match result {
+        Ok(count) => {
+            if let Err(error) =
+                update_memory_job_sqlite(&path, &job_id, "succeeded", 100, Some(count), None)
+            {
+                warn!("memory job {job_id} success state could not be persisted: {error}");
+            }
+        }
+        Err(error) => {
+            if let Err(persist_error) =
+                update_memory_job_sqlite(&path, &job_id, "failed", 100, None, Some(&error))
+            {
+                warn!("memory job {job_id} failure state could not be persisted: {persist_error}");
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateMemoryModeRequest {
+    memory_mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionMemoryModeResponse {
+    session: SessionSummaryDto,
+    memory_mode: String,
+    updated_at: u64,
+}
+
+/// P1-1：更新会话级 memory mode，并让下一次上下文装配获得新的 snapshot 身份。
+async fn api_session_memory_mode(
+    AxumPath(session_id): AxumPath<String>,
+    Json(payload): Json<UpdateMemoryModeRequest>,
+) -> ApiResult<Json<SessionMemoryModeResponse>> {
+    let requested = payload
+        .memory_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if !is_valid_memory_mode(requested) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "memory_mode 必须是 enabled、disabled 或 polluted",
+        ));
+    }
+    let mode = normalize_memory_mode(requested).to_string();
+    let mut store = session_store()
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "会话存储锁已损坏"))?;
+    let now = unix_timestamp_millis();
+    {
+        let Some(session) = store
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存在"));
+        };
+        session.updated_at = now;
+    }
+    // 先保存会话更新时间，再写侧表；侧表通过 session_id 与会话保持同一工作区生命周期。
+    store.save()?;
+    set_session_memory_mode_sqlite(&default_session_sqlite_path(), &session_id, &mode)
+        .map_err(sqlite_api_error)?;
+    let Some(session) = store.find_session(&session_id) else {
+        return Err(api_error(StatusCode::NOT_FOUND, "会话不存在"));
+    };
+    Ok(Json(SessionMemoryModeResponse {
+        session: session.summary(store.is_active(&session_id)),
+        memory_mode: mode,
+        updated_at: now,
+    }))
 }
 
 async fn api_session_add_bead(
@@ -12416,11 +13202,8 @@ fn clawbot_continue_task(
             format!("任务 {} 已处于终态 {}，不能继续。", goal.id, goal.status),
         ));
     }
-    let status = resume_goal_sqlite(
-        &default_session_sqlite_path(),
-        &binding.workspace_id,
-        &goal.id,
-    )
+    let db_path = default_session_sqlite_path();
+    let status = resume_goal_sqlite(&db_path, &binding.workspace_id, &goal.id)
     .map_err(|error| {
         ClawbotRuntimeCommandError::new("task_resume_failed", api_error_message(error))
     })?;
@@ -12433,7 +13216,7 @@ fn clawbot_continue_task(
     let loop_started = cancel.is_some();
     if let Some(cancel) = cancel {
         record_goal_loop_event_sqlite(
-            &default_session_sqlite_path(),
+            &db_path,
             &binding.workspace_id,
             &goal.id,
             "goal-loop-started",
@@ -12447,8 +13230,9 @@ fn clawbot_continue_task(
         );
         let workspace_id = binding.workspace_id.clone();
         let goal_id = goal.id.clone();
+        let db_path = db_path.clone();
         tokio::spawn(async move {
-            run_goal_loop_background(workspace_id, goal_id, max_steps, cancel).await;
+            run_goal_loop_background(workspace_id, goal_id, db_path, max_steps, cancel).await;
         });
     }
     Ok(format!(
@@ -12469,15 +13253,18 @@ fn clawbot_stop_task(
     selector: &str,
 ) -> Result<String, ClawbotRuntimeCommandError> {
     let (binding, goal) = clawbot_resolve_task_goal(message, selector, true)?;
-    let loop_status = request_goal_loop_stop(&goal.id);
+    let db_path = default_session_sqlite_path();
     let status = pause_goal_sqlite(
-        &default_session_sqlite_path(),
+        &db_path,
         &binding.workspace_id,
         &goal.id,
     )
     .map_err(|error| {
         ClawbotRuntimeCommandError::new("task_stop_failed", api_error_message(error))
     })?;
+    // pause_goal_sqlite 已在 DB commit 后发出 scoped signal；这里只读取同一
+    // workspace 的 loop 状态生成兼容旧协议的文字，不提前改变内存状态。
+    let loop_status = goal_loop_status_scoped(&binding.workspace_id, &goal.id);
     Ok(format!(
         "已停止任务：{}\nID: {}\n状态：{}\n运行循环停止请求：{}",
         goal.title,
@@ -13952,6 +14739,140 @@ async fn api_goal_status(
     Ok(Json(status))
 }
 
+fn run_event_cursor(query: &RunEventsQuery, headers: &HeaderMap) -> i64 {
+    if let Some(after) = query.after {
+        return after;
+    }
+    headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(0)
+}
+
+fn runtime_run_sse_event(event: &RuntimeRunEventDto) -> Event {
+    Event::default()
+        .id(event.id.to_string())
+        .event(&event.event_type)
+        .data(
+            serde_json::to_string(event)
+                .unwrap_or_else(|error| format!(r#"{{"error":"failed to serialize event: {error}"}}"#)),
+        )
+}
+
+async fn api_run_status(
+    AxumPath(run_id): AxumPath<String>,
+) -> ApiResult<Json<RunStatusDto>> {
+    let run_id = run_id.trim();
+    if run_id.is_empty() {
+        return Err(api_error(StatusCode::NOT_FOUND, "运行记录不存在"));
+    }
+    let path = default_session_sqlite_path();
+    let Some(run) = query_runtime_run_sqlite(&path, run_id).map_err(sqlite_api_error)? else {
+        return Err(api_error(StatusCode::NOT_FOUND, "运行记录不存在"));
+    };
+    Ok(Json(runtime_run_status_from_record(&run)))
+}
+
+async fn api_run_events(
+    AxumPath(run_id): AxumPath<String>,
+    Query(query): Query<RunEventsQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Sse<impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>>>> {
+    let run_id = run_id.trim().to_string();
+    if run_id.is_empty() {
+        return Err(api_error(StatusCode::NOT_FOUND, "运行记录不存在"));
+    }
+    // 必须先订阅，再查询历史，避免查询与订阅之间漏掉刚 commit 的事件。
+    let mut receiver = subscribe_runtime_run_events();
+    let cursor = run_event_cursor(&query, &headers);
+    let path = default_session_sqlite_path();
+    let Some(_) = query_runtime_run_sqlite(&path, &run_id).map_err(sqlite_api_error)? else {
+        return Err(api_error(StatusCode::NOT_FOUND, "运行记录不存在"));
+    };
+    let initial_events =
+        query_runtime_run_events_sqlite(&path, &run_id, cursor).map_err(sqlite_api_error)?;
+    let stream_run_id = run_id.clone();
+    let stream_path = path.clone();
+    let stream = async_stream::stream! {
+        let mut stream_cursor = cursor;
+        yield Ok::<Event, std::convert::Infallible>(
+            sse_json_event("hello", &json!({ "run_id": stream_run_id.clone(), "after": stream_cursor }))
+        );
+        for event in initial_events {
+            stream_cursor = stream_cursor.max(event.id);
+            yield Ok(runtime_run_sse_event(&event));
+        }
+        loop {
+            match receiver.recv().await {
+                Ok(event) if event.run_id == stream_run_id && event.id > stream_cursor => {
+                    stream_cursor = event.id;
+                    yield Ok(runtime_run_sse_event(&event));
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    match query_runtime_run_events_sqlite(&stream_path, &stream_run_id, stream_cursor) {
+                        Ok(events) => {
+                            for event in events {
+                                stream_cursor = stream_cursor.max(event.id);
+                                yield Ok(runtime_run_sse_event(&event));
+                            }
+                        }
+                        Err(error) => {
+                            yield Ok(sse_json_event("error", &json!({ "error": error.to_string() })));
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Ok(Sse::new(stream))
+}
+
+async fn api_run_interrupt(
+    AxumPath(run_id): AxumPath<String>,
+    Json(payload): Json<RunInterruptRequest>,
+) -> ApiResult<Json<RunInterruptResponse>> {
+    let run_id = run_id.trim();
+    if run_id.is_empty() {
+        return Err(api_error(StatusCode::NOT_FOUND, "运行记录不存在"));
+    }
+    let path = default_session_sqlite_path();
+    let response = interrupt_runtime_run_sqlite(&path, run_id, payload.reason.as_deref())
+        .map_err(|error| {
+            if matches!(error, rusqlite::Error::QueryReturnedNoRows) {
+                api_error(StatusCode::NOT_FOUND, "运行记录不存在")
+            } else {
+                sqlite_api_error(error)
+            }
+    })?;
+    signal_runtime_run_after_interrupt(&path, &response);
+    Ok(Json(response))
+}
+
+/// interrupt 的 SQLite CAS commit 后才触发内存 worker 优化；查询也固定在同一
+/// captured DB path。Goal phase 必须用 run 自带的 workspace+goal 做 scoped signal，
+/// chat run 则保留 ChatTurn 的取消优化。任何查询失败都不把 Goal 误判成 chat，
+/// 但 SQLite 的 stop_requested 事实仍然已经持久化。
+fn signal_runtime_run_after_interrupt(path: &Path, response: &RunInterruptResponse) {
+    if response.state != "stop_requested" {
+        return;
+    }
+    let Ok(Some(run)) = query_runtime_run_sqlite(path, &response.run_id) else {
+        return;
+    };
+    if run.kind == "goal_phase" {
+        if let Some(goal_id) = run.goal_id.as_deref() {
+            request_goal_loop_stop_scoped(&run.workspace_id, goal_id);
+        }
+    } else {
+        request_chat_turn_by_run_id(&response.run_id);
+    }
+}
+
 async fn api_goal_events(
     AxumPath(goal_id): AxumPath<String>,
 ) -> ApiResult<Sse<impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>>>> {
@@ -14215,7 +15136,8 @@ async fn api_run_goal_phase(
 ) -> ApiResult<Json<GoalPhaseRunResponse>> {
     let workspace = active_workspace_path();
     let workspace_id = workspace_identity(&workspace);
-    let result = run_goal_phase_once(&workspace_id, &goal_id, &phase_id).await?;
+    let db_path = default_session_sqlite_path();
+    let result = run_goal_phase_once(&workspace_id, &goal_id, &phase_id, &db_path).await?;
     Ok(Json(result))
 }
 
@@ -14262,7 +15184,7 @@ async fn api_run_next_goal_phase(
         }));
     };
 
-    let result = run_goal_phase_once(&workspace_id, &goal_id, &phase_id).await?;
+    let result = run_goal_phase_once(&workspace_id, &goal_id, &phase_id, &db_path).await?;
     Ok(Json(GoalRunNextResponse {
         goal_id,
         ran_phase_id: Some(result.phase_id.clone()),
@@ -14319,7 +15241,7 @@ async fn api_run_all_goal_phases(
             break;
         };
 
-        let result = run_goal_phase_once(&workspace_id, &goal_id, &phase_id).await?;
+        let result = run_goal_phase_once(&workspace_id, &goal_id, &phase_id, &db_path).await?;
         status = result.status.clone();
         runs.push(result);
 
@@ -14369,8 +15291,9 @@ async fn api_goal_loop_start(
         );
         let workspace_id = workspace_id.clone();
         let goal_id = goal_id.clone();
+        let db_path = db_path.clone();
         tokio::spawn(async move {
-            run_goal_loop_background(workspace_id, goal_id, max_steps, cancel).await;
+            run_goal_loop_background(workspace_id, goal_id, db_path, max_steps, cancel).await;
         });
     }
     Ok(Json(status))
@@ -14382,8 +15305,16 @@ async fn api_goal_loop_stop(
     let workspace = active_workspace_path();
     let workspace_id = workspace_identity(&workspace);
     let db_path = default_session_sqlite_path();
-    let status = request_goal_loop_stop(&goal_id);
-    if status.workspace_id.as_deref() == Some(workspace_id.as_str()) && status.stop_requested {
+    // 先在 captured DB 中提交 durable Goal-phase stop request，再设置内存
+    // AtomicBool；DB 失败时不能留下只有内存可见的半停止状态。
+    request_goal_phase_stop_requests_sqlite(
+        &db_path,
+        &workspace_id,
+        &goal_id,
+        Some("Goal loop stop requested by user."),
+    )?;
+    let (status, newly_requested) = request_goal_loop_stop_scoped_with_transition(&workspace_id, &goal_id);
+    if newly_requested {
         record_goal_loop_event_sqlite(
             &db_path,
             &workspace_id,
@@ -14403,16 +15334,17 @@ async fn api_goal_loop_stop(
 async fn api_goal_loop_status(
     AxumPath(goal_id): AxumPath<String>,
 ) -> ApiResult<Json<GoalLoopStatusResponse>> {
-    Ok(Json(goal_loop_status(&goal_id)))
+    let workspace_id = workspace_identity(&active_workspace_path());
+    Ok(Json(goal_loop_status_scoped(&workspace_id, &goal_id)))
 }
 
 async fn run_goal_loop_background(
     workspace_id: String,
     goal_id: String,
+    db_path: PathBuf,
     max_steps: usize,
     cancel: Arc<AtomicBool>,
 ) {
-    let db_path = default_session_sqlite_path();
     let mut completed_steps = 0usize;
     let mut stopped_reason =
         "Step limit reached before the goal reached a terminal state.".to_string();
@@ -14435,7 +15367,12 @@ async fn run_goal_loop_background(
                     "stop_requested": cancel.load(Ordering::SeqCst),
                 }),
             );
-            finish_goal_loop_status(&goal_id, completed_steps, stopped_reason);
+            finish_goal_loop_status_scoped(
+                &workspace_id,
+                &goal_id,
+                completed_steps,
+                stopped_reason,
+            );
             return;
         }
     };
@@ -14496,15 +15433,22 @@ async fn run_goal_loop_background(
             break;
         };
 
-        match run_goal_phase_once(&workspace_id, &goal_id, &phase_id).await {
+        match run_goal_phase_once(&workspace_id, &goal_id, &phase_id, &db_path).await {
             Ok(result) => {
                 completed_steps += 1;
-                mark_goal_loop_progress(&goal_id, completed_steps);
+                mark_goal_loop_progress_scoped(&workspace_id, &goal_id, completed_steps);
                 status = result.status;
             }
             Err(error) => {
-                stopped_reason =
-                    format!("Goal loop phase run failed: {}", api_error_message(error));
+                if cancel.load(Ordering::SeqCst) || goal_phase_stop_conflict(&error) {
+                    stopped_reason = format!(
+                        "Goal phase stop requested; loop stopped without retrying: {}",
+                        api_error_message(error)
+                    );
+                } else {
+                    stopped_reason =
+                        format!("Goal loop phase run failed: {}", api_error_message(error));
+                }
                 break;
             }
         }
@@ -14531,13 +15475,14 @@ async fn run_goal_loop_background(
             "goal_status": status.goal.status,
         }),
     );
-    finish_goal_loop_status(&goal_id, completed_steps, stopped_reason);
+    finish_goal_loop_status_scoped(&workspace_id, &goal_id, completed_steps, stopped_reason);
 }
 
 async fn run_goal_phase_once(
     workspace_id: &str,
     goal_id: &str,
     phase_id: &str,
+    expected_db_path: &Path,
 ) -> ApiResult<GoalPhaseRunResponse> {
     let phase_trace = diagnostics::TraceIdType::generate().to_hex();
     let phase_started = std::time::Instant::now();
@@ -14552,16 +15497,22 @@ async fn run_goal_phase_once(
             ("phase", phase_id.to_string()),
         ],
     );
-    let (run_context, db_path) = {
+    let run_context = {
         let mut store = session_store().lock().map_err(|_| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "session store lock poisoned",
             )
         })?;
+        if store.path != expected_db_path {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "session store changed workspace before Goal phase execution",
+            ));
+        }
         store.save()?;
         let ctx = store.prepare_goal_phase_run_context(&workspace_id, &goal_id, &phase_id)?;
-        (ctx, store.path.clone())
+        ctx
     };
     let model_response = agent_chat_response(
         &run_context.agent,
@@ -14573,10 +15524,13 @@ async fn run_goal_phase_once(
         Some(&run_context.chat_room_id),
     )
     .await;
+    // context usage 只作为 commit 后 lifecycle 的输入保存；在 finalizer 的
+    // ownership CAS 之前绝不能触碰 SessionStore / SQLite / memory。
+    let context_usage = model_response.context_usage.clone();
     let mut tool_messages = Vec::new();
     for (tool_use_id, name, input) in model_response.tool_requests.clone() {
-        tool_messages.push(
-            run_model_tool_use_message(
+        tool_messages.extend(
+            run_model_tool_use_messages(
                 &run_context.agent,
                 &tool_use_id,
                 &name,
@@ -14589,8 +15543,13 @@ async fn run_goal_phase_once(
     }
     // 确定性命令门控：在不持 session_store 锁时异步执行（cargo build/test 等可能耗时数十秒），
     // 失败证据作为参数传入 record，由其决定回退到 implementer 还是推进完成。
-    let command_failures =
-        run_goal_phase_command_gate(&db_path, &workspace_id, &goal_id, &phase_id).await;
+    let command_failures = run_goal_phase_command_gate(
+        &run_context.db_path,
+        &workspace_id,
+        &run_context.goal_id,
+        &run_context.phase_id,
+    )
+    .await;
     let result = {
         let mut store = session_store().lock().map_err(|_| {
             api_error(
@@ -14598,17 +15557,46 @@ async fn run_goal_phase_once(
                 "session store lock poisoned",
             )
         })?;
-        store.record_goal_phase_model_result(
+        // `record_goal_phase_model_result_at_path` 保留给历史 fixture；真实 worker 必须把
+        // captured db_path/run_id/claim_token 一起交给 token-aware finalizer。
+        store.record_goal_phase_model_result_at_path_with_claim(
+            &run_context.db_path,
             &workspace_id,
-            &goal_id,
-            &phase_id,
+            &run_context.goal_id,
+            &run_context.phase_id,
+            &run_context.run_id,
+            &run_context.claim_token,
             &run_context.agent,
             model_response,
             tool_messages,
             command_failures,
         )?
     };
-    persist_auto_memory_beads(&result.messages);
+    if result.memory_eligible {
+        // context lifecycle 是提交后的附加动作；路径漂移时只保留 captured DB 的事实，
+        // 不把旧 worker 的 context/memory 写进当前 workspace。
+        if let Some(snapshot) = context_usage.as_ref() {
+            if let Ok(mut store) = session_store().lock() {
+                if store.path == run_context.db_path {
+                    if let Err(error) = store.apply_context_lifecycle_after_turn(
+                        &run_context.agent.id,
+                        &run_context.chat_room_id,
+                        snapshot,
+                        context_lifecycle_policy(),
+                    ) {
+                        diag!(
+                            "[CONTEXT-LIFECYCLE] committed Goal result follow-up failed for agent={} goal={} phase={}: {}",
+                            run_context.agent.id,
+                            goal_id,
+                            phase_id,
+                            error.1.error
+                        );
+                    }
+                }
+            }
+        }
+        persist_auto_memory_beads_at_path(Some(&run_context.db_path), &result.messages);
+    }
     diagnostics::info(
         "goal",
         "phase.ok",
@@ -14896,6 +15884,25 @@ async fn relay_run_one(
             diagnostic_note: response.diagnostic_note,
         },
     }
+}
+
+/// 可协作中断的接力单步。取消后丢弃当前异步模型调用；已进入
+/// `spawn_blocking`/外部同步插件的工作只能让其自然收尾，调用方不会接收其结果。
+async fn relay_run_one_with_cancel(
+    agent: &AgentSessionDto,
+    result: &PreparedChatDispatch,
+    index: usize,
+    accumulated: &[(String, usize, String)],
+    cancellation: &ChatTurnCancellation,
+) -> Result<RelayStepOutcome, ChatTurnCancelled> {
+    if cancellation.is_requested() {
+        return Err(ChatTurnCancelled);
+    }
+    await_chat_turn(
+        cancellation,
+        relay_run_one(agent, result, index, accumulated),
+    )
+    .await
 }
 
 /// 把一次成功的接力回复（含可选推理）落入消息/任务列表。
@@ -15211,8 +16218,8 @@ async fn api_chat_send(
             });
         }
         for (tool_use_id, name, input) in effective_tool_requests {
-            messages.push(
-                run_model_tool_use_message(
+            messages.extend(
+                run_model_tool_use_messages(
                     agent,
                     &tool_use_id,
                     &name,
@@ -15325,19 +16332,210 @@ async fn api_chat_send(
     }))
 }
 
+fn chat_stream_done(
+    result: &PreparedChatDispatch,
+    turn_id: &str,
+    status: ChatTurnStatus,
+    tasks: Vec<AgentTaskDto>,
+) -> ChatStreamDone {
+    ChatStreamDone {
+        turn_id: turn_id.to_string(),
+        run_id: None,
+        status,
+        accepted_agent_ids: result
+            .targets
+            .iter()
+            .map(|agent| agent.id.clone())
+            .collect(),
+        tasks,
+    }
+}
+
+async fn api_chat_turn_interrupt(
+    Json(payload): Json<ChatTurnInterruptRequest>,
+) -> ApiResult<Json<ChatTurnInterruptResponse>> {
+    let turn_id = payload.turn_id.trim();
+    let chat_room_id = payload.chat_room_id.trim();
+    let requested_session_id = normalized_scope_value(payload.session_id.as_deref());
+    if turn_id.is_empty() || chat_room_id.is_empty() || requested_session_id.is_none() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "session_id、chat_room_id、turn_id 均必须提供有效值",
+        ));
+    }
+
+    // 新 durable turn 先按完整 scope 做 SQLite stop CAS，再触发同进程 cancellation。
+    // 这样错误 session/room 永远不会先唤醒内存 worker；仅查不到 DB row 时才进入
+    // 迁移期间的旧 registry fallback。
+    let workspace_id = workspace_identity(&active_workspace_path());
+    let db_path = default_session_sqlite_path();
+    if let Some(run) = query_chat_runtime_run_by_scope_sqlite(
+        &db_path,
+        &workspace_id,
+        requested_session_id.as_deref(),
+        chat_room_id,
+        turn_id,
+    )
+    .map_err(sqlite_api_error)?
+    {
+        let response = interrupt_runtime_run_sqlite(&db_path, &run.id, None).map_err(|error| {
+            if matches!(error, rusqlite::Error::QueryReturnedNoRows) {
+                api_error(StatusCode::NOT_FOUND, "目标聊天 turn 不存在或已结束")
+            } else {
+                sqlite_api_error(error)
+            }
+        })?;
+        if response.state == "stop_requested" {
+            request_chat_turn_by_run_id(&response.run_id);
+        }
+        let status = match response.state.as_str() {
+            "accepted" | "running" => ChatTurnStatus::Running,
+            "stop_requested" => ChatTurnStatus::InterruptRequested,
+            "completed" => ChatTurnStatus::Completed,
+            "failed" => ChatTurnStatus::Failed,
+            "interrupted" | "orphaned" => ChatTurnStatus::Interrupted,
+            _ => ChatTurnStatus::Failed,
+        };
+        return Ok(Json(ChatTurnInterruptResponse {
+            turn_id: turn_id.to_string(),
+            status,
+            outcome: response.outcome,
+            idempotent: response.idempotent,
+        }));
+    }
+
+    // 兼容迁移前或 accepted 写入与 registry 建立之间的极短窗口；此分支仍严格
+    // 校验 session/room/turn，且只操作同进程内没有 DB row 的旧条目。
+    let mut registry = chat_turn_registry()
+        .lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "聊天 turn 注册表锁已损坏"))?;
+    prune_chat_turn_registry(&mut registry);
+    let Some(entry) = registry.get_mut(turn_id) else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "未找到目标聊天 turn，可能已过期或已清理",
+        ));
+    };
+    if entry.chat_room_id != chat_room_id
+        || normalized_scope_value(entry.session_id.as_deref()) != requested_session_id
+    {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "目标聊天 turn 不存在或作用域不匹配",
+        ));
+    }
+
+    let (status, outcome, idempotent) = match entry.status {
+        ChatTurnStatus::Running => {
+            entry.status = ChatTurnStatus::InterruptRequested;
+            entry.cancellation.request();
+            (
+                ChatTurnStatus::InterruptRequested,
+                "interrupt_requested".to_string(),
+                false,
+            )
+        }
+        ChatTurnStatus::InterruptRequested => {
+            entry.cancellation.request();
+            (
+                ChatTurnStatus::InterruptRequested,
+                "interrupt_requested".to_string(),
+                true,
+            )
+        }
+        terminal => (terminal, "already_finished".to_string(), true),
+    };
+    Ok(Json(ChatTurnInterruptResponse {
+        turn_id: turn_id.to_string(),
+        status,
+        outcome,
+        idempotent,
+    }))
+}
+
 async fn api_chat_send_stream(
     Json(payload): Json<SendMessageRequest>,
 ) -> ApiResult<Sse<impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>>>> {
     let result = prepare_chat_dispatch(payload)?;
+    let turn_id = new_chat_turn_id();
+    let db_path = default_session_sqlite_path();
+    let workspace_id = workspace_identity(&active_workspace_path());
+    let (run_id, claim_token) = new_runtime_run_identifiers()
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error))?;
+    create_chat_runtime_run_sqlite(
+        &db_path,
+        &run_id,
+        &claim_token,
+        &workspace_id,
+        result.conversation_session_id.as_deref(),
+        &result.chat_room_id,
+        &turn_id,
+    )
+    .map_err(sqlite_api_error)?;
+    let cancellation = register_chat_turn_with_run(
+        &turn_id,
+        Some(run_id.clone()),
+        result.conversation_session_id.clone(),
+        result.chat_room_id.clone(),
+    );
     let stream = async_stream::stream! {
+        let mut turn_guard = ChatTurnGuard::new_runtime(
+            turn_id.clone(),
+            run_id.clone(),
+            claim_token.clone(),
+            db_path.clone(),
+        );
+        let mut terminal_status = ChatTurnStatus::Completed;
+        let mut tasks = result.tasks.clone();
+        'chat_turn: {
+        match start_chat_runtime_run_sqlite(&db_path, &run_id, &claim_token) {
+            Ok(true) => {}
+            Ok(false) => {
+                terminal_status = if cancellation.is_requested() {
+                    ChatTurnStatus::Interrupted
+                } else {
+                    ChatTurnStatus::Failed
+                };
+                break 'chat_turn;
+            }
+            Err(error) => {
+                let message = format!("聊天运行启动持久化失败: {error}");
+                emit_backend_pet_event("chat.failed", Some(&message), "chat");
+                yield Ok(sse_json_event("error", &ChatStreamError { message }));
+                terminal_status = ChatTurnStatus::Failed;
+                break 'chat_turn;
+            }
+        }
         emit_backend_pet_event(
             "chat.started",
             Some("Chat stream accepted"),
             "chat",
         );
+        yield Ok(sse_json_event("started", &ChatStreamStarted {
+            turn_id: turn_id.clone(),
+            run_id: Some(run_id.clone()),
+        }));
         let mut messages = result.messages.clone();
-        let mut tasks = result.tasks.clone();
+        let initial_message_count = messages.len();
         let mut auto_handoff_candidates = Vec::new();
+
+        // 先落盘用户消息，使显式中断不会丢失输入；后续终态只写新增 assistant/tool 消息。
+        if let Err(error) = persist_chat_dispatch(
+            &result.chat_room_id,
+            result.conversation_session_id.as_deref(),
+            &result.targets,
+            result.messages.clone(),
+        ) {
+            let message = format!("消息持久化失败: {}", error.1.error);
+            emit_backend_pet_event("chat.failed", Some(&message), "chat");
+            yield Ok(sse_json_event("error", &ChatStreamError { message }));
+            terminal_status = ChatTurnStatus::Failed;
+            break 'chat_turn;
+        }
+        if cancellation.is_requested() {
+            terminal_status = ChatTurnStatus::Interrupted;
+            break 'chat_turn;
+        }
 
         for message in &messages {
             yield Ok(sse_json_event("message", message));
@@ -15346,14 +16544,28 @@ async fn api_chat_send_stream(
         // 取消广播：多目标群发统一走接力（按配置顺序逐会话；后者见前者回复；超时跳过+各重试一次）。
         // 流式下逐会话 await 完成即 yield 整条消息（非逐 token），并 R3 增量持久化。
         if result.targets.len() > 1 {
-            persist_relay_step(&result, &result.messages);
             let mut accumulated: Vec<(String, usize, String)> = Vec::new();
             let mut retry_indices: Vec<usize> = Vec::new();
             // 第一轮接力。
             for (index, agent) in result.targets.iter().enumerate() {
                 let mut step_msgs: Vec<ChatMessageDto> = Vec::new();
                 let mut step_tasks: Vec<AgentTaskDto> = Vec::new();
-                match relay_run_one(agent, &result, index, &accumulated).await {
+                let relay_outcome = match relay_run_one_with_cancel(
+                    agent,
+                    &result,
+                    index,
+                    &accumulated,
+                    cancellation.as_ref(),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
+                };
+                match relay_outcome {
                     RelayStepOutcome::Reply { answer, reasoning, used_real_model, diagnostic_note } => {
                         relay_push_reply(&mut step_msgs, &mut step_tasks, agent, index, &answer, &reasoning, used_real_model, diagnostic_note);
                         accumulated.push((agent.display_name.clone(), index + 1, answer));
@@ -15363,6 +16575,10 @@ async fn api_chat_send_stream(
                         step_msgs.push(relay_note_message(agent, index, "超时未回复，将在后续会话完成后重新排队重试一次"));
                         retry_indices.push(index);
                     }
+                }
+                if cancellation.is_requested() {
+                    terminal_status = ChatTurnStatus::Interrupted;
+                    break 'chat_turn;
                 }
                 persist_relay_step(&result, &step_msgs);
                 for m in &step_msgs { yield Ok(sse_json_event("message", m)); }
@@ -15374,7 +16590,22 @@ async fn api_chat_send_stream(
                 let agent = result.targets[index].clone();
                 let mut step_msgs: Vec<ChatMessageDto> = Vec::new();
                 let mut step_tasks: Vec<AgentTaskDto> = Vec::new();
-                match relay_run_one(&agent, &result, index, &accumulated).await {
+                let relay_outcome = match relay_run_one_with_cancel(
+                    &agent,
+                    &result,
+                    index,
+                    &accumulated,
+                    cancellation.as_ref(),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
+                };
+                match relay_outcome {
                     RelayStepOutcome::Reply { answer, reasoning, used_real_model, diagnostic_note } => {
                         relay_push_reply(&mut step_msgs, &mut step_tasks, &agent, index, &answer, &reasoning, used_real_model, diagnostic_note);
                         accumulated.push((agent.display_name.clone(), index + 1, answer));
@@ -15383,50 +16614,87 @@ async fn api_chat_send_stream(
                         step_msgs.push(relay_note_message(&agent, index, "重试仍超时，已结束（每会话仅一次重试机会）"));
                     }
                 }
+                if cancellation.is_requested() {
+                    terminal_status = ChatTurnStatus::Interrupted;
+                    break 'chat_turn;
+                }
                 persist_relay_step(&result, &step_msgs);
                 for m in &step_msgs { yield Ok(sse_json_event("message", m)); }
                 messages.extend(step_msgs);
                 tasks.extend(step_tasks);
             }
+            if cancellation.is_requested() {
+                terminal_status = ChatTurnStatus::Interrupted;
+                break 'chat_turn;
+            }
             persist_auto_memory_beads(&messages);
             persist_reference_forward_memory(&result.reference_context, &result.targets);
             persist_group_send_shared_memory(&result.reference_context, &result.targets);
-            emit_backend_pet_event("chat.completed", Some("Relay chat stream completed"), "chat");
-            yield Ok(sse_json_event("done", &ChatStreamDone {
-                accepted_agent_ids: result.targets.iter().map(|agent| agent.id.clone()).collect(),
-                tasks,
-            }));
-            return;
+            break 'chat_turn;
         }
 
         for (index, agent) in result.targets.iter().enumerate() {
+            if cancellation.is_requested() {
+                terminal_status = ChatTurnStatus::Interrupted;
+                break 'chat_turn;
+            }
             // 图片生成会话：走 images 端点生成图片附件，yield 一条消息后跳过文本流式。
             if agent_media_gen_kind(agent) == Some("image") {
-                let image_message = image_generation_chat_message(
-                    agent,
-                    &result.user_content,
-                    index,
-                    result.image_urls.first().map(String::as_str),
+                let image_message = match await_chat_turn(
+                    cancellation.as_ref(),
+                    image_generation_chat_message(
+                        agent,
+                        &result.user_content,
+                        index,
+                        result.image_urls.first().map(String::as_str),
+                    ),
                 )
-                .await;
+                .await
+                {
+                    Ok(message) => message,
+                    Err(_) => {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
+                };
+                if cancellation.is_requested() {
+                    terminal_status = ChatTurnStatus::Interrupted;
+                    break 'chat_turn;
+                }
                 yield Ok(sse_json_event("message", &image_message));
                 messages.push(image_message);
                 continue;
             }
             // 视频生成会话：异步 videos 端点（提交 + 轮询）生成视频，yield 一条消息后跳过文本流式。
             if agent_media_gen_kind(agent) == Some("video") {
-                let video_message = video_pending_chat_message(
-                    agent,
-                    &result.user_content,
-                    index,
-                    result.image_urls.first().map(String::as_str),
+                let video_message = match await_chat_turn(
+                    cancellation.as_ref(),
+                    video_pending_chat_message(
+                        agent,
+                        &result.user_content,
+                        index,
+                        result.image_urls.first().map(String::as_str),
+                    ),
                 )
-                .await;
+                .await
+                {
+                    Ok(message) => message,
+                    Err(_) => {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
+                };
+                if cancellation.is_requested() {
+                    terminal_status = ChatTurnStatus::Interrupted;
+                    break 'chat_turn;
+                }
                 yield Ok(sse_json_event("message", &video_message));
                 messages.push(video_message);
                 continue;
             }
             let task_id = format!("task-{}-{index}", unix_timestamp_millis());
+            // 流式路径没有包在 agent_chat_response 的 TURN_TRACE scope 中，显式生成并贯穿本轮。
+            let stream_turn_id = diagnostics::TraceIdType::generate().to_hex();
             let assistant_id = format!("msg-{}-{index}", unix_timestamp_millis());
             let reasoning_id = format!("{assistant_id}-thinking");
             let mut model_tool_calls: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
@@ -15488,22 +16756,58 @@ async fn api_chat_send_stream(
                     "真实模型未启用 (coolzhu.toml model.enable_real_llm=false)",
                 );
                 assistant_started = true;
+                if cancellation.is_requested() {
+                    terminal_status = ChatTurnStatus::Interrupted;
+                    break 'chat_turn;
+                }
                 yield Ok(sse_json_event("message_replace", &assistant_message));
             } else {
-                match stream_agent_model(
-                    agent,
-                    &result.user_content,
-                    &result.image_urls,
-                    &result.context_history,
-                    result.context_rosters.get(&agent.id),
-                    Some(&result.chat_room_id),
+                let stream_result = match await_chat_turn(
+                    cancellation.as_ref(),
+                    stream_agent_model(
+                        agent,
+                        &result.user_content,
+                        &result.image_urls,
+                        &result.context_history,
+                        result.context_rosters.get(&agent.id),
+                        &stream_turn_id,
+                        Some(&result.chat_room_id),
+                    ),
                 )
-                .await {
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
+                };
+                match stream_result {
                     Ok((mut model_stream, assembly)) => {
+                        if cancellation.is_requested() {
+                            terminal_status = ChatTurnStatus::Interrupted;
+                            break 'chat_turn;
+                        }
                         used_real_model = true;
                         let mut reasoning_started = false;
                         loop {
-                            match model_stream.next_event().await {
+                            let next_event = match await_chat_turn(
+                                cancellation.as_ref(),
+                                model_stream.next_event(),
+                            )
+                            .await
+                            {
+                                Ok(event) => event,
+                                Err(_) => {
+                                    terminal_status = ChatTurnStatus::Interrupted;
+                                    break 'chat_turn;
+                                }
+                            };
+                            if cancellation.is_requested() {
+                                terminal_status = ChatTurnStatus::Interrupted;
+                                break 'chat_turn;
+                            }
+                            match next_event {
                                 Ok(Some(event)) => match event {
                                     StreamEvent::ContentBlockDelta(delta) => match delta.delta {
                                             ContentBlockDelta::TextDelta { text } => {
@@ -15633,7 +16937,7 @@ async fn api_chat_send_stream(
                                                 &delta.usage,
                                             );
                                         }
-                                    }
+                                    },
                                 Ok(None) => break,
                                 Err(error) => {
                                     diagnostic_note = Some(format!("模型流式响应中断: {error}"));
@@ -15671,11 +16975,19 @@ async fn api_chat_send_stream(
                                 "模型流式响应为空",
                             );
                             assistant_started = true;
+                            if cancellation.is_requested() {
+                                terminal_status = ChatTurnStatus::Interrupted;
+                                break 'chat_turn;
+                            }
                             yield Ok(sse_json_event("message_replace", &assistant_message));
                         }
                         stream_context_assembly = Some(assembly);
                     }
                     Err(error) => {
+                        if cancellation.is_requested() {
+                            terminal_status = ChatTurnStatus::Interrupted;
+                            break 'chat_turn;
+                        }
                         diag!("[LLM-CHAIN-STREAM] model call FAILED: {error:?}");
                         let hint = real_model_error_hint(agent, &error);
                         diagnostic_note = Some(hint.clone());
@@ -15687,9 +16999,18 @@ async fn api_chat_send_stream(
                             &hint,
                         );
                         assistant_started = true;
+                        if cancellation.is_requested() {
+                            terminal_status = ChatTurnStatus::Interrupted;
+                            break 'chat_turn;
+                        }
                         yield Ok(sse_json_event("message_replace", &assistant_message));
                     }
                 }
+            }
+
+            if cancellation.is_requested() {
+                terminal_status = ChatTurnStatus::Interrupted;
+                break 'chat_turn;
             }
 
             // REQ-LLM-003 / Phase C-13: tool result feedback loop（流"ToolResult 版）
@@ -15738,14 +17059,26 @@ async fn api_chat_send_stream(
                         "tool_call_count": parsed_tool_calls.len()
                     }),
                 );
-                let dispatches = dispatch_model_tool_calls_parallel(
+                let dispatches = match dispatch_model_tool_calls_parallel_with_cancel(
                     parsed_tool_calls,
                     "[TOOL-LOOP-STREAM]",
                     Some(agent.id.clone()),
-                    result.messages.first().map(|message| message.id.clone()),
+                    Some(stream_turn_id.clone()),
                     Some(result.chat_room_id.clone()),
+                    Arc::clone(&cancellation),
                 )
-                .await;
+                .await
+                {
+                    Ok(dispatches) => dispatches,
+                    Err(_) => {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
+                };
+                if cancellation.is_requested() {
+                    terminal_status = ChatTurnStatus::Interrupted;
+                    break 'chat_turn;
+                }
                 diag!(
                     "[TOOL-LOOP-STREAM] dispatch returned {} result(s): [{}]",
                     dispatches.len(),
@@ -15791,6 +17124,50 @@ async fn api_chat_send_stream(
                         "error_count": dispatch_error_count
                     }),
                 );
+                let stream_turn_key = result
+                    .messages
+                    .first()
+                    .map(|message| message.id.as_str())
+                    .unwrap_or("stream-turn");
+                let persisted_tool_messages = dispatches
+                    .iter()
+                    .flat_map(|dispatch| {
+                        let status = if dispatch.is_error {
+                            "failed"
+                        } else {
+                            "completed"
+                        };
+                        let call_summary = if dispatch.is_error {
+                            format!(
+                                "工具 `{}` 失败：{}",
+                                dispatch.name, dispatch.summary_text
+                            )
+                        } else {
+                            format!(
+                                "工具 `{}` 已完成：{}",
+                                dispatch.name, dispatch.summary_text
+                            )
+                        };
+                        tool_messages_from_summary(
+                            agent,
+                            &dispatch.tool_use_id,
+                            stream_turn_key,
+                            &dispatch.name,
+                            call_summary,
+                            dispatch.tool_result_text.clone(),
+                            status,
+                            &dispatch.route,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if cancellation.is_requested() {
+                    terminal_status = ChatTurnStatus::Interrupted;
+                    break 'chat_turn;
+                }
+                for message in persisted_tool_messages {
+                    yield Ok(sse_json_event("message", &message));
+                    messages.push(message);
+                }
                 let tool_result_blocks: Vec<InputContentBlock> = dispatches
                 .into_iter()
                 .map(|dispatch| InputContentBlock::ToolResult {
@@ -15835,6 +17212,10 @@ async fn api_chat_send_stream(
                 let mut loop_repeat: u32 = 0;
                 let mut round_no: u32 = 2;
                 loop {
+                    if cancellation.is_requested() {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
                     let request = agent_message_request_with_context_messages_for_room(
                         agent,
                         false,
@@ -15843,9 +17224,18 @@ async fn api_chat_send_stream(
                         Some(&result.chat_room_id),
                     );
                     let response = match provider_client_for_agent(agent) {
-                        Ok(client) => match client.send_message(&request).await {
-                            Ok(resp) => resp,
-                            Err(e) => {
+                        Ok(client) => match await_chat_turn(
+                            cancellation.as_ref(),
+                            client.send_message(&request),
+                        )
+                        .await
+                        {
+                            Err(_) => {
+                                terminal_status = ChatTurnStatus::Interrupted;
+                                break 'chat_turn;
+                            }
+                            Ok(Ok(resp)) => resp,
+                            Ok(Err(e)) => {
                                 diag!("[TOOL-LOOP-STREAM] round{round_no} send_message failed: {e:?}");
                                 break;
                             }
@@ -15856,6 +17246,10 @@ async fn api_chat_send_stream(
                         }
                     };
                     used_real_model = true;
+                    if cancellation.is_requested() {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
                     remember_largest_remote_usage(&mut best_remote_usage, &response.usage);
                     let tool_requests = model_tool_requests_from_blocks(&response.content);
                     if tool_requests.is_empty() {
@@ -15924,14 +17318,26 @@ async fn api_chat_send_stream(
                         loop_repeat = 0;
                         last_loop_sig = Some(sig);
                     }
-                    let dispatches = dispatch_model_tool_calls_parallel(
+                    let dispatches = match dispatch_model_tool_calls_parallel_with_cancel(
                         tool_requests.clone(),
                         "[TOOL-LOOP-STREAM]",
                         Some(agent.id.clone()),
-                        result.messages.first().map(|message| message.id.clone()),
+                        Some(stream_turn_id.clone()),
                         Some(result.chat_room_id.clone()),
+                        Arc::clone(&cancellation),
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(dispatches) => dispatches,
+                        Err(_) => {
+                            terminal_status = ChatTurnStatus::Interrupted;
+                            break 'chat_turn;
+                        }
+                    };
+                    if cancellation.is_requested() {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
                     streamed_tool_write_executed |= dispatches
                         .iter()
                         .any(model_tool_dispatch_result_executed_file_write);
@@ -15944,6 +17350,50 @@ async fn api_chat_send_stream(
                                     && dispatch.is_error
                             })
                             .map(|dispatch| dispatch.summary_text.clone());
+                    }
+                    let stream_turn_key = result
+                        .messages
+                        .first()
+                        .map(|message| message.id.as_str())
+                        .unwrap_or("stream-turn");
+                    let persisted_tool_messages = dispatches
+                        .iter()
+                        .flat_map(|dispatch| {
+                            let status = if dispatch.is_error {
+                                "failed"
+                            } else {
+                                "completed"
+                            };
+                            let call_summary = if dispatch.is_error {
+                                format!(
+                                    "工具 `{}` 失败：{}",
+                                    dispatch.name, dispatch.summary_text
+                                )
+                            } else {
+                                format!(
+                                    "工具 `{}` 已完成：{}",
+                                    dispatch.name, dispatch.summary_text
+                                )
+                            };
+                            tool_messages_from_summary(
+                                agent,
+                                &dispatch.tool_use_id,
+                                stream_turn_key,
+                                &dispatch.name,
+                                call_summary,
+                                dispatch.tool_result_text.clone(),
+                                status,
+                                &dispatch.route,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if cancellation.is_requested() {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
+                    for message in persisted_tool_messages {
+                        yield Ok(sse_json_event("message", &message));
+                        messages.push(message);
                     }
                     let mut tr_blocks: Vec<InputContentBlock> = dispatches
                         .into_iter()
@@ -16015,6 +17465,10 @@ async fn api_chat_send_stream(
                         tool_result_summaries.join("\n")
                     );
                 }
+                if cancellation.is_requested() {
+                    terminal_status = ChatTurnStatus::Interrupted;
+                    break 'chat_turn;
+                }
                 yield Ok(sse_json_event("message_replace", &assistant_message));
                 used_real_model = true;
                 diag!(
@@ -16047,6 +17501,10 @@ async fn api_chat_send_stream(
             );
             if !streamed_tool_calls_dispatched {
                 for (_, (tool_use_id, tool_name, tool_input)) in model_tool_calls {
+                    if cancellation.is_requested() {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
                     let tool_input = serde_json::from_str(&tool_input)
                         .unwrap_or_else(|_| json!({ "raw": tool_input }));
                     update_active_realtime_session_states(Some("tool_calling"), None);
@@ -16061,15 +17519,41 @@ async fn api_chat_send_stream(
                             "input": tool_input.clone()
                         }),
                     );
-                    let tool_message = run_model_tool_use_message(
-                        agent,
-                        &tool_use_id,
-                        &tool_name,
-                        &tool_input,
-                        None,
-                        Some(&result.chat_room_id),
+                    let tool_messages = match await_chat_turn(
+                        cancellation.as_ref(),
+                        run_model_tool_use_messages(
+                            agent,
+                            &tool_use_id,
+                            &tool_name,
+                            &tool_input,
+                            Some(&stream_turn_id),
+                            Some(&result.chat_room_id),
+                        ),
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(messages) => messages,
+                        Err(_) => {
+                            terminal_status = ChatTurnStatus::Interrupted;
+                            break 'chat_turn;
+                        }
+                    };
+                    if cancellation.is_requested() {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
+                    let tool_message = tool_messages
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| ChatMessageDto {
+                            id: format!("tool-call-{}", unix_timestamp_millis()),
+                            author: "系统工具执行 Agent".to_string(),
+                            role: "assistant".to_string(),
+                            target: agent.display_name.clone(),
+                            content: "工具调用未返回可显示结果".to_string(),
+                            kind: "tool-summary".to_string(),
+                            attachments: Vec::new(),
+                        });
                     yield Ok(sse_json_event("message", &tool_message));
                     emit_active_realtime_session_event(
                         "action_step",
@@ -16083,7 +17567,12 @@ async fn api_chat_send_stream(
                         }),
                     );
                     tool_result_summaries.push(tool_message.content.clone());
-                    messages.push(tool_message);
+                    for message in tool_messages {
+                        if message.id != tool_message.id {
+                            yield Ok(sse_json_event("message", &message));
+                        }
+                        messages.push(message);
+                    }
                 }
             }
             // 同上：纯视觉理解不触发 computer-use 动作，仅视觉动作意图 / 工具意图才执行。
@@ -16097,7 +17586,27 @@ async fn api_chat_send_stream(
                 && !has_pending_stream_model_tool_calls
                 && !formal_computer_use_intent
             {
-                if let Some(tool_message) = run_tool_intent_message(agent, &result.user_content).await {
+                if cancellation.is_requested() {
+                    terminal_status = ChatTurnStatus::Interrupted;
+                    break 'chat_turn;
+                }
+                let semantic_tool_message = match await_chat_turn(
+                    cancellation.as_ref(),
+                    run_tool_intent_message(agent, &result.user_content),
+                )
+                .await
+                {
+                    Ok(message) => message,
+                    Err(_) => {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
+                };
+                if cancellation.is_requested() {
+                    terminal_status = ChatTurnStatus::Interrupted;
+                    break 'chat_turn;
+                }
+                if let Some(tool_message) = semantic_tool_message {
                     update_active_realtime_session_states(Some("tool_calling"), None);
                     emit_active_realtime_session_event(
                         "action_step",
@@ -16116,6 +17625,10 @@ async fn api_chat_send_stream(
                 }
             }
 
+            if cancellation.is_requested() {
+                terminal_status = ChatTurnStatus::Interrupted;
+                break 'chat_turn;
+            }
             if let Some(assembly) = stream_context_assembly.as_ref() {
                 let policy = context_lifecycle_policy();
                 let snapshot = context_usage_snapshot_for_assembly_with_usage(
@@ -16131,6 +17644,10 @@ async fn api_chat_send_stream(
             let fallback_reason = diagnostic_note
                 .as_deref()
                 .unwrap_or("模型未产生可显示回复");
+            if cancellation.is_requested() {
+                terminal_status = ChatTurnStatus::Interrupted;
+                break 'chat_turn;
+            }
             ensure_assistant_message_visible_content(
                 &mut assistant_message,
                 local_agent_response(
@@ -16156,6 +17673,10 @@ async fn api_chat_send_stream(
                     yield Ok(sse_json_event("message_replace", &assistant_message));
                 }
             }
+            if cancellation.is_requested() {
+                terminal_status = ChatTurnStatus::Interrupted;
+                break 'chat_turn;
+            }
             assistant_message.content =
                 sanitize_visible_model_text(agent, &assistant_message.content);
             reasoning_message.content =
@@ -16178,12 +17699,20 @@ async fn api_chat_send_stream(
                 }),
             );
             yield Ok(sse_json_event("message_done", &assistant_message));
+            if cancellation.is_requested() {
+                terminal_status = ChatTurnStatus::Interrupted;
+                break 'chat_turn;
+            }
             auto_handoff_candidates.push(AutoHandoffCandidate {
                 from_agent_id: agent.id.clone(),
                 assistant_message_id: assistant_message.id.clone(),
                 content: assistant_message.content.clone(),
             });
 
+            if cancellation.is_requested() {
+                terminal_status = ChatTurnStatus::Interrupted;
+                break 'chat_turn;
+            }
             let context_lifecycle = match apply_context_lifecycle_for_agent(
                 &agent.id,
                 &result.chat_room_id,
@@ -16200,6 +17729,10 @@ async fn api_chat_send_stream(
                     ContextLifecycleResult::default()
                 }
             };
+            if cancellation.is_requested() {
+                terminal_status = ChatTurnStatus::Interrupted;
+                break 'chat_turn;
+            }
 
             tasks.push(agent_task(
                 agent,
@@ -16222,38 +17755,73 @@ async fn api_chat_send_stream(
         let db_path = default_session_sqlite_path();
         let workspace = active_workspace_path();
         let workspace_id = workspace_identity(&workspace);
-        match append_goal_trigger_consultation(
+        if cancellation.is_requested() {
+            terminal_status = ChatTurnStatus::Interrupted;
+            break 'chat_turn;
+        }
+        let goal_consultation = append_goal_trigger_consultation(
             &db_path,
             &workspace_id,
             &result,
             &mut messages,
             &mut tasks,
-        ) {
+        );
+        if cancellation.is_requested() {
+            terminal_status = ChatTurnStatus::Interrupted;
+            break 'chat_turn;
+        }
+        match goal_consultation {
             Ok(goal_messages) => {
                 for message in goal_messages {
+                    if cancellation.is_requested() {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
                     yield Ok(sse_json_event("message", &message));
                 }
             }
             Err(error) => {
+                if cancellation.is_requested() {
+                    terminal_status = ChatTurnStatus::Interrupted;
+                    break 'chat_turn;
+                }
                 let message = append_goal_trigger_error_message(&error, &mut messages, &mut tasks);
                 yield Ok(sse_json_event("message", &message));
             }
         }
 
+        if cancellation.is_requested() {
+            terminal_status = ChatTurnStatus::Interrupted;
+            break 'chat_turn;
+        }
+        let new_messages = messages
+            .iter()
+            .skip(initial_message_count)
+            .cloned()
+            .collect::<Vec<_>>();
         if let Err(error) = persist_chat_dispatch(
             &result.chat_room_id,
             result.conversation_session_id.as_deref(),
             &result.targets,
-            messages.clone(),
+            new_messages,
         ) {
             let message = format!("消息持久化失败: {}", error.1.error);
             emit_backend_pet_event("chat.failed", Some(&message), "chat");
             yield Ok(sse_json_event("error", &ChatStreamError { message }));
-            return;
+            terminal_status = ChatTurnStatus::Failed;
+            break 'chat_turn;
+        }
+        if cancellation.is_requested() {
+            terminal_status = ChatTurnStatus::Interrupted;
+            break 'chat_turn;
         }
         match process_auto_handoff_candidates(&result.chat_room_id, &auto_handoff_candidates) {
             Ok(auto_handoffs) => {
                 for handoff in auto_handoffs {
+                    if cancellation.is_requested() {
+                        terminal_status = ChatTurnStatus::Interrupted;
+                        break 'chat_turn;
+                    }
                     if let Some(inbound) = handoff.inbound_message {
                         let dto = chat_message_dto_from_persisted(&inbound);
                         yield Ok(sse_json_event("message", &dto));
@@ -16265,23 +17833,38 @@ async fn api_chat_send_stream(
                 let message = format!("handoff dispatch failed: {}", error.1.error);
                 emit_backend_pet_event("chat.failed", Some(&message), "chat");
                 yield Ok(sse_json_event("error", &ChatStreamError { message }));
-                return;
+                terminal_status = ChatTurnStatus::Failed;
+                break 'chat_turn;
             }
         }
 
+        if cancellation.is_requested() {
+            terminal_status = ChatTurnStatus::Interrupted;
+            break 'chat_turn;
+        }
         persist_auto_memory_beads(&messages);
         persist_reference_forward_memory(&result.reference_context, &result.targets);
         persist_group_send_shared_memory(&result.reference_context, &result.targets);
-        emit_backend_pet_event(
-            "chat.completed",
-            Some("Chat stream completed"),
-            "chat",
-        );
 
-        yield Ok(sse_json_event("done", &ChatStreamDone {
-            accepted_agent_ids: result.targets.iter().map(|agent| agent.id.clone()).collect(),
-            tasks,
-        }));
+        }
+        let status = turn_guard.finish(if cancellation.is_requested() {
+            ChatTurnStatus::Interrupted
+        } else {
+            terminal_status
+        });
+        if status == ChatTurnStatus::Completed {
+            emit_backend_pet_event(
+                "chat.completed",
+                Some("Chat stream completed"),
+                "chat",
+            );
+        }
+        let mut chat_stream_done = chat_stream_done(&result, &turn_id, status, tasks);
+        chat_stream_done.run_id = Some(run_id.clone());
+        yield Ok(sse_json_event(
+            "done",
+            &chat_stream_done,
+        ));
     };
 
     Ok(Sse::new(stream))
@@ -23594,6 +25177,68 @@ const MEMORY_EDGE_SIM_THRESHOLD: f32 = 0.55;
 /// E 关联图：单次召回最多用边补充的邻居数。
 const MEMORY_EDGE_EXPANSION_LIMIT: usize = 4;
 
+/// P1-1 stage-1 extraction：从最近一条非 system 会话消息生成可回溯的
+/// L2 conversation bead。它是 provider-neutral 的确定性兜底，不伪装成模型摘要；
+/// 相同来源消息重复触发时通过 signature 幂等。
+fn extract_session_memory(session_id: &str) -> Result<usize, String> {
+    let mut store = session_store()
+        .lock()
+        .map_err(|_| "会话存储锁已损坏".to_string())?;
+    let now = unix_timestamp_millis();
+    let Some(session) = store
+        .state
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+    else {
+        return Err("会话不存在".to_string());
+    };
+    let Some(message) = session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role != "system" && !message.content.trim().is_empty())
+        .cloned()
+    else {
+        return Ok(0);
+    };
+    let summary = compact_message_snippet(&message.content, 240);
+    if summary.trim().is_empty() {
+        return Ok(0);
+    }
+    let layer = "L2";
+    let kind = "conversation";
+    let source = "memory:extraction";
+    let signature = memory_bead_signature(layer, kind, source, &summary);
+    if session
+        .memory_beads
+        .iter()
+        .any(|bead| bead.signature() == signature)
+    {
+        return Ok(0);
+    }
+    session.memory_beads.push(MemoryBeadDto {
+        id: format!(
+            "memory-extract-{now}-{:016x}",
+            hash_bytes(signature.as_bytes())
+        ),
+        kind: kind.to_string(),
+        layer: layer.to_string(),
+        summary: summary.clone(),
+        source: source.to_string(),
+        pinned: false,
+        confidence: 0.62,
+        created_at: now,
+        origin_message_id: Some(message.id),
+        origin_table: Some("session_messages".to_string()),
+        token_count: Some(estimate_bead_tokens(&summary)),
+    });
+    session.prune_memory_beads();
+    session.updated_at = now;
+    store.save().map_err(|(_, Json(error))| error.error)?;
+    Ok(1)
+}
+
 /// E 关联图：为会话当前记忆构建语义相似边（真 bge-m3 向量，cosine ≥ 阈值），覆盖式写入，返回边数。
 /// 复用 `memory_vectors`（与召回共库）；缺失向量先嵌入落盘。<2 个 bead 直接返回 0。
 async fn build_session_edges(agent: &AgentSessionDto) -> usize {
@@ -24319,6 +25964,33 @@ async fn dispatch_model_tool_calls_parallel(
     ordered.into_iter().flatten().collect()
 }
 
+/// JoinSet 边界的协作式取消包装：取消后不再接收任何已派发任务的结果，
+/// JoinSet 丢弃时会终止仍可取消的异步任务；同步插件若已进入 blocking 线程，
+/// 允许其清理完成，但不会继续向当前 turn 写回。
+async fn dispatch_model_tool_calls_parallel_with_cancel(
+    tool_requests: Vec<(String, String, JsonValue)>,
+    log_prefix: &'static str,
+    caller_session_id: Option<String>,
+    turn_id: Option<String>,
+    chat_room_id: Option<String>,
+    cancellation: Arc<ChatTurnCancellation>,
+) -> Result<Vec<ModelToolDispatchResult>, ChatTurnCancelled> {
+    if cancellation.is_requested() {
+        return Err(ChatTurnCancelled);
+    }
+    await_chat_turn(
+        cancellation.as_ref(),
+        dispatch_model_tool_calls_parallel(
+            tool_requests,
+            log_prefix,
+            caller_session_id,
+            turn_id,
+            chat_room_id,
+        ),
+    )
+    .await
+}
+
 fn model_tool_dispatch_result_executed_file_write(result: &ModelToolDispatchResult) -> bool {
     if result.is_error || result.route != "runtime-executed" {
         return false;
@@ -24344,7 +26016,11 @@ async fn call_agent_model_with_tool_loop(
         context_history,
         prompt,
         image_urls,
-        context_build_options_for_agent(agent),
+        context_build_options_for_agent_with_floor_and_room(
+            agent,
+            session_context_reset_floor(&agent.id),
+            chat_room_id,
+        ),
         collaboration_roster,
     );
     let base_history = assembly.messages.clone();
@@ -24789,6 +26465,47 @@ fn context_compaction_memory_summary(
     (!summary.trim().is_empty()).then_some(summary)
 }
 
+fn context_compaction_item_from_history(
+    dropped_history: &[PersistedChatMessage],
+    summary: &str,
+    agent: &AgentSessionDto,
+) -> Option<ContextCompactionItem> {
+    if dropped_history.is_empty() || summary.trim().is_empty() {
+        return None;
+    }
+    let first_id = dropped_history
+        .first()
+        .map(|message| message.id.as_str())
+        .unwrap_or_default();
+    let last_id = dropped_history
+        .last()
+        .map(|message| message.id.as_str())
+        .unwrap_or_default();
+    let signature = format!("{first_id}\u{1f}{last_id}\u{1f}{summary}");
+    let id = format!("compaction-{:016x}", hash_bytes(signature.as_bytes()));
+    let persisted = agent
+        .memory_beads
+        .iter()
+        .any(|bead| bead.source == "context:auto-compact" && bead.summary == summary);
+    Some(ContextCompactionItem {
+        id,
+        kind: "compaction".to_string(),
+        source: "context:auto-compact".to_string(),
+        summary: summary.to_string(),
+        message_count: dropped_history.len(),
+        token_count: estimate_bead_tokens(summary),
+        created_at: dropped_history
+            .last()
+            .map(|message| message.created_at)
+            .unwrap_or_default(),
+        status: if persisted {
+            "persisted".to_string()
+        } else {
+            "preview".to_string()
+        },
+    })
+}
+
 fn is_goal_temporary_memory_bead(bead: &MemoryBeadDto) -> bool {
     (bead.source == "chat-room:auto-extract" && is_goal_temporary_text(&bead.summary))
         || (bead.kind != "goal-task-skill"
@@ -24919,7 +26636,9 @@ fn build_context_assembly_with_roster(
     );
     let max_prompt_tokens = options.max_prompt_tokens.max(1);
     let mut truncated = false;
-    let mut memory_beads = select_context_memory_beads(agent, current_user_text, options);
+    let memory_mode = memory_mode_for_session(&agent.id);
+    let (mut memory_beads, mut memory_selection) =
+        select_context_memory_beads(agent, current_user_text, &options, &memory_mode);
     let memory_revision = context_memory_revision(agent);
     let build_system_prompt = |beads: &[MemoryBeadDto]| {
         let mut prompt = build_agent_system_prompt_with_beads(agent, beads);
@@ -25011,6 +26730,7 @@ fn build_context_assembly_with_roster(
     // 12-D 自动 compact：超出 token 预算的较旧历史不再直接丢弃，而是收集起来做滚动摘要，
     // 以一条 [历史摘要] 注入 system_prompt，避免长会话丢失早期上下文。
     let mut dropped_history: Vec<PersistedChatMessage> = Vec::new();
+    let mut compaction_item = None;
     let effective_history_budget = options.history_token_budget.min(
         max_prompt_tokens
             .saturating_sub(system_tokens)
@@ -25047,10 +26767,34 @@ fn build_context_assembly_with_roster(
         selected_history.push(message_for_context);
     }
     selected_history.reverse();
+    let history_candidate_ids = room_history
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    let history_selected_ids = selected_history
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    let history_selected_id_set = history_selected_ids.iter().cloned().collect::<HashSet<_>>();
+    let history_excluded_ids = history_candidate_ids
+        .iter()
+        .filter(|id| !history_selected_id_set.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
+    // 模型上下文的历史权威来源固定为聊天室消息；session messages 仍可用于持久化/回放，
+    // 但不会因为写入 session store 就自动进入下一轮模型输入。
+    let history_selection = ContextHistorySelectionEvidence {
+        source: "chat_room.messages".to_string(),
+        candidate_ids: history_candidate_ids,
+        selected_ids: history_selected_ids,
+        excluded_ids: history_excluded_ids,
+    };
     // dropped_history 是新→旧顺序，摘要时转回时间正序并注入 system_prompt（计入 system_tokens）。
     if !dropped_history.is_empty() {
         dropped_history.reverse();
         let rolling_summary = summarize_dropped_history(&dropped_history);
+        compaction_item =
+            context_compaction_item_from_history(&dropped_history, &rolling_summary, agent);
         diagnostics::info(
             "context",
             "compact.ok",
@@ -25108,6 +26852,12 @@ fn build_context_assembly_with_roster(
         .iter()
         .map(|bead| bead.id.clone())
         .collect::<Vec<_>>();
+    memory_selection.selected_ids = memory_bead_ids.clone();
+    memory_selection.used_tokens = memory_tokens;
+    let workspace_id = workspace_identity(&active_workspace_path());
+    let chat_room_id = options.chat_room_id.clone();
+    let permission_profile = context_permission_profile(chat_room_id.as_deref());
+    let tool_catalog_revision = context_tool_catalog_revision();
     let context_snapshot_id = context_snapshot_id(
         agent,
         &memory_revision,
@@ -25116,7 +26866,24 @@ fn build_context_assembly_with_roster(
         &selected_history,
         &system_prompt,
         &current_user_text_for_prompt,
+        &workspace_id,
+        chat_room_id.as_deref(),
+        &permission_profile,
+        &memory_mode,
+        &tool_catalog_revision,
     );
+    let runtime_snapshot = ContextRuntimeSnapshot {
+        snapshot_id: context_snapshot_id.clone(),
+        workspace_id,
+        chat_room_id,
+        permission_profile,
+        model: agent.model.clone(),
+        provider: agent.provider.clone(),
+        tool_catalog_revision,
+        memory_revision: memory_revision.clone(),
+        memory_mode: memory_mode.clone(),
+        history_floor_millis: options.history_floor_millis,
+    };
 
     ctx_span.record("outcome", "ok");
     diagnostics::info(
@@ -25129,15 +26896,36 @@ fn build_context_assembly_with_roster(
             ("history_msgs", selected_history.len().to_string()),
             ("total_tokens", total.to_string()),
             ("truncated", truncated.to_string()),
+            ("context_snapshot", runtime_snapshot.snapshot_id.clone()),
+            ("workspace_id", runtime_snapshot.workspace_id.clone()),
+            (
+                "chat_room_id",
+                runtime_snapshot.chat_room_id.clone().unwrap_or_default(),
+            ),
+            (
+                "permission_profile",
+                runtime_snapshot.permission_profile.clone(),
+            ),
+            (
+                "tool_catalog_revision",
+                runtime_snapshot.tool_catalog_revision.clone(),
+            ),
+            ("memory_mode", runtime_snapshot.memory_mode.clone()),
         ],
     );
     ContextAssembly {
         system_prompt,
         messages,
         memory_beads,
+        // 当前运行时回合 ID；context-preview 等没有真实回合的调用保持 None。
+        turn_id: current_turn_trace(),
         context_snapshot_id,
         memory_revision,
         memory_bead_ids,
+        memory_selection,
+        history_selection,
+        compaction_item,
+        runtime_snapshot,
         history_floor_millis: options.history_floor_millis,
         history_message_count: selected_history.len(),
         token_budget: ContextTokenBudget {
@@ -25170,6 +26958,39 @@ fn context_memory_revision(agent: &AgentSessionDto) -> String {
     format!("mem-{:016x}", hash_bytes(parts.join("\u{1e}").as_bytes()))
 }
 
+fn context_permission_profile(chat_room_id: Option<&str>) -> String {
+    let room_id = chat_room_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(room_id) = room_id {
+        if let Ok(profile) =
+            chat_room_permission_profile_sqlite(&default_session_sqlite_path(), room_id)
+        {
+            return profile;
+        }
+    }
+    active_permission_profile().as_str().to_string()
+}
+
+fn context_tool_catalog_revision() -> String {
+    let catalog = build_tools_catalog();
+    let mut parts = Vec::new();
+    for category in &catalog.categories {
+        for item in &category.items {
+            parts.push(format!(
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                category.id,
+                item.item.id,
+                item.item.status,
+                item.item.permissions.join(","),
+                item.item.executable_now,
+            ));
+        }
+    }
+    parts.sort();
+    format!("tools-{:016x}", hash_bytes(parts.join("\u{1e}").as_bytes()))
+}
+
 fn context_snapshot_id(
     agent: &AgentSessionDto,
     memory_revision: &str,
@@ -25178,6 +26999,11 @@ fn context_snapshot_id(
     selected_history: &[PersistedChatMessage],
     system_prompt: &str,
     current_user_text: &str,
+    workspace_id: &str,
+    chat_room_id: Option<&str>,
+    permission_profile: &str,
+    memory_mode: &str,
+    tool_catalog_revision: &str,
 ) -> String {
     let history_identity = selected_history
         .iter()
@@ -25187,12 +27013,17 @@ fn context_snapshot_id(
     let input_hash = hash_bytes(current_user_text.as_bytes());
     let prompt_hash = hash_bytes(system_prompt.as_bytes());
     let seed = format!(
-        "{}|{}|{}|{}|{}|{:016x}|{:016x}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:016x}|{:016x}",
         agent.id,
         memory_revision,
         history_floor_millis.unwrap_or_default(),
         memory_bead_ids.join(","),
         history_identity,
+        workspace_id,
+        chat_room_id.unwrap_or_default(),
+        permission_profile,
+        memory_mode,
+        tool_catalog_revision,
         prompt_hash,
         input_hash,
     );
@@ -25202,8 +27033,9 @@ fn context_snapshot_id(
 fn select_context_memory_beads(
     agent: &AgentSessionDto,
     current_user_text: &str,
-    options: ContextBuildOptions,
-) -> Vec<MemoryBeadDto> {
+    options: &ContextBuildOptions,
+    memory_mode: &str,
+) -> (Vec<MemoryBeadDto>, ContextMemorySelectionEvidence) {
     let mut recall_span = diagnostics::start_span("memory.recall", "memory");
     diagnostics::info(
         "memory",
@@ -25213,8 +27045,34 @@ fn select_context_memory_beads(
             ("trace", current_turn_trace().unwrap_or_default()),
             ("query", compact_message_snippet(current_user_text, 120)),
             ("limit", options.max_memory_beads.to_string()),
+            ("memory_mode", memory_mode.to_string()),
         ],
     );
+    if memory_mode != DEFAULT_MEMORY_MODE {
+        recall_span.record("outcome", "blocked");
+        diagnostics::info(
+            "memory",
+            "recall.blocked",
+            "会话 memory mode 阻止自动记忆召回",
+            &[
+                ("trace", current_turn_trace().unwrap_or_default()),
+                ("memory_mode", memory_mode.to_string()),
+            ],
+        );
+        return (
+            Vec::new(),
+            ContextMemorySelectionEvidence {
+                strategy: format!("{memory_mode}_blocked"),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                expired_or_invalid_ids: Vec::new(),
+                superseded_ids: Vec::new(),
+                budget_skipped_ids: Vec::new(),
+                used_tokens: 0,
+                token_budget: options.memory_token_budget,
+            },
+        );
+    }
     let query = MemoryBeadQueryOptions {
         q: Some(current_user_text.to_string()),
         layer: None,
@@ -25249,10 +27107,32 @@ fn select_context_memory_beads(
     };
 
     // F 时效：按 kind 规则过滤已过期的瞬时记忆（chat/会话等 7 天 TTL），不污染召回。
+    let candidate_ids = candidates
+        .iter()
+        .map(|bead| bead.id.clone())
+        .collect::<Vec<_>>();
     let mut candidates = runtime::filter_unexpired(&candidates, unix_timestamp_millis());
+    let unexpired_ids = candidates
+        .iter()
+        .map(|bead| bead.id.clone())
+        .collect::<HashSet<_>>();
+    let expired_or_invalid_ids = candidate_ids
+        .iter()
+        .filter(|id| !unexpired_ids.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
     // C 冲突消解：剔除被取代（superseded）的旧 bead。
     let superseded = load_superseded_bead_ids(&agent.id);
+    let before_superseded_ids = candidates
+        .iter()
+        .map(|bead| bead.id.clone())
+        .collect::<Vec<_>>();
     candidates.retain(|bead| !superseded.contains(&bead.id));
+    let superseded_ids = before_superseded_ids
+        .iter()
+        .filter(|id| superseded.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
 
     // B 衰减：能力开关（首次安装默认开）。开启后按 effective_recall_score 重排，
     // 让高 confidence + 新鲜的记忆上浮（pinned 不衰减）。访问强化（access_count）待字段扩展后补。
@@ -25265,11 +27145,13 @@ fn select_context_memory_beads(
 
     let mut selected = Vec::new();
     let mut used_tokens = 0_u32;
+    let mut budget_skipped_ids = Vec::new();
     for bead in candidates {
         let tokens = bead
             .token_count
             .unwrap_or_else(|| estimate_bead_tokens(&bead.summary));
         if used_tokens.saturating_add(tokens) > options.memory_token_budget {
+            budget_skipped_ids.push(bead.id.clone());
             continue;
         }
         used_tokens = used_tokens.saturating_add(tokens);
@@ -25309,7 +27191,23 @@ fn select_context_memory_beads(
             );
         }
     }
-    selected
+    let selected_ids = selected
+        .iter()
+        .map(|bead| bead.id.clone())
+        .collect::<Vec<_>>();
+    (
+        selected,
+        ContextMemorySelectionEvidence {
+            strategy: strategy.to_string(),
+            candidate_ids,
+            selected_ids,
+            expired_or_invalid_ids,
+            superseded_ids,
+            budget_skipped_ids,
+            used_tokens,
+            token_budget: options.memory_token_budget,
+        },
+    )
 }
 
 /// 取会话生效的 token 限制：优先 config 里该会话的手填覆盖（context_window/max_output_tokens，>0 才生效），
@@ -25360,14 +27258,30 @@ fn effective_model_limit_for_agent(agent: &AgentSessionDto) -> (u32, u32) {
 }
 
 fn context_build_options_for_agent(agent: &AgentSessionDto) -> ContextBuildOptions {
-    context_build_options_for_agent_with_floor(agent, session_context_reset_floor(&agent.id))
+    context_build_options_for_agent_with_floor_and_room(
+        agent,
+        session_context_reset_floor(&agent.id),
+        None,
+    )
 }
 
 fn context_build_options_for_agent_with_floor(
     agent: &AgentSessionDto,
     history_floor_millis: Option<u64>,
 ) -> ContextBuildOptions {
+    context_build_options_for_agent_with_floor_and_room(agent, history_floor_millis, None)
+}
+
+fn context_build_options_for_agent_with_floor_and_room(
+    agent: &AgentSessionDto,
+    history_floor_millis: Option<u64>,
+    chat_room_id: Option<&str>,
+) -> ContextBuildOptions {
     let mut options = ContextBuildOptions::default();
+    options.chat_room_id = chat_room_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let policy = context_lifecycle_policy();
     let (model_context_raw, max_output) = effective_model_limit_for_agent(agent);
     let model_context = model_context_raw.max(1);
@@ -26133,7 +28047,7 @@ async fn verify_cursor_on_target(x: i32, y: i32, target: &str) -> bool {
         model_type: "vision".to_string(),
         base_url: None,
         endpoint: None,
-        reasoning_effort: "medium".to_string(),
+        reasoning_effort: "auto".to_string(),
         api_key_status: "配置".to_string(),
         selectable: false,
         enabled: true,
@@ -26390,73 +28304,268 @@ fn provider_option_for_kind(kind: ProviderKind) -> Option<api::ProviderOption> {
         .copied()
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ReasoningOptionDto {
+    value: String,
+    label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+impl From<&api::ReasoningOption> for ReasoningOptionDto {
+    fn from(option: &api::ReasoningOption) -> Self {
+        Self {
+            value: option.value.as_str().to_string(),
+            label: option.label.clone(),
+            note: option.note.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReasoningResolutionDto {
+    requested: String,
+    effective: String,
+    status: String,
+    strategy: String,
+    protocol: String,
+    reason: String,
+    supported_options: Vec<ReasoningOptionDto>,
+}
+
+impl From<&api::ReasoningResolution> for ReasoningResolutionDto {
+    fn from(resolution: &api::ReasoningResolution) -> Self {
+        Self {
+            requested: resolution.requested.as_str().to_string(),
+            effective: resolution.effective.as_str().to_string(),
+            status: reasoning_resolution_status_id(resolution.status).to_string(),
+            strategy: reasoning_strategy_id(resolution.strategy).to_string(),
+            protocol: reasoning_protocol_id(resolution.protocol).to_string(),
+            reason: resolution.reason.clone(),
+            supported_options: resolution
+                .supported_options
+                .iter()
+                .map(ReasoningOptionDto::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReasoningCapabilityOptionDto {
+    value: String,
+    label: String,
+    effective: String,
+    status: String,
+    reason: String,
+    selectable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ModelReasoningCapabilityDto {
+    /// 固定暴露全部 canonical requested 值；前端只过滤 unsupported 项。
+    options: Vec<ReasoningCapabilityOptionDto>,
+    #[serde(rename = "default")]
+    default_reasoning: String,
+    strategy: String,
+    protocol: String,
+    status: String,
+    note: String,
+    deprecated: bool,
+}
+
+fn reasoning_resolution_status_id(status: api::ReasoningResolutionStatus) -> &'static str {
+    match status {
+        api::ReasoningResolutionStatus::Default => "default",
+        api::ReasoningResolutionStatus::Exact => "exact",
+        api::ReasoningResolutionStatus::Downgraded => "downgraded",
+        api::ReasoningResolutionStatus::Unsupported => "unsupported",
+        api::ReasoningResolutionStatus::LegacyFallback => "legacy_fallback",
+    }
+}
+
+fn reasoning_capability_status_id(status: api::ReasoningCapabilityStatus) -> &'static str {
+    match status {
+        api::ReasoningCapabilityStatus::Verified => "verified",
+        api::ReasoningCapabilityStatus::Unknown => "unknown",
+        api::ReasoningCapabilityStatus::Deprecated => "deprecated",
+    }
+}
+
+fn reasoning_strategy_id(strategy: api::ReasoningStrategy) -> &'static str {
+    match strategy {
+        api::ReasoningStrategy::ProviderDefault => "provider_default",
+        api::ReasoningStrategy::OpenAiReasoningEffort => "openai_reasoning_effort",
+        api::ReasoningStrategy::AnthropicAdaptiveThinking => "anthropic_adaptive_thinking",
+        api::ReasoningStrategy::DeepSeekThinking => "deepseek_thinking",
+        api::ReasoningStrategy::ZhipuThinking => "zhipu_thinking",
+    }
+}
+
+fn reasoning_protocol_id(protocol: api::ProviderProtocol) -> &'static str {
+    match protocol {
+        api::ProviderProtocol::OpenAiChatCompletions => "openai_chat_completions",
+        api::ProviderProtocol::AnthropicMessages => "anthropic_messages",
+        api::ProviderProtocol::OpenAiImagesGenerations => "openai_images_generations",
+        api::ProviderProtocol::OpenAiVideos => "openai_videos",
+    }
+}
+
+fn reasoning_preflight_options(
+    capability: &api::ReasoningCapability,
+) -> Vec<ReasoningCapabilityOptionDto> {
+    const REQUESTED_VALUES: [api::ReasoningEffort; 8] = [
+        api::ReasoningEffort::Auto,
+        api::ReasoningEffort::None,
+        api::ReasoningEffort::Minimal,
+        api::ReasoningEffort::Low,
+        api::ReasoningEffort::Medium,
+        api::ReasoningEffort::High,
+        api::ReasoningEffort::XHigh,
+        api::ReasoningEffort::Max,
+    ];
+
+    REQUESTED_VALUES
+        .into_iter()
+        .map(|requested| {
+            let resolution = api::resolve_reasoning(
+                &capability.provider_id,
+                &capability.model_id,
+                Some(requested.as_str()),
+            )
+            .expect("canonical reasoning preflight value must parse");
+            ReasoningCapabilityOptionDto {
+                value: requested.as_str().to_string(),
+                label: requested.label().to_string(),
+                effective: resolution.effective.as_str().to_string(),
+                status: reasoning_resolution_status_id(resolution.status).to_string(),
+                reason: resolution.reason,
+                selectable: resolution.status != api::ReasoningResolutionStatus::Unsupported,
+            }
+        })
+        .collect()
+}
+
+fn model_reasoning_capability_dto(
+    capability: &api::ReasoningCapability,
+) -> ModelReasoningCapabilityDto {
+    ModelReasoningCapabilityDto {
+        options: reasoning_preflight_options(capability),
+        default_reasoning: capability.default_reasoning.as_str().to_string(),
+        strategy: reasoning_strategy_id(capability.strategy).to_string(),
+        protocol: reasoning_protocol_id(capability.protocol).to_string(),
+        status: reasoning_capability_status_id(capability.status).to_string(),
+        note: capability.note.clone(),
+        deprecated: capability.deprecated,
+    }
+}
+
+fn capability_supports_reasoning(capability: &api::ReasoningCapability) -> bool {
+    match capability.strategy {
+        // GPT-4.1 等 non-reasoning 模型的 auto/none 只是默认与关闭开关，
+        // 不能把 none 当成可调思考程度；只有明确强度档位才算支持。
+        api::ReasoningStrategy::ProviderDefault => capability
+            .supported_options
+            .iter()
+            .any(|option| {
+                matches!(
+                    option.value,
+                    api::ReasoningEffort::Minimal
+                        | api::ReasoningEffort::Low
+                        | api::ReasoningEffort::Medium
+                        | api::ReasoningEffort::High
+                        | api::ReasoningEffort::XHigh
+                        | api::ReasoningEffort::Max
+                )
+            }),
+        // Anthropic/Zhipu/DeepSeek/xAI 的 manifest 本身声明了 thinking 语义；
+        // none 也可能是原生关闭开关，保留 true 表示该策略可被配置。
+        _ => capability
+            .supported_options
+            .iter()
+            .any(|option| option.value != api::ReasoningEffort::Auto),
+    }
+}
+
+/// 能力目录目前没有另行维护媒体注册表；模型名媒体特征仅作为 DTO 的最后回退。
+fn capability_model_type(model: &str) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    if lower.contains("glm-4.6v") {
+        "vision".to_string()
+    } else {
+        resolve_model_type(model)
+    }
+}
+
 /// 模型能力表条目：上下文容量 + 最大输出 + 可选思考程度。
-/// 前端配置会话时查此表，按所选 model 显示上下文容量与可选思考档位。
-#[derive(Serialize)]
+/// 前端配置会话时只查此表，不再从 provider/model 名称启发式生成 reasoning 矩阵。
+#[derive(Debug, Clone, Serialize)]
 struct ModelCapabilityDto {
+    /// 兼容旧 API 的 provider 显示字段；新代码使用 provider_id/provider_label。
     provider: String,
+    /// 兼容旧 API 的 model id 字段；新代码使用 model_id/model_label。
     model: String,
     context_window: u32,
     max_output_tokens: u32,
     reasoning_options: Vec<String>,
     supports_reasoning: bool,
+    provider_id: String,
+    provider_label: String,
+    model_id: String,
+    model_label: String,
+    model_type: String,
+    reasoning: ModelReasoningCapabilityDto,
+    reasoning_default: String,
+    reasoning_strategy: String,
+    reasoning_protocol: String,
+    reasoning_status: String,
+    reasoning_note: String,
+    /// 旧会话可用的显式 model id 别名；不计入当前模型目录条目。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<String>,
+    deprecated: bool,
 }
 
-/// 按 model 名推断可选思考程度：具备显式思考档位的模型给全档，纯指令/视觉模型给 none/medium。
-/// 档位与 `normalize_reasoning_effort` 对齐（low/medium/high/xhigh/max）。
-fn model_reasoning_options(model: &str) -> (Vec<String>, bool) {
-    let m = model.to_ascii_lowercase();
-    let thinking = m.contains("glm-5")
-        || m.contains("glm-4.6")
-        || m.contains("glm-4.7")
-        || m.contains("deepseek")
-        || m.contains("claude")
-        || m.contains("opus")
-        || m.contains("sonnet")
-        || m.contains("grok")
-        || m.contains("qwen")
-        || m.contains("o1")
-        || m.contains("o3");
-    if thinking {
-        (
-            ["low", "medium", "high", "xhigh", "max"]
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect(),
-            true,
-        )
-    } else {
-        (
-            ["none", "medium"]
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect(),
-            false,
-        )
-    }
-}
-
-/// GET /api/models/capabilities：返回 provider_catalog 里每个推荐模型的上下文容量与可选思考程度。
+/// GET /api/models/capabilities：适配器 reasoning manifest 的唯一能力来源。
+/// context/max 仍使用既有 token 表；新模型未注册时会得到该表的保守回退值。
 async fn api_model_capabilities() -> Json<Vec<ModelCapabilityDto>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for option in api::provider_catalog() {
-        for model in option.recommended_models.iter() {
-            let name = (*model).to_string();
-            if !seen.insert(format!("{}::{name}", option.label)) {
-                continue;
-            }
-            let limit = api::model_token_limit(&name);
-            let (reasoning_options, supports_reasoning) = model_reasoning_options(&name);
-            out.push(ModelCapabilityDto {
-                provider: option.label.to_string(),
-                model: name,
-                context_window: limit.context_tokens,
-                max_output_tokens: limit.max_output_tokens,
-                reasoning_options,
-                supports_reasoning,
-            });
+    for capability in api::reasoning_capability_catalog() {
+        let key = format!("{}::{}", capability.provider_id, capability.model_id);
+        if !seen.insert(key) {
+            continue;
         }
+        let limit = api::model_token_limit(&capability.model_id);
+        let reasoning = model_reasoning_capability_dto(&capability);
+        let aliases = api::reasoning_model_aliases(&capability.provider_id, &capability.model_id);
+        let reasoning_options = capability
+            .supported_options
+            .iter()
+            .map(|option| option.value.as_str().to_string())
+            .collect::<Vec<_>>();
+        let supports_reasoning = capability_supports_reasoning(&capability);
+        out.push(ModelCapabilityDto {
+            provider: capability.provider_label.clone(),
+            model: capability.model_id.clone(),
+            context_window: limit.context_tokens,
+            max_output_tokens: limit.max_output_tokens,
+            reasoning_options,
+            supports_reasoning,
+            provider_id: capability.provider_id.clone(),
+            provider_label: capability.provider_label.clone(),
+            model_id: capability.model_id.clone(),
+            model_label: capability.model_label.clone(),
+            model_type: capability_model_type(&capability.model_id),
+            reasoning_default: capability.default_reasoning.as_str().to_string(),
+            reasoning_strategy: reasoning.strategy.clone(),
+            reasoning_protocol: reasoning.protocol.clone(),
+            reasoning_status: reasoning.status.clone(),
+            reasoning_note: reasoning.note.clone(),
+            aliases,
+            deprecated: capability.deprecated,
+            reasoning,
+        });
     }
     Json(out)
 }
@@ -27131,24 +29240,49 @@ fn webview2_runtime_candidates() -> Vec<PathBuf> {
     if let Ok(folder) = env::var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER") {
         let trimmed = folder.trim();
         if !trimmed.is_empty() {
-            candidates.push(PathBuf::from(trimmed).join("msedgewebview2.exe"));
-            candidates.push(PathBuf::from(trimmed));
+            let override_path = PathBuf::from(trimmed);
+            candidates.push(override_path.join("msedgewebview2.exe"));
+            candidates.push(override_path);
         }
     }
     #[cfg(windows)]
     {
-        candidates.push(PathBuf::from(
-            r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\msedgewebview2.exe",
-        ));
-        candidates.push(PathBuf::from(
-            r"C:\Program Files\Microsoft\EdgeWebView\Application\msedgewebview2.exe",
-        ));
+        let roots = vec![
+            PathBuf::from(r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application"),
+            PathBuf::from(r"C:\Program Files\Microsoft\EdgeWebView\Application"),
+        ];
+        candidates.extend(webview2_runtime_candidates_for_roots(&roots));
+    }
+    candidates
+}
+
+/// 为已知的 WebView2 Application 根目录生成候选，不做全盘或递归搜索。
+/// 标准安装通常把真实 exe 放在 Application\\<版本>\\ 下，同时保留根目录直放候选以兼容既有布局。
+fn webview2_runtime_candidates_for_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for root in roots {
+        candidates.push(root.join("msedgewebview2.exe"));
+
+        let mut version_dirs = std::fs::read_dir(root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        version_dirs.sort();
+        candidates.extend(
+            version_dirs
+                .into_iter()
+                .map(|version_dir| version_dir.join("msedgewebview2.exe")),
+        );
     }
     candidates
 }
 
 fn webview2_runtime_check_for(candidates: &[PathBuf]) -> DiagnosticsCheck {
-    if let Some(path) = candidates.iter().find(|path| path.exists()) {
+    if let Some(path) = candidates.iter().find(|path| path.is_file()) {
         diagnostics_check(
             "desktop.webview2",
             "WebView2 Runtime",
@@ -27281,9 +29415,18 @@ fn looks_like_secret(value: &str) -> bool {
 }
 
 fn persist_auto_memory_beads(messages: &[ChatMessageDto]) {
+    persist_auto_memory_beads_at_path(None, messages);
+}
+
+/// Goal 自动结果的 memory 写入必须再次确认当前 store 仍指向模型调用前捕获的 DB，
+/// 避免 workspace reload 后把旧结果沉淀到新 workspace。
+fn persist_auto_memory_beads_at_path(expected_path: Option<&Path>, messages: &[ChatMessageDto]) {
     let Ok(mut store) = session_store().lock() else {
         return;
     };
+    if expected_path.is_some_and(|path| store.path != path) {
+        return;
+    }
     let mut write_span = diagnostics::start_span("memory.write", "memory");
     diagnostics::info(
         "memory",
@@ -27516,7 +29659,7 @@ struct PreparedGoalTrigger {
     consultation_required: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ContextBuildOptions {
     history_token_budget: u32,
     memory_token_budget: u32,
@@ -27524,6 +29667,8 @@ struct ContextBuildOptions {
     image_token_estimate: u32,
     max_memory_beads: usize,
     history_floor_millis: Option<u64>,
+    /// 当前 turn 所属聊天室；None 表示调用方没有房间作用域（例如通用模型探测）。
+    chat_room_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27613,6 +29758,7 @@ impl Default for ContextBuildOptions {
             image_token_estimate: default_context_image_token_estimate(),
             max_memory_beads: 8,
             history_floor_millis: None,
+            chat_room_id: None,
         }
     }
 }
@@ -27628,16 +29774,80 @@ struct ContextTokenBudget {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct ContextRuntimeSnapshot {
+    /// 本轮上下文与运行时作用域的联合身份；作用域变化会生成新值。
+    snapshot_id: String,
+    workspace_id: String,
+    chat_room_id: Option<String>,
+    permission_profile: String,
+    model: String,
+    provider: String,
+    tool_catalog_revision: String,
+    memory_revision: String,
+    memory_mode: String,
+    history_floor_millis: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContextCompactionItem {
+    id: String,
+    kind: String,
+    source: String,
+    summary: String,
+    message_count: usize,
+    token_count: u32,
+    created_at: u64,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContextMemorySelectionEvidence {
+    /// 召回路径：semantic、keyword 或 prompt_fallback。
+    strategy: String,
+    /// 经过查询但尚未做 TTL/superseded/token 过滤的候选 bead。
+    candidate_ids: Vec<String>,
+    /// 最终实际注入 system prompt 的 bead；预算裁剪后会再次同步。
+    selected_ids: Vec<String>,
+    expired_or_invalid_ids: Vec<String>,
+    superseded_ids: Vec<String>,
+    budget_skipped_ids: Vec<String>,
+    used_tokens: u32,
+    token_budget: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContextHistorySelectionEvidence {
+    /// 模型上下文的权威历史来源；当前固定为聊天室消息投影。
+    source: String,
+    /// 进入历史选择器前的聊天室消息 ID。
+    candidate_ids: Vec<String>,
+    /// 本轮真正转换成 InputMessage 并发送给模型的历史消息 ID。
+    selected_ids: Vec<String>,
+    /// 候选中未进入本轮模型输入的消息 ID（重置边界、临时消息、预算等原因）。
+    excluded_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ContextAssembly {
     system_prompt: String,
     messages: Vec<InputMessage>,
     memory_beads: Vec<MemoryBeadDto>,
+    /// 生成该上下文的真实运行时回合；与 history projection 的派生 turn id 分开。
+    turn_id: Option<String>,
     /// 本次装配的稳定身份；前端可用它判断预览是否已经过期。
     context_snapshot_id: String,
     /// 由候选 memory beads 内容计算的 revision，不把完整记忆文本复制到状态栏。
     memory_revision: String,
     /// 实际注入 prompt 的 bead id，便于诊断“记忆已加载但未进入上下文”的差异。
     memory_bead_ids: Vec<String>,
+    /// 记忆召回、过滤和 token 预算证据，供预览/回放诊断。
+    memory_selection: ContextMemorySelectionEvidence,
+    /// 历史来源与实际注入边界证据；session messages 不属于本字段的模型输入来源。
+    history_selection: ContextHistorySelectionEvidence,
+    /// 历史被预算裁剪时生成的 typed compaction item；与原始消息分开，便于回放和恢复。
+    compaction_item: Option<ContextCompactionItem>,
+    /// 本轮固定的 workspace/聊天室/权限/模型/工具目录作用域。
+    runtime_snapshot: ContextRuntimeSnapshot,
     history_floor_millis: Option<u64>,
     history_message_count: usize,
     token_budget: ContextTokenBudget,
@@ -27704,7 +29914,7 @@ fn context_usage_footer_for_snapshot(
         String::new()
     };
     format!(
-        "---\nContext usage: {}.{}% ({}/{} {token_label} tokens; source={source}). Local estimate: {} tokens; local prompt budget: {}/{} tokens; history truncated: {}.{}",
+        "---\nContext usage: {}.{}% ({}/{} {token_label} tokens; source={source}). Local estimate: {} tokens; local prompt budget: {}/{} tokens; history truncated: {}.\nContext turn: {}; Context snapshot: {}; history source: {}; history loaded: {}; memory revision: {}{}",
         snapshot.percent_tenths / 10,
         snapshot.percent_tenths % 10,
         snapshot.used_tokens,
@@ -27713,6 +29923,11 @@ fn context_usage_footer_for_snapshot(
         assembly.token_budget.total,
         assembly.token_budget.budget,
         assembly.truncated,
+        assembly.turn_id.as_deref().unwrap_or("none"),
+        assembly.context_snapshot_id,
+        assembly.history_selection.source,
+        assembly.history_selection.selected_ids.len(),
+        assembly.memory_revision,
         warning,
         source = snapshot.source.as_str(),
     )
@@ -27906,16 +30121,23 @@ async fn stream_agent_model(
     image_urls: &[String],
     context_history: &[PersistedChatMessage],
     collaboration_roster: Option<&ChatRosterResponse>,
+    turn_id: &str,
     chat_room_id: Option<&str>,
 ) -> Result<(api::MessageStream, ContextAssembly), api::ApiError> {
-    let assembly = build_context_assembly_with_roster(
+    let mut assembly = build_context_assembly_with_roster(
         agent,
         context_history,
         prompt,
         image_urls,
-        context_build_options_for_agent(agent),
+        context_build_options_for_agent_with_floor_and_room(
+            agent,
+            session_context_reset_floor(&agent.id),
+            chat_room_id,
+        ),
         collaboration_roster,
     );
+    // 流式入口不经过 agent_chat_response 的 TURN_TRACE scope，显式回填真实回合 ID。
+    assembly.turn_id = Some(turn_id.to_string());
     let request = agent_message_request_with_context_for_room(agent, true, &assembly, chat_room_id);
     let stream = provider_client_for_agent(agent)?
         .stream_message(&request)
@@ -29372,6 +31594,10 @@ fn agent_message_request_build_with_system(
         system_prompt.len(),
         tool_names,
     );
+    let reasoning_effort = api::parse_legacy_reasoning_effort(Some(&agent.reasoning_effort))
+        .value
+        .as_str()
+        .to_string();
     MessageRequest {
         model: agent.model.clone(),
         max_tokens,
@@ -29379,7 +31605,7 @@ fn agent_message_request_build_with_system(
         system: Some(system_prompt),
         tools,
         tool_choice,
-        reasoning_effort: Some(normalize_reasoning_effort(Some(&agent.reasoning_effort))),
+        reasoning_effort: Some(reasoning_effort),
         stream,
     }
 }
@@ -30406,14 +32632,61 @@ async fn run_tool_intent_message(agent: &AgentSessionDto, prompt: &str) -> Optio
     })
 }
 
-async fn run_model_tool_use_message(
+fn tool_messages_from_summary(
+    agent: &AgentSessionDto,
+    tool_use_id: &str,
+    dispatch_turn_id: &str,
+    name: &str,
+    call_summary: String,
+    result_summary: String,
+    status: &str,
+    route: &str,
+) -> Vec<ChatMessageDto> {
+    let tool_call_id = format!(
+        "tool-call-{:016x}",
+        hash_bytes(
+            format!(
+                "{}\u{1f}{}\u{1f}{}",
+                agent.id, dispatch_turn_id, tool_use_id
+            )
+            .as_bytes(),
+        )
+    );
+    let result_id = tool_call_id.replacen("tool-call-", "tool-result-", 1);
+    let result_content = format!(
+        "tool_call_id: {tool_call_id}\ntool_name: {name}\nroute: {route}\nstatus: {status}\nsummary: {}",
+        compact_message_snippet(&result_summary, 1200)
+    );
+    vec![
+        ChatMessageDto {
+            id: tool_call_id,
+            author: "系统工具执行 Agent".to_string(),
+            role: "assistant".to_string(),
+            target: agent.display_name.clone(),
+            content: call_summary,
+            kind: "tool-summary".to_string(),
+            attachments: Vec::new(),
+        },
+        ChatMessageDto {
+            id: result_id,
+            author: "工具结果".to_string(),
+            role: "assistant".to_string(),
+            target: agent.display_name.clone(),
+            content: result_content,
+            kind: "tool-result".to_string(),
+            attachments: Vec::new(),
+        },
+    ]
+}
+
+async fn run_model_tool_use_messages(
     agent: &AgentSessionDto,
     tool_use_id: &str,
     name: &str,
     input: &JsonValue,
     turn_id: Option<&str>,
     chat_room_id: Option<&str>,
-) -> ChatMessageDto {
+) -> Vec<ChatMessageDto> {
     diag!(
         "[TOOL-CHAIN] run_model_tool_use_message: agent={}, tool={name}, tool_use_id={tool_use_id}, input={input}",
         agent.name
@@ -30447,7 +32720,7 @@ async fn run_model_tool_use_message(
         chat_room_id,
     )
     .await;
-    let content = match response {
+    let (content, result_content, result_status, result_route) = match response {
         Ok(dispatch) => {
             diagnostics::info(
                 "tool",
@@ -30459,7 +32732,17 @@ async fn run_model_tool_use_message(
                     ("latency_ms", tool_started.elapsed().as_millis().to_string()),
                 ],
             );
-            dispatch_plan_chat_summary(&dispatch)
+            let summary = dispatch_plan_chat_summary(&dispatch);
+            let result_text = dispatch
+                .tool_result_text
+                .clone()
+                .unwrap_or_else(|| dispatch_plan_detail(&dispatch));
+            (
+                summary,
+                compact_message_snippet(&result_text, 1200),
+                dispatch.status,
+                dispatch.route,
+            )
         }
         Err(error) => {
             let detail = error.1.error.to_string();
@@ -30475,19 +32758,25 @@ async fn run_model_tool_use_message(
                     ("latency_ms", tool_started.elapsed().as_millis().to_string()),
                 ],
             );
-            format!("工具 `{name}` 调用失败：{detail}")
+            (
+                format!("工具 `{name}` 调用失败：{detail}"),
+                compact_message_snippet(&detail, 1200),
+                "failed".to_string(),
+                "runtime-failed".to_string(),
+            )
         }
     };
 
-    ChatMessageDto {
-        id: format!("msg-{}-model-tool", unix_timestamp_millis()),
-        author: "系统工具执行 Agent".to_string(),
-        role: "assistant".to_string(),
-        target: agent.display_name.clone(),
+    tool_messages_from_summary(
+        agent,
+        tool_use_id,
+        &dispatch_turn_id,
+        name,
         content,
-        kind: "tool-summary".to_string(),
-        attachments: Vec::new(),
-    }
+        result_content,
+        &result_status,
+        &result_route,
+    )
 }
 
 async fn run_model_tool_dispatch(name: &str, input: &JsonValue) -> ApiResult<ToolDispatchResponse> {
@@ -33017,7 +35306,7 @@ impl SessionStore {
         let mut added_memory_beads = 0usize;
         if let Some(summary) = summary {
             let signature =
-                memory_bead_signature("L2", "conversation", "context:auto-compact", &summary);
+                memory_bead_signature("L2", "compaction", "context:auto-compact", &summary);
             if !session
                 .memory_beads
                 .iter()
@@ -33025,7 +35314,7 @@ impl SessionStore {
             {
                 session.memory_beads.push(MemoryBeadDto {
                     id: format!("ctx-compact-{now}-{:016x}", hash_bytes(summary.as_bytes())),
-                    kind: "conversation".to_string(),
+                    kind: "compaction".to_string(),
                     layer: "L2".to_string(),
                     summary: summary.clone(),
                     source: "context:auto-compact".to_string(),
@@ -33493,50 +35782,43 @@ impl SessionStore {
                 retry_context
             );
             if target_session_id == commander_session_id {
-                self.install_goal_task_skill_overlay(
+                // 先在 durable DB 中占用 phase，再执行 overlay 等内存/持久化副作用。
+                // CAS 失败只跳过本 phase，绝不创建重复 handoff。
+                let Some(claim) = claim_goal_phase_for_dispatch(
+                    &self.path,
+                    workspace_id,
+                    goal_id,
+                    &room_id,
+                    phase,
+                    &target_session_id,
+                    &commander_session_id,
+                    "self-role",
+                    false,
+                )?
+                else {
+                    skipped.push(GoalPhaseDispatchDto {
+                        phase_id: phase_review.phase_id.clone(),
+                        title: phase_review.title.clone(),
+                        assigned_role: phase_review.assigned_role.clone(),
+                        assigned_session_id: phase_review.assigned_session_id.clone(),
+                        action: "dispatch_skipped".to_string(),
+                        reason: "Phase is no longer pending or already claimed.".to_string(),
+                        handoff_id: None,
+                    });
+                    continue;
+                };
+                if let Err(error) = self.install_goal_task_skill_overlay(
                     &target_session_id,
                     &goal,
                     phase,
                     &required_skills,
                     &output_artifacts,
                     &verification,
-                )?;
-                let connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
-                initialize_session_schema(&connection).map_err(sqlite_api_error)?;
-                update_goal_phase_status_connection(
-                    &connection,
-                    workspace_id,
-                    goal_id,
-                    &phase.id,
-                    "running",
-                )
-                .map_err(sqlite_api_error)?;
-                insert_goal_event_connection(
-                    &connection,
-                    goal_id,
-                    "goal-phase-dispatched",
-                    &format!(
-                        "Phase {} self-dispatched to {}.",
-                        phase.id, target_session_id
-                    ),
-                    json!({
-                        "caller": "goal-loop",
-                        "phase_id": phase.id.clone(),
-                        "assigned_role": phase.assigned_role.clone(),
-                        "assigned_session_id": target_session_id.clone(),
-                        "handoff_id": JsonValue::Null,
-                        "dispatch_mode": "self-role",
-                        "chat_room_id": room_id.clone(),
-                        "originating_user_msg_id": originating_user_msg_id.clone(),
-                        "commander_session_id": commander_session_id.clone(),
-                        // GL-14（codex #4）：self-dispatch 分支同样要带前进决策的因果链，
-                        // 否则这条路径派发出去的阶段在事件流里查不到「为什么现在轮到它」。
-                        "route_reason": if phase.retry_count > 0 { "retry" } else { "advance" },
-                        "retry_count": phase.retry_count,
-                        "depends_on": phase.depends_on.clone(),
-                    }),
-                )
-                .map_err(sqlite_api_error)?;
+                ) {
+                    self.remove_goal_task_skill_overlay(&goal.id, &phase.id)?;
+                    fail_goal_phase_dispatch(&claim, "task-scoped skill overlay failed")?;
+                    return Err(error);
+                }
                 // GL-07（codex #5 + 二轮 #3）：self-dispatch 不走 handoff，intent 原本被直接丢弃——
                 // 被打回的 self-role 阶段拿不到失败原因/证据。必须写进**聊天室**：自动执行的
                 // context_history 取自聊天室消息，写 session messages 不会进下一次模型请求。
@@ -33554,8 +35836,19 @@ impl SessionStore {
                         kind: "task-summary".to_string(),
                         attachments: Vec::new(),
                     };
-                    self.append_chat_room_messages(&room_id, vec![retry_message.clone()])?;
-                    self.append_chat_messages(&target_session_id, vec![retry_message])?;
+                    if let Err(error) = self.append_goal_phase_retry_context(
+                        &room_id,
+                        &target_session_id,
+                        retry_message,
+                    ) {
+                        // retry context 可能已经写入 room；保留 claim/run 为 in-doubt，
+                        // 禁止清 claim 后让下一次 dispatch 重复产生执行指令。
+                        mark_goal_phase_dispatch_in_doubt(
+                            &claim,
+                            "retry context atomic append failed",
+                        )?;
+                        return Err(error);
+                    }
                 }
                 dispatched.push(GoalPhaseDispatchDto {
                     phase_id: phase_review.phase_id.clone(),
@@ -33590,62 +35883,77 @@ impl SessionStore {
                     "max_retries": phase.max_retries,
                 })
             });
-            let response = self
-                .create_manual_handoff(
-                    &room_id,
-                    ManualHandoffRequest {
-                        from_agent_id: commander_session_id.clone(),
-                        to: target_session_id.clone(),
-                        intent,
-                        attach: Some("none".to_string()),
-                        attach_message_ids: Some(Vec::new()),
-                        originating_user_msg_id: Some(originating_user_msg_id.clone()),
-                        depth: Some(0),
-                        contract,
-                    },
-                )?
-                .0;
+            // 这些是 create_manual_handoff 可能返回错误的确定性前置条件；在 claim 前验证，
+            // 让真正进入 create 的错误统一按“可能已写入 inbound”保留 in-doubt claim。
+            self.validate_goal_phase_handoff_preflight(
+                &room_id,
+                &commander_session_id,
+                &target_session_id,
+                &intent,
+            )?;
+            // handoff 也是外部/内存副作用，必须在 claim 提交后才能开始。
+            let Some(claim) = claim_goal_phase_for_dispatch(
+                &self.path,
+                workspace_id,
+                goal_id,
+                &room_id,
+                phase,
+                &target_session_id,
+                &commander_session_id,
+                "handoff",
+                true,
+            )?
+            else {
+                skipped.push(GoalPhaseDispatchDto {
+                    phase_id: phase_review.phase_id.clone(),
+                    title: phase_review.title.clone(),
+                    assigned_role: phase_review.assigned_role.clone(),
+                    assigned_session_id: phase_review.assigned_session_id.clone(),
+                    action: "dispatch_skipped".to_string(),
+                    reason: "Phase is no longer pending or already claimed.".to_string(),
+                    handoff_id: None,
+                });
+                continue;
+            };
+            // overlay 必须先于 handoff；成功 handoff 后不再存在可失败的后续步骤。
+            if let Err(error) = self.install_goal_task_skill_overlay(
+                &target_session_id,
+                &goal,
+                phase,
+                &required_skills,
+                &output_artifacts,
+                &verification,
+            ) {
+                self.remove_goal_task_skill_overlay(&goal.id, &phase.id)?;
+                fail_goal_phase_dispatch(&claim, "task-scoped skill overlay failed")?;
+                return Err(error);
+            }
+            let response = match self.create_manual_handoff(
+                &room_id,
+                ManualHandoffRequest {
+                    from_agent_id: commander_session_id.clone(),
+                    to: target_session_id.clone(),
+                    intent,
+                    attach: Some("none".to_string()),
+                    attach_message_ids: Some(Vec::new()),
+                    originating_user_msg_id: Some(originating_user_msg_id.clone()),
+                    depth: Some(0),
+                    contract,
+                },
+            ) {
+                Ok(response) => response.0,
+                Err(error) => {
+                    // create_manual_handoff 可能已将 inbound message 保存后才在 handoff
+                    // insert 处失败；此时清 claim 会让重派产生第二个执行指令。保留 accepted
+                    // run + running phase，并记录有界 in-doubt 事件，交给后续恢复路径处理。
+                    mark_goal_phase_dispatch_in_doubt(
+                        &claim,
+                        "goal phase handoff creation may have partially persisted",
+                    )?;
+                    return Err(error);
+                }
+            };
             if response.handoff.status == "delivered" {
-                self.install_goal_task_skill_overlay(
-                    &target_session_id,
-                    &goal,
-                    phase,
-                    &required_skills,
-                    &output_artifacts,
-                    &verification,
-                )?;
-                let connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
-                initialize_session_schema(&connection).map_err(sqlite_api_error)?;
-                update_goal_phase_status_connection(
-                    &connection,
-                    workspace_id,
-                    goal_id,
-                    &phase.id,
-                    "running",
-                )
-                .map_err(sqlite_api_error)?;
-                insert_goal_event_connection(
-                    &connection,
-                    goal_id,
-                    "goal-phase-dispatched",
-                    &format!("Phase {} dispatched to {}.", phase.id, target_session_id),
-                    json!({
-                        "caller": "goal-loop",
-                        "phase_id": phase.id.clone(),
-                        "assigned_role": phase.assigned_role.clone(),
-                        "assigned_session_id": target_session_id.clone(),
-                        "handoff_id": response.handoff.id.clone(),
-                        "chat_room_id": room_id.clone(),
-                        "originating_user_msg_id": originating_user_msg_id.clone(),
-                        "commander_session_id": commander_session_id.clone(),
-                        // GL-14：前进决策的因果链——是首次派发还是被打回后重跑、
-                        // 依赖了谁。让事件流能回看"为什么现在轮到这个阶段"。
-                        "route_reason": if phase.retry_count > 0 { "retry" } else { "advance" },
-                        "retry_count": phase.retry_count,
-                        "depends_on": phase.depends_on.clone(),
-                    }),
-                )
-                .map_err(sqlite_api_error)?;
                 dispatched.push(GoalPhaseDispatchDto {
                     phase_id: phase_review.phase_id.clone(),
                     title: phase_review.title.clone(),
@@ -33656,16 +35964,20 @@ impl SessionStore {
                     handoff_id: Some(response.handoff.id),
                 });
             } else {
+                let rejected_reason = response
+                    .handoff
+                    .rejected_reason
+                    .clone()
+                    .unwrap_or_else(|| "handoff rejected".to_string());
+                self.remove_goal_task_skill_overlay(&goal.id, &phase.id)?;
+                fail_goal_phase_dispatch(&claim, &rejected_reason)?;
                 skipped.push(GoalPhaseDispatchDto {
                     phase_id: phase_review.phase_id.clone(),
                     title: phase_review.title.clone(),
                     assigned_role: phase_review.assigned_role.clone(),
                     assigned_session_id: phase_review.assigned_session_id.clone(),
                     action: "handoff_rejected".to_string(),
-                    reason: response
-                        .handoff
-                        .rejected_reason
-                        .unwrap_or_else(|| "handoff rejected".to_string()),
+                    reason: rejected_reason,
                     handoff_id: Some(response.handoff.id),
                 });
             }
@@ -33735,6 +36047,53 @@ impl SessionStore {
         });
         session.prune_memory_beads();
         self.save()?;
+        Ok(())
+    }
+
+    fn remove_goal_task_skill_overlay(&mut self, goal_id: &str, phase_id: &str) -> ApiResult<()> {
+        let source = goal_task_skill_memory_source(goal_id);
+        let id = goal_task_skill_memory_id(goal_id, phase_id);
+        for session in &mut self.state.sessions {
+            session.memory_beads.retain(|bead| {
+                !(bead.kind == "goal-task-skill" && bead.id == id && bead.source == source)
+            });
+        }
+        // 即使当前内存快照没有 bead，也用一次 save 将 SQLite 中同一精确 id 的旧 overlay
+        // 一并清掉；不触碰同 goal 的其它 phase overlay。
+        self.save()
+    }
+
+    fn validate_goal_phase_handoff_preflight(
+        &self,
+        room_id: &str,
+        from_agent_id: &str,
+        target_session_id: &str,
+        intent: &str,
+    ) -> ApiResult<()> {
+        if !self.state.chat_rooms.iter().any(|room| room.id == room_id) {
+            return Err(api_error(StatusCode::NOT_FOUND, "聊天室不存在"));
+        }
+        if !self
+            .state
+            .sessions
+            .iter()
+            .any(|session| session.id == from_agent_id)
+        {
+            return Err(api_error(StatusCode::NOT_FOUND, "发起 Agent 不存在"));
+        }
+        let roster = chat_room_roster_from_state(&self.state, room_id, None)?;
+        if resolve_handoff_target(target_session_id, &roster).is_none() {
+            return Err(api_error(
+                StatusCode::NOT_FOUND,
+                "目标 Agent 不存在或不可用",
+            ));
+        }
+        if intent.trim().is_empty() {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "handoff intent 不能为空",
+            ));
+        }
         Ok(())
     }
 
@@ -33824,6 +36183,23 @@ impl SessionStore {
         let tx = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(sqlite_api_error)?;
+        // 手工完成不能覆盖 durable claim。检查与后续 status/verdict/event 写入共用
+        // Immediate 事务，避免读到无 claim 后被并发 dispatch 抢占。
+        let active_run_id: Option<String> = tx
+            .query_row(
+                "SELECT active_run_id FROM goal_phases \
+                 WHERE goal_id = ?1 AND id = ?2 AND active_run_id IS NOT NULL",
+                params![goal_id, phase_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_api_error)?;
+        if active_run_id.is_some() {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "phase has an active run claim; wait for it to finish",
+            ));
+        }
         update_goal_phase_status_connection(&tx, workspace_id, goal_id, phase_id, "completed")
             .map_err(sqlite_api_error)?;
         // 事件在事务内只写库不广播，commit 成功后再统一广播（防回滚幽灵事件，codex #4）。
@@ -33891,70 +36267,418 @@ impl SessionStore {
         goal_id: &str,
         phase_id: &str,
     ) -> ApiResult<GoalPhaseRunContext> {
-        let goal = get_goal_sqlite(&self.path, workspace_id, goal_id)?;
-        if matches!(goal.status.as_str(), "paused" | "cancelled" | "completed") {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "Goal is not runnable in its current status.",
-            ));
-        }
-        let phase = goal
-            .phases
-            .iter()
-            .find(|phase| phase.id == phase_id)
-            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Goal phase does not exist."))?;
-        if phase.status != "running" {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "Only running goal phases can be executed.",
-            ));
-        }
-        // GL-08（codex 二轮 #1）：在模型调用前**原子占用**一次迭代额度。
-        // 全局刹车必须挡在真正的执行入口上——commander review 只能拦派发，run-next 会绕过
-        // review 直接跑 running 阶段。且必须是条件 UPDATE 占用而不是先读后判，否则并发下
-        // 两个请求会同时通过检查、双双执行把计数顶到 max+1。
+        let db_path = self.path.clone();
+        let mut connection = open_session_connection(&db_path).map_err(sqlite_api_error)?;
+        initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+        let now = unix_timestamp_millis();
+        let mut prepared: Option<(GoalDto, GoalPhaseDto, GoalPhaseClaim)> = None;
+        let mut budget_failure: Option<(GoalPhaseClaim, bool, u32, u32)> = None;
         {
-            let connection = open_session_connection(&self.path).map_err(sqlite_api_error)?;
-            initialize_session_schema(&connection).map_err(sqlite_api_error)?;
-            if reserve_goal_iteration_connection(&connection, workspace_id, goal_id)
+            // Goal、phase claim、run start 和 iteration reserve 必须共享同一 Immediate 事务；
+            // 事务外的旧 DTO 不能决定是否进入模型调用。
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sqlite_api_error)?;
+            let goal_row = {
+                let mut statement = transaction
+                    .prepare(
+                        r#"
+                        SELECT id, workspace_id, chat_room_id, title, status, max_iterations,
+                               current_iteration, background, originating_user_msg_id,
+                               completion_condition_json, plan_json, created_at, updated_at, cancelled_at
+                        FROM goals
+                        WHERE workspace_id = ?1 AND id = ?2
+                        "#,
+                    )
+                    .map_err(sqlite_api_error)?;
+                statement
+                    .query_row(params![workspace_id, goal_id], goal_row_from_row)
+                    .optional()
+                    .map_err(sqlite_api_error)?
+            }
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Goal 不存"))?;
+            let goal = goal_dto_from_row(&transaction, goal_row)?;
+
+            // accepted run 还没有真正进入 worker（started_at IS NULL）时，
+            // cancel/pause/direct interrupt 可能已经先把它 CAS 成 stop_requested。
+            // 在任何 terminal/paused 早退前收敛这条自有 claim，避免 accepted 窗口
+            // 永久悬挂；running stop_requested 则必须留给迟到结果 finalizer。
+            let prestart_stop_run: Option<(String, String, Option<String>, Option<String>)> = transaction
+                .query_row(
+                    r#"
+                    SELECT r.id, r.claim_token, r.stop_reason, r.session_id
+                    FROM goal_phases p
+                    JOIN runtime_runs r ON r.id = p.active_run_id
+                    WHERE p.goal_id = ?1
+                      AND p.id = ?2
+                      AND p.status = 'running'
+                      AND r.kind = 'goal_phase'
+                      AND r.workspace_id = ?3
+                      AND r.goal_id = ?1
+                      AND r.phase_id = ?2
+                      AND r.chat_room_id = ?4
+                      AND p.claim_token = r.claim_token
+                      AND r.state = 'stop_requested'
+                      AND r.started_at IS NULL
+                    "#,
+                    params![goal_id, phase_id, workspace_id, &goal.chat_room_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(sqlite_api_error)?;
+            if let Some((run_id, claim_token, stop_reason, run_session_id)) = prestart_stop_run {
+                let expected_session_id = goal
+                    .phases
+                    .iter()
+                    .find(|phase| phase.id == phase_id)
+                    .and_then(|phase| phase.assigned_session_id.as_deref());
+                // assigned_session_id 是由 role 配置在 DTO 查询层解析出的派生字段，
+                // 不是 goal_phases 的物理列；这里在同一事务 fresh DTO 上补等价
+                // session scope CAS，错误 session 的 accepted run 只能保留现场。
+                if expected_session_id.is_none()
+                    || expected_session_id != run_session_id.as_deref()
+                {
+                    return Err(stale_goal_phase_result_error());
+                } else {
+                    let events = finalize_goal_phase_interrupted_transaction(
+                        &transaction,
+                        workspace_id,
+                        goal_id,
+                        phase_id,
+                        &run_id,
+                        &claim_token,
+                        "stop_requested",
+                        &goal.status,
+                        stop_reason.as_deref().unwrap_or("stop_requested"),
+                    )
+                    .map_err(sqlite_api_error)?;
+                    transaction.commit().map_err(sqlite_api_error)?;
+                    broadcast_runtime_run_event(events.runtime);
+                    broadcast_goal_event(events.goal);
+                    return Err(api_error(
+                        StatusCode::CONFLICT,
+                        "Goal phase stop was requested before execution began; no model call was made.",
+                    ));
+                }
+            }
+            if matches!(goal.status.as_str(), "paused" | "cancelled" | "completed") {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Goal is not runnable in its current status.",
+                ));
+            }
+            if !self
+                .state
+                .chat_rooms
+                .iter()
+                .any(|room| room.id == goal.chat_room_id)
+            {
+                return Err(api_error(
+                    StatusCode::NOT_FOUND,
+                    "Goal chat room does not exist.",
+                ));
+            }
+            let phase = goal
+                .phases
+                .iter()
+                .find(|phase| phase.id == phase_id)
+                .cloned()
+                .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Goal phase does not exist."))?;
+            if phase.status != "running" {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Only running goal phases can be executed.",
+                ));
+            }
+            let assigned_session_id = phase.assigned_session_id.clone().ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Goal phase has no assigned session to run.",
+                )
+            })?;
+            // assigned session 也在 transaction 内的 fresh phase 后校验；self.state 由调用方
+            // 持有 store 锁，不能在本同步段被切换。
+            if !self
+                .state
+                .sessions
+                .iter()
+                .any(|session| session.id == assigned_session_id)
+            {
+                return Err(api_error(
+                    StatusCode::NOT_FOUND,
+                    "Goal phase assigned session does not exist.",
+                ));
+            }
+            let (stored_active_run_id, stored_claim_token, stored_claim_owner): (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = transaction
+                .query_row(
+                    "SELECT active_run_id, claim_token, claim_owner FROM goal_phases \
+                     WHERE goal_id = ?1 AND id = ?2",
+                    params![goal_id, phase_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(sqlite_api_error)?
+                .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Goal phase does not exist."))?;
+            let mut pending_events = Vec::new();
+            let claim;
+            let claim_is_preexisting;
+            if let Some(active_run_id) = stored_active_run_id {
+                let claim_token = stored_claim_token.ok_or_else(|| {
+                    api_error(
+                        StatusCode::CONFLICT,
+                        "goal phase active run is missing its claim token",
+                    )
+                })?;
+                if phase.active_run_id.as_deref() != Some(active_run_id.as_str()) {
+                    return Err(api_error(
+                        StatusCode::CONFLICT,
+                        "goal phase active run snapshot is stale",
+                    ));
+                }
+                let run = query_runtime_run_connection(&transaction, &active_run_id)
+                    .map_err(sqlite_api_error)?
+                    .ok_or_else(|| {
+                        api_error(
+                            StatusCode::CONFLICT,
+                            "goal phase active run no longer exists",
+                        )
+                    })?;
+                if run.kind != "goal_phase"
+                    || run.workspace_id != workspace_id
+                    || run.goal_id.as_deref() != Some(goal_id)
+                    || run.phase_id.as_deref() != Some(phase_id)
+                    || run.chat_room_id.as_deref() != Some(goal.chat_room_id.as_str())
+                    || run.session_id.as_deref() != Some(assigned_session_id.as_str())
+                    || run.claim_token != claim_token
+                    || !matches!(run.state.as_str(), "accepted")
+                {
+                    return Err(api_error(
+                        StatusCode::CONFLICT,
+                        "goal phase active run claim is stale or mismatched",
+                    ));
+                }
+                let claim_owner = run
+                    .owner_id
+                    .or(stored_claim_owner)
+                    .unwrap_or_else(|| format!("coolzhu-web-console:{}", std::process::id()));
+                claim = GoalPhaseClaim {
+                    run_id: active_run_id,
+                    claim_token,
+                    claim_owner,
+                    db_path: db_path.clone(),
+                    goal_id: goal_id.to_string(),
+                    phase_id: phase_id.to_string(),
+                };
+                let changed = transaction
+                    .execute(
+                        r#"
+                        UPDATE runtime_runs
+                           SET state = 'running', started_at = ?3, heartbeat_at = ?3
+                         WHERE id = ?1
+                           AND kind = 'goal_phase'
+                           AND claim_token = ?2
+                           AND state = 'accepted'
+                        "#,
+                        params![&claim.run_id, &claim.claim_token, u64_to_i64(now)],
+                    )
+                    .map_err(sqlite_api_error)?;
+                if changed != 1 {
+                    return Err(api_error(
+                        StatusCode::CONFLICT,
+                        "goal phase run was already started or stopped",
+                    ));
+                }
+                pending_events.push(
+                    append_runtime_run_event_deferred(
+                        &transaction,
+                        &claim.run_id,
+                        "run.started",
+                        json!({
+                            "kind": "goal_phase",
+                            "previous_state": "accepted",
+                            "goal_id": goal_id,
+                            "phase_id": phase_id,
+                        }),
+                    )
+                    .map_err(sqlite_api_error)?,
+                );
+                claim_is_preexisting = true;
+            } else {
+                claim = new_goal_phase_claim(&db_path, goal_id, phase_id)
+                    .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error))?;
+                let run = RuntimeRunRecord {
+                    id: claim.run_id.clone(),
+                    kind: "goal_phase".to_string(),
+                    workspace_id: workspace_id.to_string(),
+                    session_id: Some(assigned_session_id.clone()),
+                    chat_room_id: Some(goal.chat_room_id.clone()),
+                    goal_id: Some(goal_id.to_string()),
+                    phase_id: Some(phase_id.to_string()),
+                    legacy_turn_id: None,
+                    provider_turn_id: None,
+                    state: "accepted".to_string(),
+                    owner_id: Some(claim.claim_owner.clone()),
+                    claim_token: claim.claim_token.clone(),
+                    stop_reason: None,
+                    error_json: None,
+                    created_at: u64_to_i64(now),
+                    started_at: None,
+                    stop_requested_at: None,
+                    heartbeat_at: Some(u64_to_i64(now)),
+                    finished_at: None,
+                };
+                if let Err(error) = insert_runtime_run_connection(&transaction, &run) {
+                    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                        return Err(api_error(
+                            StatusCode::CONFLICT,
+                            "goal phase already has an active execution claim",
+                        ));
+                    }
+                    return Err(sqlite_api_error(error));
+                }
+                pending_events.push(
+                    append_runtime_run_event_deferred(
+                        &transaction,
+                        &claim.run_id,
+                        "run.accepted",
+                        json!({
+                            "kind": "goal_phase",
+                            "workspace_id": workspace_id,
+                            "goal_id": goal_id,
+                            "phase_id": phase_id,
+                            "assigned_session_id": assigned_session_id,
+                        }),
+                    )
+                    .map_err(sqlite_api_error)?,
+                );
+                let changed = transaction
+                    .execute(
+                        r#"
+                        UPDATE goal_phases
+                           SET active_run_id = ?1,
+                               claim_token = ?2,
+                               claim_owner = ?3,
+                               claimed_at = ?4,
+                               lease_until = ?5,
+                               updated_at = ?4
+                         WHERE goal_id = ?6
+                           AND id = ?7
+                           AND status = 'running'
+                           AND active_run_id IS NULL
+                        "#,
+                        params![
+                            &claim.run_id,
+                            &claim.claim_token,
+                            &claim.claim_owner,
+                            u64_to_i64(now),
+                            u64_to_i64(now.saturating_add(GOAL_PHASE_CLAIM_LEASE_MS)),
+                            goal_id,
+                            phase_id,
+                        ],
+                    )
+                    .map_err(sqlite_api_error)?;
+                if changed != 1 {
+                    return Err(api_error(
+                        StatusCode::CONFLICT,
+                        "goal phase claim changed before execution started",
+                    ));
+                }
+                let started_changed = transaction
+                    .execute(
+                        r#"
+                        UPDATE runtime_runs
+                           SET state = 'running', started_at = ?3, heartbeat_at = ?3
+                         WHERE id = ?1 AND claim_token = ?2 AND state = 'accepted'
+                        "#,
+                        params![&claim.run_id, &claim.claim_token, u64_to_i64(now)],
+                    )
+                    .map_err(sqlite_api_error)?;
+                if started_changed != 1 {
+                    return Err(api_error(
+                        StatusCode::CONFLICT,
+                        "legacy goal phase run could not be started",
+                    ));
+                }
+                pending_events.push(
+                    append_runtime_run_event_deferred(
+                        &transaction,
+                        &claim.run_id,
+                        "run.started",
+                        json!({
+                            "kind": "goal_phase",
+                            "previous_state": "accepted",
+                            "goal_id": goal_id,
+                            "phase_id": phase_id,
+                        }),
+                    )
+                    .map_err(sqlite_api_error)?,
+                );
+                claim_is_preexisting = false;
+            }
+            // 与 E3a 保持一致：旧 planning Goal 只推进为 running，不覆盖其他状态。
+            transaction
+                .execute(
+                    "UPDATE goals SET status = 'running', updated_at = ?1 \
+                     WHERE workspace_id = ?2 AND id = ?3 AND status = 'planning'",
+                    params![u64_to_i64(now), workspace_id, goal_id],
+                )
+                .map_err(sqlite_api_error)?;
+            // iteration reserve 是本事务最后一个条件 UPDATE；此后只允许 commit 或回滚。
+            if reserve_goal_iteration_connection(&transaction, workspace_id, goal_id)
                 .map_err(sqlite_api_error)?
                 .is_none()
             {
-                // codex 自检发现的回归：把占用前移到这里时，原来那段「暂停 goal + 发事件」
-                // 被一并删掉了，结果超限只报 400，goal 仍是 running、事件永不发出
-                // （前端白名单里的 goal-iteration-budget-exhausted 成了死事件）。
-                // 这里补回来：耗尽即暂停并记事件，且只在真正发生状态变化时发一次。
-                let note = format!(
-                    "Goal iteration budget exhausted: {}/{}. The goal is paused; raise max_iterations or close it out.",
-                    goal.current_iteration, goal.max_iterations
-                );
-                let paused = connection
-                    .execute(
-                        r#"
-                        UPDATE goals SET status = 'paused', updated_at = ?1
-                        WHERE workspace_id = ?2 AND id = ?3
-                          AND status NOT IN ('completed', 'cancelled', 'paused')
-                        "#,
-                        params![u64_to_i64(unix_timestamp_millis()), workspace_id, goal_id],
-                    )
-                    .map_err(sqlite_api_error)?;
-                if paused > 0 {
-                    let _ = insert_goal_event_connection(
-                        &connection,
-                        goal_id,
-                        "goal-iteration-budget-exhausted",
-                        &note,
-                        json!({
-                            "caller": "goal-loop",
-                            "phase_id": phase_id,
-                            "current_iteration": goal.current_iteration,
-                            "max_iterations": goal.max_iterations,
-                        }),
-                    );
+                budget_failure = Some((
+                    claim,
+                    claim_is_preexisting,
+                    goal.current_iteration,
+                    goal.max_iterations,
+                ));
+            } else {
+                transaction.commit().map_err(sqlite_api_error)?;
+                for event in pending_events {
+                    broadcast_runtime_run_event(event);
                 }
-                return Err(api_error(StatusCode::BAD_REQUEST, &note));
+                prepared = Some((goal, phase, claim));
             }
         }
+        if let Some((claim, claim_is_preexisting, current_iteration, max_iterations)) =
+            budget_failure.take()
+        {
+            let note = format!(
+                "Goal iteration budget exhausted: {current_iteration}/{max_iterations}. The goal is paused; raise max_iterations or close it out."
+            );
+            if claim_is_preexisting {
+                fail_goal_phase_budget_after_rollback(
+                    &claim,
+                    workspace_id,
+                    current_iteration,
+                    max_iterations,
+                    &note,
+                )?;
+            } else {
+                pause_goal_for_iteration_budget(
+                    &db_path,
+                    workspace_id,
+                    goal_id,
+                    phase_id,
+                    current_iteration,
+                    max_iterations,
+                    &note,
+                )?;
+            }
+            return Err(api_error(StatusCode::BAD_REQUEST, &note));
+        }
+        let (goal, phase, claim) = prepared.ok_or_else(|| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "goal phase execution transaction did not produce a claim",
+            )
+        })?;
         let assigned_session_id = phase.assigned_session_id.as_deref().ok_or_else(|| {
             api_error(
                 StatusCode::BAD_REQUEST,
@@ -33983,17 +36707,140 @@ impl SessionStore {
         let collaboration_roster =
             chat_room_roster_from_state(&self.state, &goal.chat_room_id, Some(&agent.id)).ok();
         // 结构化进度注入：把本 phase 已发生的回退/重试/上轮验证失败聚合进 prompt，减少模型靠历史推断。
-        let progress = open_session_connection(&self.path)
+        let progress = open_session_connection(&db_path)
             .ok()
-            .map(|connection| goal_phase_progress_block(&connection, &goal.id, phase))
+            .map(|connection| goal_phase_progress_block(&connection, &goal.id, &phase))
             .unwrap_or_default();
         Ok(GoalPhaseRunContext {
-            prompt: goal_phase_run_prompt_with_progress(&goal, phase, &progress),
+            prompt: goal_phase_run_prompt_with_progress(&goal, &phase, &progress),
             agent,
             chat_room_id: goal.chat_room_id.clone(),
+            goal_id: goal.id.clone(),
+            phase_id: phase.id.clone(),
             context_history,
             collaboration_roster,
+            run_id: claim.run_id,
+            claim_token: claim.claim_token,
+            db_path,
         })
+    }
+
+    /// E3b.2 自动 Goal worker 的唯一结果回写入口。
+    ///
+    /// 与历史 `record_goal_phase_model_result*` fixture 兼容层分开：调用方必须同时提供
+    /// captured DB path、run id 与 claim token。该方法在 commit 前不改内存、不调用
+    /// `save()`、context lifecycle、memory 或 handoff；所有结果事实由同一个 SQLite
+    /// Immediate 事务决定，commit 后才把消息镜像回当前 store。
+    fn record_goal_phase_model_result_at_path_with_claim(
+        &mut self,
+        expected_db_path: &Path,
+        workspace_id: &str,
+        goal_id: &str,
+        phase_id: &str,
+        run_id: &str,
+        claim_token: &str,
+        agent: &AgentSessionDto,
+        response: AgentModelResponse,
+        tool_messages: Vec<ChatMessageDto>,
+        command_failures: Vec<String>,
+    ) -> ApiResult<GoalPhaseRunResponse> {
+        // await 期间 workspace 可能已切换。旧结果不能写当前新 store；仅在 captured DB
+        // 上以自有 token 做 interrupted cleanup，失败则保持现场并返回 stale/409。
+        if self.path != expected_db_path {
+            cleanup_goal_phase_path_drift(
+                expected_db_path,
+                workspace_id,
+                goal_id,
+                phase_id,
+                run_id,
+                claim_token,
+            )?;
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "session store changed workspace while Goal phase was running",
+            ));
+        }
+
+        let finalized = finalize_goal_phase_result_sqlite(
+            expected_db_path,
+            workspace_id,
+            goal_id,
+            phase_id,
+            run_id,
+            claim_token,
+            agent,
+            response,
+            tool_messages,
+            command_failures,
+        )?;
+
+        // SQLite 已 commit；镜像失败不能伪造 rollback。只有 same-path 才能修改内存，
+        // 且不调用全量 save，避免重写 runtime tables。Goal 完成时只从当前内存快照
+        // 移除本 Goal 的 task-skill overlay；持久 overlay 已在同一完成事务中清理。
+        let same_path = self.path == expected_db_path;
+        if same_path && finalized.memory_eligible && finalized.status.goal.status == "completed" {
+            self.remove_goal_task_skill_overlays_from_state(goal_id);
+        }
+        if same_path && !finalized.messages.is_empty() {
+            let room_ok = self.append_chat_room_messages_in_memory(
+                &finalized.chat_room_id,
+                &finalized.messages,
+            );
+            let session_ok = self.append_chat_messages_in_memory(
+                &finalized.assigned_session_id,
+                &finalized.messages,
+            );
+            if !room_ok || !session_ok {
+                diag!(
+                    "[GOAL-FINALIZER] committed result mirror skipped: room_ok={} session_ok={} goal={} phase={}",
+                    room_ok,
+                    session_ok,
+                    goal_id,
+                    phase_id
+                );
+            }
+        }
+
+        Ok(GoalPhaseRunResponse {
+            goal_id: goal_id.to_string(),
+            phase_id: phase_id.to_string(),
+            assigned_session_id: finalized.assigned_session_id,
+            messages: finalized.messages,
+            status: finalized.status,
+            generated_at: unix_timestamp_millis(),
+            memory_eligible: finalized.memory_eligible,
+        })
+    }
+
+    /// 历史测试/兼容入口。真实 Goal worker 不得调用此方法，因为它没有 ownership token。
+    /// 保留原签名只为迁移旧 fixture；新路径必须使用
+    /// `record_goal_phase_model_result_at_path_with_claim`。
+    fn record_goal_phase_model_result_at_path(
+        &mut self,
+        expected_db_path: &Path,
+        workspace_id: &str,
+        goal_id: &str,
+        phase_id: &str,
+        agent: &AgentSessionDto,
+        response: AgentModelResponse,
+        tool_messages: Vec<ChatMessageDto>,
+        command_failures: Vec<String>,
+    ) -> ApiResult<GoalPhaseRunResponse> {
+        if self.path != expected_db_path {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "session store changed workspace while Goal phase was running",
+            ));
+        }
+        self.record_goal_phase_model_result(
+            workspace_id,
+            goal_id,
+            phase_id,
+            agent,
+            response,
+            tool_messages,
+            command_failures,
+        )
     }
 
     fn record_goal_phase_model_result(
@@ -34017,6 +36864,11 @@ impl SessionStore {
                 StatusCode::BAD_REQUEST,
                 "Goal phase result came from a different session.",
             ));
+        }
+        // 无 token 的历史 fixture 只允许操作真正的 legacy no-claim phase；不得绕过
+        // durable execution claim 覆盖正在运行的真实 worker。
+        if phase.active_run_id.is_some() {
+            return Err(stale_goal_phase_result_error());
         }
         // GL-08（codex #2）：拒收陈旧/失效结果。phase 不再 running，或 goal 已被取消/收尾，
         // 都说明这次执行的结果已经过期（并发 run-next、重复点击、执行途中被取消）。
@@ -34188,6 +37040,7 @@ impl SessionStore {
                 messages,
                 status,
                 generated_at: unix_timestamp_millis(),
+                memory_eligible: false,
             });
         }
 
@@ -34284,6 +37137,7 @@ impl SessionStore {
                 messages,
                 status,
                 generated_at: unix_timestamp_millis(),
+                memory_eligible: false,
             });
         }
 
@@ -34372,6 +37226,7 @@ impl SessionStore {
                 messages,
                 status,
                 generated_at: unix_timestamp_millis(),
+                memory_eligible: false,
             });
         }
 
@@ -34396,6 +37251,7 @@ impl SessionStore {
             messages,
             status,
             generated_at: unix_timestamp_millis(),
+            memory_eligible: false,
         })
     }
 
@@ -34911,6 +37767,7 @@ impl SessionStore {
     }
 
     fn create_session(&mut self, payload: UpsertSessionRequest) -> ApiResult<SessionSummaryDto> {
+        validate_reasoning_effort(payload.reasoning_effort.as_deref())?;
         if self.state.sessions.len() >= MAX_USER_SESSIONS {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
@@ -34950,7 +37807,9 @@ impl SessionStore {
             avatar,
             base_url,
             endpoint,
-            reasoning_effort: normalize_reasoning_effort(payload.reasoning_effort.as_deref()),
+            reasoning_effort: payload
+                .reasoning_effort
+                .unwrap_or_else(default_reasoning_effort),
             api_key_ref: payload.api_key_ref.unwrap_or_default(),
             memory_beads: Vec::new(),
             created_at: now,
@@ -35043,6 +37902,12 @@ impl SessionStore {
         session_id: &str,
         payload: UpsertSessionRequest,
     ) -> ApiResult<SessionSummaryDto> {
+        // 所有可能返回 400 的会话级字段先验证，再借用并修改持久化对象，
+        // 确保非法 reasoning 不会与其它字段一起产生部分写入。
+        validate_reasoning_effort(payload.reasoning_effort.as_deref())?;
+        if let Some(avatar) = payload.avatar.as_deref() {
+            normalize_session_avatar(Some(avatar))?;
+        }
         let is_active = self.is_active(session_id);
         let Some(session) = self
             .state
@@ -35088,7 +37953,7 @@ impl SessionStore {
             session.endpoint = None;
         }
         if let Some(reasoning_effort) = payload.reasoning_effort {
-            session.reasoning_effort = normalize_reasoning_effort(Some(&reasoning_effort));
+            session.reasoning_effort = reasoning_effort;
         }
         if let Some(api_key_ref) = payload.api_key_ref {
             session.api_key_ref = api_key_ref.trim().chars().take(128).collect();
@@ -35159,6 +38024,184 @@ impl SessionStore {
         Ok(self.state.sessions[position].summary(true))
     }
 
+    fn resume_session(&mut self, session_id: &str) -> ApiResult<SessionResumeResponse> {
+        let Some(position) = self
+            .state
+            .sessions
+            .iter()
+            .position(|session| session.id == session_id)
+        else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存"));
+        };
+        let already_active = self.state.active_session_id.as_deref() == Some(session_id);
+        self.state.active_session_id = Some(session_id.to_string());
+        let session = &self.state.sessions[position];
+        let history = session_history_response(
+            session,
+            true,
+            SessionHistoryQuery {
+                limit: Some(20),
+                before: None,
+            },
+        );
+        let response = SessionResumeResponse {
+            session: session.summary(true),
+            resumed: !already_active,
+            history,
+        };
+        if !already_active {
+            self.save()?;
+        }
+        Ok(response)
+    }
+
+    fn fork_session(
+        &mut self,
+        session_id: &str,
+        payload: SessionForkRequest,
+    ) -> ApiResult<SessionForkResponse> {
+        if self.state.sessions.len() >= MAX_USER_SESSIONS {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "最多只能保留 10 个自定义会话，请先删除不再使用的会话",
+            ));
+        }
+        let source = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "会话不存"))?;
+        let cursor = payload
+            .before
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let keep_messages = match cursor {
+            Some(cursor) => session_history_message_end(&source, cursor).ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "分叉游标不存在，请使用 history 返回的 turn 或 item id",
+                )
+            })?,
+            None => source.messages.len(),
+        };
+        let boundary = source
+            .messages
+            .get(keep_messages.saturating_sub(1))
+            .map(|message| message.created_at);
+        let now = unix_timestamp_millis();
+        let base_id = format!("session-fork-{now}");
+        let mut fork_id = base_id.clone();
+        let mut suffix = 2_u32;
+        while self
+            .state
+            .sessions
+            .iter()
+            .any(|session| session.id == fork_id)
+        {
+            fork_id = format!("{base_id}-{suffix}");
+            suffix = suffix.saturating_add(1);
+        }
+        let default_name = format!("{} 分叉", source.name);
+        let name = payload
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(default_name.as_str());
+        let mut fork = source.clone();
+        fork.id = fork_id.clone();
+        fork.name = normalize_session_name(Some(name), self.state.sessions.len() + 1);
+        fork.created_at = now;
+        fork.updated_at = now;
+        fork.messages.truncate(keep_messages);
+        if let Some(boundary) = boundary {
+            fork.memory_beads.retain(|bead| {
+                bead.pinned || bead.created_at <= boundary || bead.source == "session-config"
+            });
+        }
+        fork.prune_memory_beads();
+        let copied_memory_beads = fork.memory_beads.len();
+        let summary = fork.summary(true);
+        self.state.active_session_id = Some(fork.id.clone());
+        self.state.sessions.push(fork);
+        self.save()?;
+        Ok(SessionForkResponse {
+            source_session_id: source.id,
+            source_cursor: cursor.map(str::to_string),
+            session: summary,
+            copied_messages: keep_messages,
+            copied_memory_beads,
+        })
+    }
+
+    fn rollback_session(
+        &mut self,
+        session_id: &str,
+        payload: SessionRollbackRequest,
+    ) -> ApiResult<SessionRollbackResponse> {
+        let cursor = payload.before.trim();
+        if cursor.is_empty() {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "回滚必须提供 history 返回的 turn 或 item id",
+            ));
+        }
+        let source = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "会话不存"))?;
+        let keep_messages = session_history_message_end(&source, cursor).ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "回滚游标不存在，请使用 history 返回的 turn 或 item id",
+            )
+        })?;
+        let boundary = source
+            .messages
+            .get(keep_messages.saturating_sub(1))
+            .map(|message| message.created_at)
+            .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "回滚目标不能早于首条消息"))?;
+        let active = self.is_active(session_id);
+        let (summary, old_message_count, removed_memory_beads) = {
+            let Some(session) = self
+                .state
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == session_id)
+            else {
+                return Err(api_error(StatusCode::NOT_FOUND, "会话不存"));
+            };
+            let old_message_count = session.messages.len();
+            let old_bead_count = session.memory_beads.len();
+            session.messages.truncate(keep_messages);
+            session.memory_beads.retain(|bead| {
+                bead.pinned || bead.created_at <= boundary || bead.source == "session-config"
+            });
+            session.context_reset_at = boundary;
+            session.updated_at = unix_timestamp_millis();
+            let removed_memory_beads = old_bead_count.saturating_sub(session.memory_beads.len());
+            (
+                session.summary(active),
+                old_message_count,
+                removed_memory_beads,
+            )
+        };
+        self.save()?;
+        Ok(SessionRollbackResponse {
+            session: summary,
+            target: cursor.to_string(),
+            kept_messages: keep_messages,
+            removed_messages: old_message_count.saturating_sub(keep_messages),
+            removed_memory_beads,
+            reason: payload.reason.filter(|reason| !reason.trim().is_empty()),
+        })
+    }
+
     fn session_messages(
         &self,
         session_id: &str,
@@ -35200,6 +38243,52 @@ impl SessionStore {
         }))
     }
 
+    fn session_history(
+        &self,
+        session_id: &str,
+        query: SessionHistoryQuery,
+    ) -> ApiResult<Json<SessionHistoryResponse>> {
+        let Some(session) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存"));
+        };
+        Ok(Json(session_history_response(
+            session,
+            self.is_active(session_id),
+            query,
+        )))
+    }
+
+    fn session_events(
+        &self,
+        session_id: &str,
+        query: SessionHistoryQuery,
+    ) -> ApiResult<Response<Body>> {
+        let Some(session) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return Err(api_error(StatusCode::NOT_FOUND, "会话不存"));
+        };
+        let history = session_history_response(session, self.is_active(session_id), query);
+        let body = session_agent_events_jsonl(&history);
+        let mut response = Response::new(Body::from(body));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+        );
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        Ok(response)
+    }
+
     fn append_chat_messages(
         &mut self,
         session_id: &str,
@@ -35235,6 +38324,37 @@ impl SessionStore {
         }
         session.updated_at = unix_timestamp_millis();
         true
+    }
+
+    /// self-dispatch 的 retry context 作为一次内存状态变更、一次 save 提交，
+    /// 避免 room 已落库而 session 第二次写入失败后留下可重派的孤儿指令。
+    fn append_goal_phase_retry_context(
+        &mut self,
+        room_id: &str,
+        session_id: &str,
+        message: ChatMessageDto,
+    ) -> ApiResult<()> {
+        if !self.state.chat_rooms.iter().any(|room| room.id == room_id) {
+            return Err(api_error(StatusCode::NOT_FOUND, "聊天室不存在"));
+        }
+        if !self
+            .state
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id)
+        {
+            return Err(api_error(StatusCode::NOT_FOUND, "目标会话不存在"));
+        }
+        let messages = vec![message];
+        if !self.append_chat_room_messages_in_memory(room_id, &messages)
+            || !self.append_chat_messages_in_memory(session_id, &messages)
+        {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "retry context atomic append lost its target",
+            ));
+        }
+        self.save()
     }
 
     /// 幂等创建定时任务系统聊天室（不激活，不改活动室）。
@@ -35824,7 +38944,7 @@ fn initialize_session_schema(connection: &Connection) -> rusqlite::Result<()> {
             model TEXT NOT NULL,
             base_url TEXT,
             endpoint TEXT,
-            reasoning_effort TEXT NOT NULL DEFAULT 'medium',
+            reasoning_effort TEXT NOT NULL DEFAULT 'auto',
             api_key_ref TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
@@ -35888,7 +39008,7 @@ fn initialize_session_schema(connection: &Connection) -> rusqlite::Result<()> {
     ensure_session_column(
         connection,
         "reasoning_effort",
-        "TEXT NOT NULL DEFAULT 'medium'",
+        "TEXT NOT NULL DEFAULT 'auto'",
     )?;
     ensure_session_column(connection, "model_type", "TEXT NOT NULL DEFAULT 'text'")?;
     ensure_session_column(connection, "avatar", "TEXT")?;
@@ -35908,6 +39028,10 @@ fn initialize_session_schema(connection: &Connection) -> rusqlite::Result<()> {
     apply_session_migration_v14(connection)?;
     apply_session_migration_v15(connection)?;
     apply_session_migration_v16(connection)?;
+    apply_session_migration_v17(connection)?;
+    apply_session_migration_v18(connection)?;
+    apply_session_migration_v19(connection)?;
+    apply_session_migration_v20(connection)?;
     Ok(())
 }
 
@@ -36032,10 +39156,328 @@ fn apply_session_migration_v16(connection: &Connection) -> rusqlite::Result<()> 
         "computer_use_enabled",
         "INTEGER NOT NULL DEFAULT 1",
     )?;
-    // 保持现有 user_version=15 契约，避免旧版迁移测试/第三方库把未知版本视为不兼容。
-    // 表本身使用 IF NOT EXISTS，随每次 schema 初始化安全补齐。
+    // v16-v18 的表本身使用 IF NOT EXISTS，随每次 schema 初始化安全补齐；
+    // 当前正式 schema 版本由 v19 迁移统一推进。
     Ok(())
 }
+
+/// Schema v17（P1-1）：会话级 memory mode。关闭或污染态只阻止自动召回，
+/// 不删除已有 bead，便于恢复、审计和后续人工处理。
+fn apply_session_migration_v17(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_settings (
+            session_id TEXT PRIMARY KEY,
+            memory_mode TEXT NOT NULL DEFAULT 'enabled'
+                CHECK (memory_mode IN ('enabled', 'disabled', 'polluted')),
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_settings_mode
+            ON memory_settings(memory_mode, updated_at);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Schema v18（P1-1）：记忆 extraction / 关联边 / consolidation 作业状态。
+/// 作业表与 beads 分离，允许失败后重试，也不会因 session JSON 全量保存而丢失。
+fn apply_session_migration_v18(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_jobs (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            job_type TEXT NOT NULL
+                CHECK (job_type IN ('extraction', 'edges', 'consolidation')),
+            status TEXT NOT NULL
+                CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+            requested_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            progress INTEGER NOT NULL DEFAULT 0,
+            result_count INTEGER,
+            error TEXT,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_jobs_session_requested
+            ON memory_jobs(session_id, requested_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memory_jobs_session_active
+            ON memory_jobs(session_id, job_type, status);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Schema v19：运行时 run 与 append-only run event 事实源。
+///
+/// run 表不依附 sessions/goals/chat_rooms，避免 session store 全量重写时被清空；
+/// 只有 event → run 保留级联删除。DDL 每次都执行 IF NOT EXISTS，兼容版本号已推进
+/// 但进程在建表中途退出的数据库。
+fn apply_session_migration_v19(connection: &Connection) -> rusqlite::Result<()> {
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS runtime_runs (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK (kind IN ('chat_turn', 'goal_phase', 'goal_loop')),
+            workspace_id TEXT NOT NULL,
+            session_id TEXT,
+            chat_room_id TEXT,
+            goal_id TEXT,
+            phase_id TEXT,
+            legacy_turn_id TEXT,
+            provider_turn_id TEXT,
+            state TEXT NOT NULL CHECK (state IN
+              ('accepted','running','stop_requested','completed','failed','interrupted','orphaned')),
+            owner_id TEXT,
+            claim_token TEXT NOT NULL,
+            stop_reason TEXT,
+            error_json TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            stop_requested_at INTEGER,
+            heartbeat_at INTEGER,
+            finished_at INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_runs_legacy_turn
+            ON runtime_runs(legacy_turn_id) WHERE legacy_turn_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_runs_active_goal_phase
+            ON runtime_runs(goal_id, phase_id)
+            WHERE kind = 'goal_phase'
+              AND state IN ('accepted','running','stop_requested');
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_runs_active_goal_loop
+            ON runtime_runs(goal_id)
+            WHERE kind = 'goal_loop'
+              AND state IN ('accepted','running','stop_requested');
+        CREATE INDEX IF NOT EXISTS idx_runtime_runs_scope_created
+            ON runtime_runs(workspace_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS runtime_run_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES runtime_runs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_runtime_run_events_run_id
+            ON runtime_run_events(run_id, id);
+        "#,
+    )?;
+    if current < 19 {
+        connection.execute_batch("PRAGMA user_version = 19;")?;
+    }
+    Ok(())
+}
+
+/// Schema v20：Goal phase 的 durable claim 列。
+///
+/// 只增加可空列和非唯一部分索引，不重建 `goal_phases`，从而保留旧 phase、Goal 以及
+/// v19 runtime/event 数据。每次初始化都校验列/索引，修复版本号已经推进但迁移中途退出的库。
+const GOAL_PHASE_CLAIM_COLUMNS: &[(&str, &str)] = &[
+    ("active_run_id", "TEXT"),
+    ("claim_token", "TEXT"),
+    ("claim_owner", "TEXT"),
+    ("claimed_at", "INTEGER"),
+    ("lease_until", "INTEGER"),
+];
+
+fn apply_session_migration_v20(connection: &Connection) -> rusqlite::Result<()> {
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    for (column, column_type) in GOAL_PHASE_CLAIM_COLUMNS {
+        ensure_table_column(connection, "goal_phases", column, column_type)?;
+    }
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_goal_phases_active_run\n         ON goal_phases(active_run_id)\n         WHERE active_run_id IS NOT NULL;",
+    )?;
+    if current < 20 {
+        connection.execute_batch("PRAGMA user_version = 20;")?;
+    }
+    Ok(())
+}
+
+const DEFAULT_MEMORY_MODE: &str = "enabled";
+
+fn is_valid_memory_mode(value: Option<&str>) -> bool {
+    matches!(value, Some("enabled") | Some("disabled") | Some("polluted"))
+}
+
+fn normalize_memory_mode(value: Option<&str>) -> &'static str {
+    match value.map(str::trim) {
+        Some("disabled") => "disabled",
+        Some("polluted") => "polluted",
+        _ => DEFAULT_MEMORY_MODE,
+    }
+}
+
+fn memory_mode_for_session(session_id: &str) -> String {
+    let Ok(connection) = open_session_connection(&default_session_sqlite_path()) else {
+        return DEFAULT_MEMORY_MODE.to_string();
+    };
+    let mode = connection
+        .query_row(
+            "SELECT memory_mode FROM memory_settings WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    normalize_memory_mode(mode.as_deref()).to_string()
+}
+
+fn set_session_memory_mode_sqlite(
+    path: &Path,
+    session_id: &str,
+    memory_mode: &str,
+) -> rusqlite::Result<String> {
+    let mode = normalize_memory_mode(Some(memory_mode));
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    connection.execute(
+        "INSERT INTO memory_settings(session_id, memory_mode, updated_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(session_id) DO UPDATE SET memory_mode=excluded.memory_mode, updated_at=excluded.updated_at",
+        params![session_id, mode, u64_to_i64(unix_timestamp_millis())],
+    )?;
+    Ok(mode.to_string())
+}
+
+fn normalize_memory_job_type(value: Option<&str>) -> Option<&'static str> {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some(MEMORY_JOB_EXTRACTION) => Some(MEMORY_JOB_EXTRACTION),
+        Some(MEMORY_JOB_EDGES) => Some(MEMORY_JOB_EDGES),
+        Some(MEMORY_JOB_CONSOLIDATION) => Some(MEMORY_JOB_CONSOLIDATION),
+        _ => None,
+    }
+}
+
+fn memory_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryJobDto> {
+    Ok(MemoryJobDto {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        job_type: row.get(2)?,
+        status: row.get(3)?,
+        requested_at: i64_to_u64(row.get(4)?),
+        started_at: row.get::<_, Option<i64>>(5)?.map(i64_to_u64),
+        completed_at: row.get::<_, Option<i64>>(6)?.map(i64_to_u64),
+        progress: i64_to_u64(row.get::<_, i64>(7)?).min(100) as u8,
+        result_count: row
+            .get::<_, Option<i64>>(8)?
+            .map(|value| i64_to_u64(value) as usize),
+        error: row.get(9)?,
+    })
+}
+
+fn memory_job_select_sql() -> &'static str {
+    "SELECT id, session_id, job_type, status, requested_at, started_at, completed_at, progress, result_count, error FROM memory_jobs"
+}
+
+fn create_memory_job_sqlite(
+    path: &Path,
+    session_id: &str,
+    job_type: &str,
+    retry: bool,
+) -> rusqlite::Result<(MemoryJobDto, bool)> {
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    if !retry {
+        let active_sql = format!(
+            "{} WHERE session_id = ?1 AND job_type = ?2 AND status IN ('queued', 'running') ORDER BY requested_at DESC LIMIT 1",
+            memory_job_select_sql()
+        );
+        if let Some(job) = connection
+            .query_row(
+                &active_sql,
+                params![session_id, job_type],
+                memory_job_from_row,
+            )
+            .optional()?
+        {
+            return Ok((job, true));
+        }
+    }
+    let now = unix_timestamp_millis();
+    let sequence = MEMORY_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let job_id = format!("memory-job-{now}-{sequence}");
+    connection.execute(
+        "INSERT INTO memory_jobs(id, session_id, job_type, status, requested_at, progress) VALUES (?1, ?2, ?3, 'queued', ?4, 0)",
+        params![job_id, session_id, job_type, u64_to_i64(now)],
+    )?;
+    let select_sql = format!("{} WHERE id = ?1", memory_job_select_sql());
+    let job = connection.query_row(&select_sql, params![job_id], memory_job_from_row)?;
+    Ok((job, false))
+}
+
+fn update_memory_job_sqlite(
+    path: &Path,
+    job_id: &str,
+    status: &str,
+    progress: u8,
+    result_count: Option<usize>,
+    error: Option<&str>,
+) -> rusqlite::Result<MemoryJobDto> {
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    let now = unix_timestamp_millis();
+    let started_at = (status == "running").then_some(u64_to_i64(now));
+    let completed_at = matches!(status, "succeeded" | "failed").then_some(u64_to_i64(now));
+    let changed = connection.execute(
+        "UPDATE memory_jobs SET status = ?1, progress = ?2, result_count = ?3, error = ?4, \
+         started_at = COALESCE(started_at, ?5), completed_at = COALESCE(?6, completed_at) WHERE id = ?7",
+        params![
+            status,
+            i64::from(progress.min(100)),
+            result_count.map(|value| u64_to_i64(value as u64)),
+            error,
+            started_at,
+            completed_at,
+            job_id,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let select_sql = format!("{} WHERE id = ?1", memory_job_select_sql());
+    connection.query_row(&select_sql, params![job_id], memory_job_from_row)
+}
+
+fn list_memory_jobs_sqlite(
+    path: &Path,
+    session_id: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<MemoryJobDto>> {
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    let select_sql = format!(
+        "{} WHERE session_id = ?1 ORDER BY requested_at DESC, id DESC LIMIT ?2",
+        memory_job_select_sql()
+    );
+    let mut statement = connection.prepare(&select_sql)?;
+    let rows = statement.query_map(params![session_id, limit as i64], memory_job_from_row)?;
+    rows.collect()
+}
+
+fn get_memory_job_sqlite(
+    path: &Path,
+    session_id: &str,
+    job_id: &str,
+) -> rusqlite::Result<Option<MemoryJobDto>> {
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    let select_sql = format!(
+        "{} WHERE session_id = ?1 AND id = ?2",
+        memory_job_select_sql()
+    );
+    connection
+        .query_row(
+            &select_sql,
+            params![session_id, job_id],
+            memory_job_from_row,
+        )
+        .optional()
+}
+
 fn chat_room_permission_profile_sqlite(path: &Path, room_id: &str) -> rusqlite::Result<String> {
     let connection = open_session_connection(path)?;
     initialize_session_schema(&connection)?;
@@ -36701,6 +40143,1352 @@ fn ensure_table_column(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeRunRecord {
+    id: String,
+    kind: String,
+    workspace_id: String,
+    session_id: Option<String>,
+    chat_room_id: Option<String>,
+    goal_id: Option<String>,
+    phase_id: Option<String>,
+    legacy_turn_id: Option<String>,
+    provider_turn_id: Option<String>,
+    state: String,
+    owner_id: Option<String>,
+    claim_token: String,
+    stop_reason: Option<String>,
+    error_json: Option<String>,
+    created_at: i64,
+    started_at: Option<i64>,
+    stop_requested_at: Option<i64>,
+    heartbeat_at: Option<i64>,
+    finished_at: Option<i64>,
+}
+
+/// 启动恢复初始查询读取的最小 scope 快照。claim_token 只用于事务内 ownership CAS，
+/// 永不进入 DTO 或恢复事件 payload。
+#[derive(Debug, Clone)]
+struct RuntimeRunRecoveryCandidate {
+    id: String,
+    previous_state: String,
+    kind: String,
+    workspace_id: String,
+    goal_id: Option<String>,
+    phase_id: Option<String>,
+    claim_token: String,
+}
+
+const RUNTIME_RUN_SELECT_SQL: &str = "SELECT id, kind, workspace_id, session_id, chat_room_id, goal_id, phase_id, legacy_turn_id, provider_turn_id, state, owner_id, claim_token, stop_reason, error_json, created_at, started_at, stop_requested_at, heartbeat_at, finished_at FROM runtime_runs";
+
+fn runtime_run_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeRunRecord> {
+    Ok(RuntimeRunRecord {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        workspace_id: row.get(2)?,
+        session_id: row.get(3)?,
+        chat_room_id: row.get(4)?,
+        goal_id: row.get(5)?,
+        phase_id: row.get(6)?,
+        legacy_turn_id: row.get(7)?,
+        provider_turn_id: row.get(8)?,
+        state: row.get(9)?,
+        owner_id: row.get(10)?,
+        claim_token: row.get(11)?,
+        stop_reason: row.get(12)?,
+        error_json: row.get(13)?,
+        created_at: row.get(14)?,
+        started_at: row.get(15)?,
+        stop_requested_at: row.get(16)?,
+        heartbeat_at: row.get(17)?,
+        finished_at: row.get(18)?,
+    })
+}
+
+fn runtime_run_status_from_record(run: &RuntimeRunRecord) -> RunStatusDto {
+    RunStatusDto {
+        run_id: run.id.clone(),
+        kind: run.kind.clone(),
+        workspace_id: run.workspace_id.clone(),
+        session_id: run.session_id.clone(),
+        chat_room_id: run.chat_room_id.clone(),
+        goal_id: run.goal_id.clone(),
+        phase_id: run.phase_id.clone(),
+        turn_id: run.legacy_turn_id.clone(),
+        provider_turn_id: run.provider_turn_id.clone(),
+        state: run.state.clone(),
+        stop_reason: run.stop_reason.clone(),
+        created_at: i64_to_u64(run.created_at),
+        started_at: run.started_at.map(i64_to_u64),
+        stop_requested_at: run.stop_requested_at.map(i64_to_u64),
+        heartbeat_at: run.heartbeat_at.map(i64_to_u64),
+        finished_at: run.finished_at.map(i64_to_u64),
+    }
+}
+
+fn query_runtime_run_connection(
+    connection: &Connection,
+    run_id: &str,
+) -> rusqlite::Result<Option<RuntimeRunRecord>> {
+    connection
+        .query_row(
+            &format!("{RUNTIME_RUN_SELECT_SQL} WHERE id = ?1"),
+            params![run_id],
+            runtime_run_record_from_row,
+        )
+        .optional()
+}
+
+fn query_runtime_run_sqlite(
+    path: &Path,
+    run_id: &str,
+) -> rusqlite::Result<Option<RuntimeRunRecord>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    query_runtime_run_connection(&connection, run_id)
+}
+
+fn insert_runtime_run_connection(
+    connection: &Connection,
+    run: &RuntimeRunRecord,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        r#"
+        INSERT INTO runtime_runs(
+            id, kind, workspace_id, session_id, chat_room_id, goal_id, phase_id,
+            legacy_turn_id, provider_turn_id, state, owner_id, claim_token,
+            stop_reason, error_json, created_at, started_at, stop_requested_at,
+            heartbeat_at, finished_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+            ?15, ?16, ?17, ?18, ?19
+        )
+        "#,
+        params![
+            &run.id,
+            &run.kind,
+            &run.workspace_id,
+            &run.session_id,
+            &run.chat_room_id,
+            &run.goal_id,
+            &run.phase_id,
+            &run.legacy_turn_id,
+            &run.provider_turn_id,
+            &run.state,
+            &run.owner_id,
+            &run.claim_token,
+            &run.stop_reason,
+            &run.error_json,
+            run.created_at,
+            run.started_at,
+            run.stop_requested_at,
+            run.heartbeat_at,
+            run.finished_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn runtime_run_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeRunEventDto> {
+    let payload_json: String = row.get(3)?;
+    Ok(RuntimeRunEventDto {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        event_type: row.get(2)?,
+        payload: serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({})),
+        created_at: i64_to_u64(row.get::<_, i64>(4)?),
+    })
+}
+
+fn query_runtime_run_events_connection(
+    connection: &Connection,
+    run_id: &str,
+    after: i64,
+) -> rusqlite::Result<Vec<RuntimeRunEventDto>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT id, run_id, event_type, payload_json, created_at
+        FROM runtime_run_events
+        WHERE run_id = ?1 AND id > ?2
+        ORDER BY id ASC
+        "#,
+    )?;
+    let rows = statement.query_map(params![run_id, after], runtime_run_event_from_row)?;
+    rows.collect()
+}
+
+fn query_runtime_run_events_sqlite(
+    path: &Path,
+    run_id: &str,
+    after: i64,
+) -> rusqlite::Result<Vec<RuntimeRunEventDto>> {
+    if !path.exists() {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    query_runtime_run_events_connection(&connection, run_id, after.max(0))
+}
+
+/// 只写入当前事务，不广播。调用方必须在外层事务 commit 成功后再广播返回事件。
+fn append_runtime_run_event_deferred(
+    connection: &Connection,
+    run_id: &str,
+    event_type: &str,
+    payload: JsonValue,
+) -> rusqlite::Result<RuntimeRunEventDto> {
+    let created_at = unix_timestamp_millis();
+    let payload_json = serde_json::to_string(&payload)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    connection.execute(
+        r#"
+        INSERT INTO runtime_run_events(run_id, event_type, payload_json, created_at)
+        VALUES (?1, ?2, ?3, ?4)
+        "#,
+        params![run_id, event_type, payload_json, u64_to_i64(created_at)],
+    )?;
+    Ok(RuntimeRunEventDto {
+        id: connection.last_insert_rowid(),
+        run_id: run_id.to_string(),
+        event_type: event_type.to_string(),
+        payload,
+        created_at,
+    })
+}
+
+/// 非事务上下文的写事件包装：commit 成功后才向实时订阅者广播。
+fn append_runtime_run_event(
+    path: &Path,
+    run_id: &str,
+    event_type: &str,
+    payload: JsonValue,
+) -> rusqlite::Result<RuntimeRunEventDto> {
+    if !path.exists() {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let mut connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let event = append_runtime_run_event_deferred(&transaction, run_id, event_type, payload)?;
+    transaction.commit()?;
+    broadcast_runtime_run_event(event.clone());
+    Ok(event)
+}
+
+fn chat_turn_status_from_runtime_state(state: &str) -> Option<ChatTurnStatus> {
+    match state {
+        "accepted" | "running" => Some(ChatTurnStatus::Running),
+        "stop_requested" => Some(ChatTurnStatus::InterruptRequested),
+        "completed" => Some(ChatTurnStatus::Completed),
+        "failed" => Some(ChatTurnStatus::Failed),
+        "interrupted" | "orphaned" => Some(ChatTurnStatus::Interrupted),
+        _ => None,
+    }
+}
+
+fn runtime_terminal_state_for_chat_status(status: ChatTurnStatus) -> &'static str {
+    match status {
+        ChatTurnStatus::Completed => "completed",
+        ChatTurnStatus::Interrupted => "interrupted",
+        ChatTurnStatus::Failed => "failed",
+        ChatTurnStatus::Running | ChatTurnStatus::InterruptRequested => "failed",
+    }
+}
+
+fn runtime_terminal_event_type(state: &str) -> Option<&'static str> {
+    match state {
+        "completed" => Some("run.completed"),
+        "failed" => Some("run.failed"),
+        "interrupted" => Some("run.interrupted"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GoalPhaseClaim {
+    run_id: String,
+    claim_token: String,
+    claim_owner: String,
+    db_path: PathBuf,
+    goal_id: String,
+    phase_id: String,
+}
+
+const GOAL_PHASE_CLAIM_LEASE_MS: u64 = 30 * 60 * 1_000;
+
+fn new_goal_phase_claim(
+    db_path: &Path,
+    goal_id: &str,
+    phase_id: &str,
+) -> Result<GoalPhaseClaim, String> {
+    Ok(GoalPhaseClaim {
+        run_id: format!(
+            "run-goal-phase-{}",
+            random_hex_identifier(24, "goal phase run id")?
+        ),
+        claim_token: format!(
+            "claim-goal-phase-{}",
+            random_hex_identifier(32, "goal phase claim token")?
+        ),
+        claim_owner: format!("coolzhu-web-console:{}", std::process::id()),
+        db_path: db_path.to_path_buf(),
+        goal_id: goal_id.to_string(),
+        phase_id: phase_id.to_string(),
+    })
+}
+
+/// 在任何 handoff/overlay 副作用前原子占用 pending phase，并把 accepted run 与派发事件
+/// 写入同一事务。事务提交成功后才广播；CAS 失败只返回 None，不创建外部 handoff。
+fn claim_goal_phase_for_dispatch(
+    db_path: &Path,
+    workspace_id: &str,
+    goal_id: &str,
+    room_id: &str,
+    phase: &GoalPhaseDto,
+    target_session_id: &str,
+    commander_session_id: &str,
+    dispatch_mode: &str,
+    handoff_pending: bool,
+) -> ApiResult<Option<GoalPhaseClaim>> {
+    let claim = new_goal_phase_claim(db_path, goal_id, &phase.id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error))?;
+    let mut connection = open_session_connection(db_path).map_err(sqlite_api_error)?;
+    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+    let now = unix_timestamp_millis();
+    let lease_until = now.saturating_add(GOAL_PHASE_CLAIM_LEASE_MS);
+    let run = RuntimeRunRecord {
+        id: claim.run_id.clone(),
+        kind: "goal_phase".to_string(),
+        workspace_id: workspace_id.to_string(),
+        session_id: Some(target_session_id.to_string()),
+        chat_room_id: Some(room_id.to_string()),
+        goal_id: Some(goal_id.to_string()),
+        phase_id: Some(phase.id.clone()),
+        legacy_turn_id: None,
+        provider_turn_id: None,
+        state: "accepted".to_string(),
+        owner_id: Some(claim.claim_owner.clone()),
+        claim_token: claim.claim_token.clone(),
+        stop_reason: None,
+        error_json: None,
+        created_at: u64_to_i64(now),
+        started_at: None,
+        stop_requested_at: None,
+        heartbeat_at: Some(u64_to_i64(now)),
+        finished_at: None,
+    };
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sqlite_api_error)?;
+    // run 先落在同一事务中；已有 active goal-phase 唯一索引时，把约束冲突视为
+    // 另一 dispatcher 已抢到 claim，回滚本事务并按 skipped 返回，不制造 500。
+    if let Err(error) = insert_runtime_run_connection(&transaction, &run) {
+        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+            return Ok(None);
+        }
+        return Err(sqlite_api_error(error));
+    }
+    let changed = transaction
+        .execute(
+            r#"
+            UPDATE goal_phases
+               SET status = 'running',
+                   active_run_id = ?1,
+                   claim_token = ?2,
+                   claim_owner = ?3,
+                   claimed_at = ?4,
+                   lease_until = ?5,
+                   updated_at = ?4
+             WHERE goal_id = ?6
+                AND id = ?7
+                AND status = 'pending'
+                AND active_run_id IS NULL
+                AND assigned_role = ?8
+                AND updated_at = ?9
+                AND EXISTS (
+                    SELECT 1 FROM goals
+                     WHERE goals.id = goal_phases.goal_id
+                       AND goals.workspace_id = ?10
+                       AND goals.status NOT IN ('paused', 'cancelled', 'completed')
+                )
+             "#,
+            params![
+                &claim.run_id,
+                &claim.claim_token,
+                &claim.claim_owner,
+                u64_to_i64(now),
+                u64_to_i64(lease_until),
+                goal_id,
+                &phase.id,
+                &phase.assigned_role,
+                u64_to_i64(phase.updated_at),
+                workspace_id,
+            ],
+        )
+        .map_err(sqlite_api_error)?;
+    if changed != 1 {
+        return Ok(None);
+    }
+    // phase claim 与 Goal 状态推进必须同事务提交；只推进 planning，绝不覆盖
+    // paused/cancelled/completed 等其它状态。
+    transaction
+        .execute(
+            "UPDATE goals SET status = 'running', updated_at = ?1 \
+             WHERE workspace_id = ?2 AND id = ?3 AND status = 'planning'",
+            params![u64_to_i64(now), workspace_id, goal_id],
+        )
+        .map_err(sqlite_api_error)?;
+    let run_event = append_runtime_run_event_deferred(
+        &transaction,
+        &claim.run_id,
+        "run.accepted",
+        json!({
+            "kind": "goal_phase",
+            "workspace_id": workspace_id,
+            "goal_id": goal_id,
+            "phase_id": phase.id,
+            "assigned_session_id": target_session_id,
+        }),
+    )
+    .map_err(sqlite_api_error)?;
+    let goal_event = insert_goal_event_connection_deferred(
+        &transaction,
+        goal_id,
+        "goal-phase-dispatched",
+        &format!(
+            "Phase {} claimed for dispatch to {}.",
+            phase.id, target_session_id
+        ),
+        json!({
+            "caller": "goal-loop",
+            "run_id": claim.run_id,
+            "phase_id": phase.id,
+            "assigned_role": phase.assigned_role,
+            "assigned_session_id": target_session_id,
+            "handoff_id": JsonValue::Null,
+            "handoff_pending": handoff_pending,
+            "dispatch_mode": dispatch_mode,
+            "chat_room_id": room_id,
+            "commander_session_id": commander_session_id,
+            "route_reason": if phase.retry_count > 0 { "retry" } else { "advance" },
+            "retry_count": phase.retry_count,
+            "depends_on": phase.depends_on,
+        }),
+    )
+    .map_err(sqlite_api_error)?;
+    transaction.commit().map_err(sqlite_api_error)?;
+    broadcast_runtime_run_event(run_event);
+    broadcast_goal_event(goal_event);
+    Ok(Some(claim))
+}
+
+/// handoff/overlay 失败后的 accepted claim 回滚。run 与 phase 必须同时命中自己的 token，
+/// 否则事务回滚并保留现场，绝不清理别人的 claim。
+fn fail_goal_phase_dispatch(claim: &GoalPhaseClaim, reason: &str) -> ApiResult<()> {
+    let mut connection = open_session_connection(&claim.db_path).map_err(sqlite_api_error)?;
+    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+    let now = unix_timestamp_millis();
+    let error_json = json!({ "reason": reason }).to_string();
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sqlite_api_error)?;
+    let run_changed = transaction
+        .execute(
+            r#"
+            UPDATE runtime_runs
+               SET state = 'failed', error_json = ?3, finished_at = ?4
+             WHERE id = ?1 AND claim_token = ?2 AND state = 'accepted'
+            "#,
+            params![&claim.run_id, &claim.claim_token, error_json, u64_to_i64(now)],
+        )
+        .map_err(sqlite_api_error)?;
+    if run_changed != 1 {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "goal phase dispatch claim is no longer accepted",
+        ));
+    }
+    let phase_changed = transaction
+        .execute(
+            r#"
+            UPDATE goal_phases
+               SET status = 'pending', active_run_id = NULL, claim_token = NULL,
+                   claim_owner = NULL, claimed_at = NULL, lease_until = NULL, updated_at = ?5
+             WHERE goal_id = ?1 AND id = ?2
+               AND active_run_id = ?3 AND claim_token = ?4 AND status = 'running'
+            "#,
+            params![
+                &claim.goal_id,
+                &claim.phase_id,
+                &claim.run_id,
+                &claim.claim_token,
+                u64_to_i64(now),
+            ],
+        )
+        .map_err(sqlite_api_error)?;
+    if phase_changed != 1 {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "goal phase dispatch claim changed before failure rollback",
+        ));
+    }
+    let run_event = append_runtime_run_event_deferred(
+        &transaction,
+        &claim.run_id,
+        "run.failed",
+        json!({
+            "kind": "goal_phase",
+            "goal_id": claim.goal_id,
+            "phase_id": claim.phase_id,
+            "reason": reason,
+        }),
+    )
+    .map_err(sqlite_api_error)?;
+    let goal_event = insert_goal_event_connection_deferred(
+        &transaction,
+        &claim.goal_id,
+        "goal-phase-dispatch-rejected",
+        &format!("Phase {} dispatch failed: {reason}.", claim.phase_id),
+        json!({
+            "caller": "goal-loop",
+            "run_id": claim.run_id,
+            "phase_id": claim.phase_id,
+            "reason": reason,
+        }),
+    )
+    .map_err(sqlite_api_error)?;
+    transaction.commit().map_err(sqlite_api_error)?;
+    broadcast_runtime_run_event(run_event);
+    broadcast_goal_event(goal_event);
+    Ok(())
+}
+
+/// E3b.1：E3a 已提交的 accepted phase run 遇到预算失败时，回滚执行事务后用
+/// 同一 run/token 做短事务终结。两条 ownership CAS 任一未命中都回滚并 fail-closed。
+fn fail_goal_phase_budget_after_rollback(
+    claim: &GoalPhaseClaim,
+    workspace_id: &str,
+    current_iteration: u32,
+    max_iterations: u32,
+    reason: &str,
+) -> ApiResult<()> {
+    let mut connection = open_session_connection(&claim.db_path).map_err(sqlite_api_error)?;
+    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+    let now = unix_timestamp_millis();
+    let error_json = json!({
+        "reason": reason,
+        "kind": "iteration_budget",
+    })
+    .to_string();
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sqlite_api_error)?;
+    let run_changed = transaction
+        .execute(
+            r#"
+            UPDATE runtime_runs
+               SET state = 'failed', error_json = ?3, finished_at = ?4
+             WHERE id = ?1
+               AND claim_token = ?2
+               AND kind = 'goal_phase'
+               AND workspace_id = ?5
+               AND goal_id = ?6
+               AND phase_id = ?7
+               AND state = 'accepted'
+            "#,
+            params![
+                &claim.run_id,
+                &claim.claim_token,
+                error_json,
+                u64_to_i64(now),
+                workspace_id,
+                &claim.goal_id,
+                &claim.phase_id,
+            ],
+        )
+        .map_err(sqlite_api_error)?;
+    if run_changed != 1 {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "goal phase budget claim is no longer accepted",
+        ));
+    }
+    let phase_changed = transaction
+        .execute(
+            r#"
+            UPDATE goal_phases
+               SET status = 'pending', active_run_id = NULL, claim_token = NULL,
+                   claim_owner = NULL, claimed_at = NULL, lease_until = NULL, updated_at = ?5
+             WHERE goal_id = ?1
+               AND id = ?2
+               AND active_run_id = ?3
+               AND claim_token = ?4
+               AND status = 'running'
+            "#,
+            params![
+                &claim.goal_id,
+                &claim.phase_id,
+                &claim.run_id,
+                &claim.claim_token,
+                u64_to_i64(now),
+            ],
+        )
+        .map_err(sqlite_api_error)?;
+    if phase_changed != 1 {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "goal phase budget claim changed before rollback",
+        ));
+    }
+    transaction
+        .execute(
+            r#"
+            UPDATE goals
+               SET status = 'paused', updated_at = ?1
+             WHERE workspace_id = ?2
+               AND id = ?3
+               AND status NOT IN ('completed', 'cancelled', 'paused')
+            "#,
+            params![u64_to_i64(now), workspace_id, &claim.goal_id],
+        )
+        .map_err(sqlite_api_error)?;
+    let run_event = append_runtime_run_event_deferred(
+        &transaction,
+        &claim.run_id,
+        "run.failed",
+        json!({
+            "kind": "goal_phase",
+            "goal_id": claim.goal_id,
+            "phase_id": claim.phase_id,
+            "reason": reason,
+            "budget_failure": true,
+        }),
+    )
+    .map_err(sqlite_api_error)?;
+    let goal_event = insert_goal_event_connection_deferred(
+        &transaction,
+        &claim.goal_id,
+        "goal-iteration-budget-exhausted",
+        reason,
+        json!({
+            "caller": "goal-loop",
+            "phase_id": claim.phase_id,
+            "run_id": claim.run_id,
+            "current_iteration": current_iteration,
+            "max_iterations": max_iterations,
+        }),
+    )
+    .map_err(sqlite_api_error)?;
+    transaction.commit().map_err(sqlite_api_error)?;
+    broadcast_runtime_run_event(run_event);
+    broadcast_goal_event(goal_event);
+    Ok(())
+}
+
+/// legacy running/no-claim phase 的预算失败路径：claim/start/reserve 事务整体回滚后，
+/// 仅在 Goal 仍可暂停时写一次既有预算事件。
+fn pause_goal_for_iteration_budget(
+    db_path: &Path,
+    workspace_id: &str,
+    goal_id: &str,
+    phase_id: &str,
+    current_iteration: u32,
+    max_iterations: u32,
+    reason: &str,
+) -> ApiResult<()> {
+    let mut connection = open_session_connection(db_path).map_err(sqlite_api_error)?;
+    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sqlite_api_error)?;
+    let changed = transaction
+        .execute(
+            r#"
+            UPDATE goals
+               SET status = 'paused', updated_at = ?1
+             WHERE workspace_id = ?2
+               AND id = ?3
+               AND status NOT IN ('completed', 'cancelled', 'paused')
+            "#,
+            params![u64_to_i64(unix_timestamp_millis()), workspace_id, goal_id],
+        )
+        .map_err(sqlite_api_error)?;
+    let event = if changed > 0 {
+        Some(
+            insert_goal_event_connection_deferred(
+                &transaction,
+                goal_id,
+                "goal-iteration-budget-exhausted",
+                reason,
+                json!({
+                    "caller": "goal-loop",
+                    "phase_id": phase_id,
+                    "current_iteration": current_iteration,
+                    "max_iterations": max_iterations,
+                }),
+            )
+            .map_err(sqlite_api_error)?,
+        )
+    } else {
+        None
+    };
+    transaction.commit().map_err(sqlite_api_error)?;
+    if let Some(event) = event {
+        broadcast_goal_event(event);
+    }
+    Ok(())
+}
+
+/// 外部副作用可能已部分落库时保留 accepted/running claim，记录有界 in-doubt 事件，
+/// 让后续恢复路径拥有唯一 ownership，禁止 dispatch 重新产生第二个执行指令。
+fn mark_goal_phase_dispatch_in_doubt(claim: &GoalPhaseClaim, reason: &str) -> ApiResult<()> {
+    let mut connection = open_session_connection(&claim.db_path).map_err(sqlite_api_error)?;
+    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+    let bounded_reason = reason.chars().take(256).collect::<String>();
+    let error_json = json!({ "reason": bounded_reason }).to_string();
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sqlite_api_error)?;
+    let changed = transaction
+        .execute(
+            "UPDATE runtime_runs SET error_json = ?3 \
+             WHERE id = ?1 AND claim_token = ?2 AND state = 'accepted'",
+            params![&claim.run_id, &claim.claim_token, error_json],
+        )
+        .map_err(sqlite_api_error)?;
+    if changed != 1 {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "goal phase dispatch claim is no longer accepted",
+        ));
+    }
+    let event = append_runtime_run_event_deferred(
+        &transaction,
+        &claim.run_id,
+        "run.dispatch_in_doubt",
+        json!({
+            "kind": "goal_phase",
+            "goal_id": claim.goal_id,
+            "phase_id": claim.phase_id,
+            "reason": bounded_reason,
+        }),
+    )
+    .map_err(sqlite_api_error)?;
+    transaction.commit().map_err(sqlite_api_error)?;
+    broadcast_runtime_run_event(event);
+    Ok(())
+}
+
+/// 创建聊天 durable run。run 行与 `run.accepted` 必须在同一个 Immediate 事务中提交，
+/// 事务提交前不向广播总线发送任何事件。
+fn create_chat_runtime_run_sqlite(
+    path: &Path,
+    run_id: &str,
+    claim_token: &str,
+    workspace_id: &str,
+    session_id: Option<&str>,
+    chat_room_id: &str,
+    turn_id: &str,
+) -> rusqlite::Result<RuntimeRunRecord> {
+    let mut connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    let now = u64_to_i64(unix_timestamp_millis());
+    let run = RuntimeRunRecord {
+        id: run_id.to_string(),
+        kind: "chat_turn".to_string(),
+        workspace_id: workspace_id.to_string(),
+        session_id: session_id.map(str::to_string),
+        chat_room_id: Some(chat_room_id.to_string()),
+        goal_id: None,
+        phase_id: None,
+        legacy_turn_id: Some(turn_id.to_string()),
+        provider_turn_id: None,
+        state: "accepted".to_string(),
+        owner_id: Some("coolzhu-web-console".to_string()),
+        claim_token: claim_token.to_string(),
+        stop_reason: None,
+        error_json: None,
+        created_at: now,
+        started_at: None,
+        stop_requested_at: None,
+        heartbeat_at: Some(now),
+        finished_at: None,
+    };
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    insert_runtime_run_connection(&transaction, &run)?;
+    let event = append_runtime_run_event_deferred(
+        &transaction,
+        run_id,
+        "run.accepted",
+        json!({
+            "kind": "chat_turn",
+            "legacy_turn_id": turn_id,
+        }),
+    )?;
+    transaction.commit()?;
+    broadcast_runtime_run_event(event);
+    Ok(run)
+}
+
+/// worker 启动时仅允许自己的 accepted run CAS 为 running，并在 commit 后追加 started 事件。
+fn start_chat_runtime_run_sqlite(
+    path: &Path,
+    run_id: &str,
+    claim_token: &str,
+) -> rusqlite::Result<bool> {
+    let mut connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current_state: Option<String> = transaction
+        .query_row(
+            "SELECT state FROM runtime_runs WHERE id = ?1 AND claim_token = ?2",
+            params![run_id, claim_token],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(current_state) = current_state else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    if current_state != "accepted" {
+        return Ok(false);
+    }
+    let now = u64_to_i64(unix_timestamp_millis());
+    let changed = transaction.execute(
+        r#"
+        UPDATE runtime_runs
+           SET state = 'running', started_at = ?3, heartbeat_at = ?3
+         WHERE id = ?1 AND claim_token = ?2 AND state = 'accepted'
+        "#,
+        params![run_id, claim_token, now],
+    )?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    let event = append_runtime_run_event_deferred(
+        &transaction,
+        run_id,
+        "run.started",
+        json!({"previous_state": "accepted"}),
+    )?;
+    transaction.commit()?;
+    broadcast_runtime_run_event(event);
+    Ok(true)
+}
+
+/// 以 workspace/session/room/legacy turn 精确查找聊天 run；查不到时允许旧内存
+/// registry 在同进程迁移窗口提供兼容 fallback，不能模糊匹配其他作用域。
+fn query_chat_runtime_run_by_scope_sqlite(
+    path: &Path,
+    workspace_id: &str,
+    session_id: Option<&str>,
+    chat_room_id: &str,
+    turn_id: &str,
+) -> rusqlite::Result<Option<RuntimeRunRecord>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    connection
+        .query_row(
+            &format!(
+                "{RUNTIME_RUN_SELECT_SQL} WHERE kind = 'chat_turn' AND legacy_turn_id = ?1 \
+                 AND workspace_id = ?2 AND session_id IS ?3 AND chat_room_id = ?4"
+            ),
+            params![turn_id, workspace_id, session_id, chat_room_id],
+            runtime_run_record_from_row,
+        )
+        .optional()
+}
+
+/// worker/guard 终结的唯一入口。Immediate + claim token CAS 决定 interrupt/completion race：
+/// stop_requested 一旦先提交，任何完成/失败请求都只能收敛为 interrupted。
+fn finalize_chat_runtime_run_sqlite(
+    path: &Path,
+    run_id: &str,
+    claim_token: &str,
+    requested_status: ChatTurnStatus,
+) -> rusqlite::Result<ChatTurnStatus> {
+    let mut connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT state, claim_token FROM runtime_runs WHERE id = ?1",
+            params![run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((current_state, stored_claim_token)) = current else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    if stored_claim_token != claim_token {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    if let Some(actual) = chat_turn_status_from_runtime_state(&current_state) {
+        if actual.is_terminal() {
+            transaction.commit()?;
+            return Ok(actual);
+        }
+    } else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+
+    let target_state = if current_state == "stop_requested" {
+        "interrupted"
+    } else if current_state == "running" {
+        runtime_terminal_state_for_chat_status(requested_status)
+    } else if current_state == "accepted" {
+        match requested_status {
+            ChatTurnStatus::Interrupted => "interrupted",
+            ChatTurnStatus::Failed
+            | ChatTurnStatus::Completed
+            | ChatTurnStatus::Running
+            | ChatTurnStatus::InterruptRequested => "failed",
+        }
+    } else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    let now = u64_to_i64(unix_timestamp_millis());
+    let changed = transaction.execute(
+        r#"
+        UPDATE runtime_runs
+           SET state = ?3, finished_at = ?4
+         WHERE id = ?1 AND claim_token = ?2
+           AND state IN ('accepted','running','stop_requested')
+        "#,
+        params![run_id, claim_token, target_state, now],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let event_type = runtime_terminal_event_type(target_state)
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let event = append_runtime_run_event_deferred(
+        &transaction,
+        run_id,
+        event_type,
+        json!({
+            "previous_state": current_state,
+            "requested_status": requested_status,
+        }),
+    )?;
+    transaction.commit()?;
+    broadcast_runtime_run_event(event);
+    Ok(chat_turn_status_from_runtime_state(target_state).unwrap_or(ChatTurnStatus::Failed))
+}
+
+/// 启动前将上次进程遗留的非终态 run 收敛为 orphaned。
+///
+/// runtime orphaning 与 Goal phase durable claim 收敛共用一笔 Immediate 事务：事务内
+/// 先改 run，再按 workspace/Goal/phase/token 精确匹配清理 phase claim、收敛 Goal，最后
+/// 写事件；commit 成功后才广播。任何一步失败都会让 runtime/phase/Goal/event 一起回滚，
+/// 调用方可据此 fail-closed。数据库尚不存在时严格 no-op。
+fn recover_incomplete_runtime_runs(path: &Path) -> rusqlite::Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // 先一次性读取整批 active run 的恢复所需 scope。后续不再回读 runtime_runs，避免
+    // 只恢复到半批或用模糊条件误碰其它 workspace/Goal 的 claim。
+    let active_runs: Vec<RuntimeRunRecoveryCandidate> = {
+        let mut statement = transaction.prepare(
+            "SELECT id, state, kind, workspace_id, goal_id, phase_id, claim_token \
+             FROM runtime_runs \
+             WHERE state IN ('accepted','running','stop_requested') \
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(RuntimeRunRecoveryCandidate {
+                    id: row.get(0)?,
+                    previous_state: row.get(1)?,
+                    kind: row.get(2)?,
+                    workspace_id: row.get(3)?,
+                    goal_id: row.get(4)?,
+                    phase_id: row.get(5)?,
+                    claim_token: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let now = u64_to_i64(unix_timestamp_millis());
+    let mut runtime_events = Vec::new();
+    let mut goal_events = Vec::new();
+    for run in active_runs {
+        let changed = transaction.execute(
+            r#"
+            UPDATE runtime_runs
+               SET state = 'orphaned',
+                   stop_reason = 'process_restart',
+                   finished_at = ?2
+             WHERE id = ?1
+               AND state IN ('accepted','running','stop_requested')
+            "#,
+            params![&run.id, now],
+        )?;
+        if changed != 1 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        runtime_events.push(append_runtime_run_event_deferred(
+            &transaction,
+            &run.id,
+            "run.orphaned",
+            json!({
+                "reason": "process_restart",
+                "previous_state": run.previous_state,
+            }),
+        )?);
+
+        // chat_turn / goal_loop 没有 phase durable claim；它们只做 runtime orphaning。
+        let (Some(goal_id), Some(phase_id)) = (run.goal_id.as_deref(), run.phase_id.as_deref())
+        else {
+            continue;
+        };
+        if run.kind != "goal_phase" {
+            continue;
+        }
+
+        // workspace/Goal/phase 必须来自同一条关联记录；任何缺失或 scope 不匹配都保留
+        // phase 现场供人工处理。这里只读一次当前 Goal/phase 状态，不依据 runtime 的
+        // goal_id/phase_id 单独清理其它 scope 的 claim。
+        let matched_claim: Option<(String, String, String, Option<String>, Option<String>)> = transaction
+            .query_row(
+                r#"
+                SELECT g.workspace_id, g.status, p.status, p.active_run_id, p.claim_token
+                  FROM goals g
+                  JOIN goal_phases p
+                    ON p.goal_id = g.id
+                   AND p.id = ?3
+                 WHERE g.id = ?1
+                   AND g.workspace_id = ?2
+                   AND p.goal_id = ?1
+                "#,
+                params![goal_id, &run.workspace_id, phase_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()?;
+        let Some((goal_workspace_id, goal_status, phase_status, active_run_id, phase_claim_token)) =
+            matched_claim
+        else {
+            continue;
+        };
+        if goal_workspace_id != run.workspace_id
+            || active_run_id.as_deref() != Some(run.id.as_str())
+            || phase_claim_token.as_deref() != Some(run.claim_token.as_str())
+        {
+            continue;
+        }
+        if phase_status != "running" {
+            // ownership 虽匹配，但 phase 已离开 running，无法证明这是可安全收敛的
+            // 活动 claim；保留全部 phase/Goal 现场，并继续处理同一批其它 active run。
+            continue;
+        }
+
+        // 只有 status='running' 且 run/token ownership 同时命中时才清理 durable claim。
+        // 终态/异常 phase 不满足 CAS，就保留现场，不伪造 Goal review 事件。
+        let (next_phase_status, next_route_hint) = match goal_status.as_str() {
+            "cancelled" => ("cancelled", None),
+            "completed" | "paused" => ("pending", Some("manual_reconcile")),
+            _ => ("pending", Some("manual_reconcile")),
+        };
+        let phase_changed = transaction.execute(
+            r#"
+            UPDATE goal_phases
+               SET active_run_id = NULL,
+                   claim_token = NULL,
+                   claim_owner = NULL,
+                   claimed_at = NULL,
+                   lease_until = NULL,
+                   status = ?5,
+                   route_hint = ?6,
+                   updated_at = ?7
+             WHERE goal_id = ?1
+               AND id = ?2
+               AND status = 'running'
+               AND active_run_id = ?3
+               AND claim_token = ?4
+            "#,
+            params![
+                goal_id,
+                phase_id,
+                &run.id,
+                &run.claim_token,
+                next_phase_status,
+                next_route_hint,
+                now,
+            ],
+        )?;
+        if phase_changed != 1 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+
+        // 仅非终态 Goal 转 paused；cancelled/completed/paused 均不可被覆盖。
+        if !matches!(goal_status.as_str(), "cancelled" | "completed" | "paused") {
+            let goal_changed = transaction.execute(
+                r#"
+                UPDATE goals
+                   SET status = 'paused', updated_at = ?1
+                 WHERE workspace_id = ?2
+                   AND id = ?3
+                   AND status NOT IN ('cancelled','completed','paused')
+                "#,
+                params![now, &run.workspace_id, goal_id],
+            )?;
+            if goal_changed != 1 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+        }
+
+        // 事件 payload 只携带公开审计所需 scope，不暴露 claim_token/owner/lease/error_json。
+        goal_events.push(insert_goal_event_connection_deferred(
+            &transaction,
+            goal_id,
+            "run-interrupted-needs-review",
+            &format!(
+                "Goal phase {phase_id} was interrupted by process restart and needs manual reconciliation."
+            ),
+            json!({
+                "caller": "startup-recovery",
+                "phase_id": phase_id,
+                "run_id": run.id,
+                "previous_state": run.previous_state,
+                "reason": "process_restart",
+                "goal_status": goal_status,
+            }),
+        )?);
+    }
+    transaction.commit()?;
+    for event in &runtime_events {
+        broadcast_runtime_run_event(event.clone());
+    }
+    for event in &goal_events {
+        broadcast_goal_event(event.clone());
+    }
+    Ok(runtime_events.len())
+}
+
+fn normalize_run_interrupt_reason(reason: Option<&str>) -> Option<String> {
+    reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// 以 SQLite Immediate 事务执行唯一 CAS 中断请求。
+///
+/// 首次 accepted/running → stop_requested 时在同一事务追加一条 stop_requested 事件；
+/// transitional/terminal 状态只返回幂等 ACK，不覆盖状态、原因，也不追加事件。
+fn interrupt_runtime_run_sqlite(
+    path: &Path,
+    run_id: &str,
+    reason: Option<&str>,
+) -> rusqlite::Result<RunInterruptResponse> {
+    if !path.exists() {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let mut connection = open_session_connection(path)?;
+    initialize_session_schema(&connection)?;
+    let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current_state: Option<String> = transaction
+        .query_row(
+            "SELECT state FROM runtime_runs WHERE id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(current_state) = current_state else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    let normalized_reason = normalize_run_interrupt_reason(reason);
+    let mut event = None;
+    let (state, outcome, idempotent) = if matches!(current_state.as_str(), "accepted" | "running") {
+        let now = u64_to_i64(unix_timestamp_millis());
+        let changed = transaction.execute(
+            r#"
+            UPDATE runtime_runs
+               SET state = 'stop_requested',
+                   stop_requested_at = ?2,
+                   stop_reason = COALESCE(?3, stop_reason)
+             WHERE id = ?1
+               AND state IN ('accepted','running')
+            "#,
+            params![run_id, now, normalized_reason.as_deref()],
+        )?;
+        if changed == 1 {
+            event = Some(append_runtime_run_event_deferred(
+                &transaction,
+                run_id,
+                "run.stop_requested",
+                json!({
+                    "reason": normalized_reason,
+                    "previous_state": current_state,
+                }),
+            )?);
+            (
+                "stop_requested".to_string(),
+                "interrupt_requested".to_string(),
+                false,
+            )
+        } else {
+            let state: String = transaction.query_row(
+                "SELECT state FROM runtime_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )?;
+            let outcome = if state == "stop_requested" {
+                "interrupt_requested"
+            } else {
+                "already_finished"
+            };
+            (state, outcome.to_string(), true)
+        }
+    } else if current_state == "stop_requested" {
+        (
+            current_state,
+            "interrupt_requested".to_string(),
+            true,
+        )
+    } else {
+        (current_state, "already_finished".to_string(), true)
+    };
+    let response = RunInterruptResponse {
+        run_id: run_id.to_string(),
+        state,
+        outcome,
+        idempotent,
+    };
+    transaction.commit()?;
+    if let Some(event) = event {
+        broadcast_runtime_run_event(event);
+    }
+    Ok(response)
+}
+
+/// 一笔 Goal stop 事务的结果。事件对象只在外层事务 commit 成功后交给广播层；
+/// 结构体本身不携带 claim token/owner 等内部 ownership 资料。
+#[derive(Debug, Default)]
+struct GoalPhaseStopRequestEvents {
+    runtime_events: Vec<RuntimeRunEventDto>,
+}
+
+/// 在调用方已经持有的 `BEGIN IMMEDIATE` 事务内，把指定 workspace/Goal 的所有
+/// active goal-phase run 原子请求停止。
+///
+/// 这是 stop 请求的唯一批量 CAS：每一行只允许 accepted/running → stop_requested，
+/// 每个实际命中的 run 只追加一次 `run.stop_requested`。重复调用不会改状态，也不会
+/// 重复追加事件。事件 payload 刻意不包含 claim token、owner、lease 或 error_json。
+fn request_goal_phase_stop_requests_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    goal_id: &str,
+    reason: Option<&str>,
+) -> rusqlite::Result<GoalPhaseStopRequestEvents> {
+    let normalized_reason = normalize_run_interrupt_reason(reason);
+    let candidates = {
+        let mut statement = transaction.prepare(
+            r#"
+            SELECT id, state, phase_id
+            FROM runtime_runs
+            WHERE workspace_id = ?1
+              AND goal_id = ?2
+              AND kind = 'goal_phase'
+              AND state IN ('accepted', 'running')
+            ORDER BY id
+            "#,
+        )?;
+        let rows = statement.query_map(params![workspace_id, goal_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let now = u64_to_i64(unix_timestamp_millis());
+    let mut runtime_events = Vec::new();
+    for (run_id, previous_state, phase_id) in candidates {
+        let changed = transaction.execute(
+            r#"
+            UPDATE runtime_runs
+               SET state = 'stop_requested',
+                   stop_requested_at = ?2,
+                   stop_reason = COALESCE(?3, stop_reason)
+             WHERE id = ?1
+               AND workspace_id = ?4
+               AND goal_id = ?5
+               AND kind = 'goal_phase'
+               AND state IN ('accepted', 'running')
+            "#,
+            params![
+                &run_id,
+                now,
+                normalized_reason.as_deref(),
+                workspace_id,
+                goal_id,
+            ],
+        )?;
+        if changed != 1 {
+            continue;
+        }
+        let mut payload = json!({
+            "kind": "goal_phase",
+            "goal_id": goal_id,
+            "previous_state": previous_state,
+            "reason": normalized_reason,
+        });
+        if let Some(phase_id) = phase_id {
+            payload["phase_id"] = JsonValue::String(phase_id);
+        }
+        runtime_events.push(append_runtime_run_event_deferred(
+            transaction,
+            &run_id,
+            "run.stop_requested",
+            payload,
+        )?);
+    }
+    Ok(GoalPhaseStopRequestEvents { runtime_events })
+}
+
+/// 非事务包装：事务 commit 后才广播 stop 事件。
+fn request_goal_phase_stop_requests_sqlite(
+    path: &Path,
+    workspace_id: &str,
+    goal_id: &str,
+    reason: Option<&str>,
+) -> ApiResult<usize> {
+    let mut connection = open_session_connection(path).map_err(sqlite_api_error)?;
+    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sqlite_api_error)?;
+    let outcome = request_goal_phase_stop_requests_transaction(
+        &transaction,
+        workspace_id,
+        goal_id,
+        reason,
+    )
+    .map_err(sqlite_api_error)?;
+    let runtime_events = outcome.runtime_events;
+    transaction.commit().map_err(sqlite_api_error)?;
+    let count = runtime_events.len();
+    for event in runtime_events {
+        broadcast_runtime_run_event(event);
+    }
+    Ok(count)
+}
+
 fn read_session_state_from_sqlite(path: &Path) -> rusqlite::Result<PersistedSessionState> {
     let started = Instant::now();
     diag!("[SESSION-SQLITE] read start: {}", path.display());
@@ -36738,7 +41526,9 @@ fn read_session_state_from_sqlite(path: &Path) -> rusqlite::Result<PersistedSess
             model: row.get(3)?,
             base_url: row.get(4)?,
             endpoint: row.get(5)?,
-            reasoning_effort: normalize_reasoning_effort(Some(row.get::<_, String>(6)?.as_str())),
+            // 读取时保留 SQLite 中的原始字符串；summary/agent DTO 再通过
+            // resolve_legacy_reasoning 计算 canonical requested/effective。
+            reasoning_effort: row.get(6)?,
             model_type: row.get::<_, String>(7).unwrap_or_else(|_| {
                 resolve_model_type(&row.get::<_, String>(3).unwrap_or_default())
             }),
@@ -37198,33 +41988,70 @@ fn create_goal_sqlite(
 }
 
 fn cancel_goal_sqlite(path: &Path, workspace_id: &str, goal_id: &str) -> ApiResult<GoalDto> {
-    let existing = get_goal_sqlite(path, workspace_id, goal_id)?;
-    if matches!(existing.status.as_str(), "completed" | "cancelled") {
-        return Ok(existing);
-    }
     let now = unix_timestamp_millis();
-    let connection = open_session_connection(path).map_err(sqlite_api_error)?;
+    let mut connection = open_session_connection(path).map_err(sqlite_api_error)?;
     initialize_session_schema(&connection).map_err(sqlite_api_error)?;
-    connection
-        .execute(
-            r#"
-            UPDATE goals
-            SET status = 'cancelled', updated_at = ?1, cancelled_at = ?1
-            WHERE workspace_id = ?2
-              AND id = ?3
-              AND status NOT IN ('completed', 'cancelled')
-            "#,
-            params![u64_to_i64(now), workspace_id, goal_id],
+    let (goal_event, runtime_events) = {
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_api_error)?;
+        let previous_status: String = transaction
+            .query_row(
+                "SELECT status FROM goals WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, goal_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_api_error)?
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Goal 不存"))?;
+        let goal_changed = transaction
+            .execute(
+                r#"
+                UPDATE goals
+                SET status = 'cancelled', updated_at = ?1, cancelled_at = ?1
+                WHERE workspace_id = ?2
+                  AND id = ?3
+                  AND status NOT IN ('completed', 'cancelled')
+                "#,
+                params![u64_to_i64(now), workspace_id, goal_id],
+            )
+            .map_err(sqlite_api_error)?;
+        let goal_event = if goal_changed == 1 {
+            Some(
+                insert_goal_event_connection_deferred(
+                    &transaction,
+                    goal_id,
+                    "goal-cancelled",
+                    "Goal cancelled by user.",
+                    json!({
+                        "cancelled_at": now,
+                        "previous_status": previous_status,
+                    }),
+                )
+                .map_err(sqlite_api_error)?,
+            )
+        } else {
+            None
+        };
+        let stop_events = request_goal_phase_stop_requests_transaction(
+            &transaction,
+            workspace_id,
+            goal_id,
+            Some("Goal cancelled by user."),
         )
         .map_err(sqlite_api_error)?;
-    insert_goal_event_connection(
-        &connection,
-        goal_id,
-        "goal-cancelled",
-        "Goal cancelled by user.",
-        json!({ "cancelled_at": now }),
-    )
-    .map_err(sqlite_api_error)?;
+        let runtime_events = stop_events.runtime_events;
+        transaction.commit().map_err(sqlite_api_error)?;
+        (goal_event, runtime_events)
+    };
+    // 只有事务 commit 成功后才广播/触发内存 worker；失败时不会留下半个 stop。
+    for event in runtime_events {
+        broadcast_runtime_run_event(event);
+    }
+    if let Some(event) = goal_event {
+        broadcast_goal_event(event);
+    }
+    request_goal_loop_stop_scoped(workspace_id, goal_id);
     get_goal_sqlite(path, workspace_id, goal_id)
 }
 
@@ -37242,37 +42069,67 @@ fn pause_goal_sqlite(
     workspace_id: &str,
     goal_id: &str,
 ) -> ApiResult<GoalStatusResponse> {
-    let existing = get_goal_sqlite(path, workspace_id, goal_id)?;
-    if matches!(
-        existing.status.as_str(),
-        "completed" | "cancelled" | "paused"
-    ) {
-        return Ok(goal_status_response_from_goal(existing));
-    }
     let now = unix_timestamp_millis();
-    let previous_status = existing.status.clone();
-    let connection = open_session_connection(path).map_err(sqlite_api_error)?;
+    let mut connection = open_session_connection(path).map_err(sqlite_api_error)?;
     initialize_session_schema(&connection).map_err(sqlite_api_error)?;
-    connection
-        .execute(
-            r#"
-            UPDATE goals
-            SET status = 'paused', updated_at = ?1
-            WHERE workspace_id = ?2
-              AND id = ?3
-              AND status NOT IN ('completed', 'cancelled', 'paused')
-            "#,
-            params![u64_to_i64(now), workspace_id, goal_id],
+    let (goal_event, runtime_events) = {
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_api_error)?;
+        let previous_status: String = transaction
+            .query_row(
+                "SELECT status FROM goals WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace_id, goal_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_api_error)?
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Goal 不存"))?;
+        let goal_changed = transaction
+            .execute(
+                r#"
+                UPDATE goals
+                SET status = 'paused', updated_at = ?1
+                WHERE workspace_id = ?2
+                  AND id = ?3
+                  AND status NOT IN ('completed', 'cancelled', 'paused')
+                "#,
+                params![u64_to_i64(now), workspace_id, goal_id],
+            )
+            .map_err(sqlite_api_error)?;
+        let goal_event = if goal_changed == 1 {
+            Some(
+                insert_goal_event_connection_deferred(
+                    &transaction,
+                    goal_id,
+                    "goal-paused",
+                    "Goal paused by user.",
+                    json!({ "paused_at": now, "previous_status": previous_status }),
+                )
+                .map_err(sqlite_api_error)?,
+            )
+        } else {
+            None
+        };
+        let stop_events = request_goal_phase_stop_requests_transaction(
+            &transaction,
+            workspace_id,
+            goal_id,
+            Some("Goal paused by user."),
         )
         .map_err(sqlite_api_error)?;
-    insert_goal_event_connection(
-        &connection,
-        goal_id,
-        "goal-paused",
-        "Goal paused by user.",
-        json!({ "paused_at": now, "previous_status": previous_status }),
-    )
-    .map_err(sqlite_api_error)?;
+        let runtime_events = stop_events.runtime_events;
+        transaction.commit().map_err(sqlite_api_error)?;
+        (goal_event, runtime_events)
+    };
+    // 只有 commit 成功后才向 Goal loop 发内存停止信号。
+    for event in runtime_events {
+        broadcast_runtime_run_event(event);
+    }
+    if let Some(event) = goal_event {
+        broadcast_goal_event(event);
+    }
+    request_goal_loop_stop_scoped(workspace_id, goal_id);
     goal_status_sqlite(path, workspace_id, goal_id)
 }
 
@@ -37520,6 +42377,21 @@ fn resume_goal_from_phase_sqlite(
         let tx = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(sqlite_api_error)?;
+        let active_claim: Option<String> = tx
+            .query_row(
+                "SELECT active_run_id FROM goal_phases \
+                 WHERE goal_id = ?1 AND active_run_id IS NOT NULL LIMIT 1",
+                params![goal_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_api_error)?;
+        if active_claim.is_some() {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "cannot resume a goal while a phase claim is active",
+            ));
+        }
         let (status, current_iteration, max_iterations): (String, i64, i64) = tx
             .query_row(
                 "SELECT status, current_iteration, max_iterations FROM goals \
@@ -37597,7 +42469,8 @@ fn resume_goal_from_phase_sqlite(
                 .prepare(
                     "UPDATE goal_phases SET status = 'pending', retry_count = 0, \
                      last_verdict = NULL, last_reason = NULL, last_evidence_json = NULL, \
-                     route_hint = NULL, updated_at = ?1 WHERE goal_id = ?2 AND id = ?3",
+                     route_hint = NULL, updated_at = ?1 \
+                     WHERE goal_id = ?2 AND id = ?3 AND active_run_id IS NULL",
                 )
                 .map_err(sqlite_api_error)?;
             for id in &to_reset {
@@ -37641,65 +42514,107 @@ fn resume_goal_sqlite(
     workspace_id: &str,
     goal_id: &str,
 ) -> ApiResult<GoalStatusResponse> {
-    let existing = get_goal_sqlite(path, workspace_id, goal_id)?;
-    if existing.status != "paused" {
-        return Ok(goal_status_response_from_goal(existing));
+    let now = unix_timestamp_millis();
+    let mut connection = open_session_connection(path).map_err(sqlite_api_error)?;
+    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+    // 普通 resume 也必须在幂等早退前检查 active claim。Immediate 锁把检查、paused
+    // 状态更新和 resumed 事件收在同一事务内，避免检查通过后 phase 才被并发 claim。
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sqlite_api_error)?;
+    let (status, current_iteration, max_iterations): (String, i64, i64) = transaction
+        .query_row(
+            "SELECT status, current_iteration, max_iterations FROM goals \
+             WHERE workspace_id = ?1 AND id = ?2",
+            params![workspace_id, goal_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_api_error)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Goal 不存"))?;
+    let active_claim: Option<String> = transaction
+        .query_row(
+            "SELECT active_run_id FROM goal_phases \
+             WHERE goal_id = ?1 AND active_run_id IS NOT NULL LIMIT 1",
+            params![goal_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_api_error)?;
+    if active_claim.is_some() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "cannot resume a goal while a phase claim is active",
+        ));
+    }
+    if status != "paused" {
+        transaction.commit().map_err(sqlite_api_error)?;
+        return goal_status_sqlite(path, workspace_id, goal_id);
     }
     // GL-08（codex #1）：预算耗尽导致的暂停，不抬高 max_iterations 就不许 resume——
     // 否则 resume 就成了绕过全局天花板的后门。
-    if existing.current_iteration >= existing.max_iterations {
+    if current_iteration >= max_iterations {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             &format!(
-                "Goal iteration budget exhausted ({}/{}); raise max_iterations before resuming.",
-                existing.current_iteration, existing.max_iterations
+                "Goal iteration budget exhausted ({current_iteration}/{max_iterations}); raise max_iterations before resuming.",
             ),
         ));
     }
-    let now = unix_timestamp_millis();
-    let resumed_status = resumed_goal_status(&existing);
-    let connection = open_session_connection(path).map_err(sqlite_api_error)?;
-    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
-    connection
+    let phase_statuses: Vec<String> = {
+        let mut statement = transaction
+            .prepare("SELECT status FROM goal_phases WHERE goal_id = ?1")
+            .map_err(sqlite_api_error)?;
+        let rows = statement
+            .query_map(params![goal_id], |row| row.get::<_, String>(0))
+            .map_err(sqlite_api_error)?;
+        let mut statuses = Vec::new();
+        for row in rows {
+            statuses.push(row.map_err(sqlite_api_error)?);
+        }
+        statuses
+    };
+    let resumed_status = if phase_statuses
+        .iter()
+        .any(|phase_status| matches!(phase_status.as_str(), "running" | "dispatched"))
+    {
+        "running"
+    } else if !phase_statuses.is_empty()
+        && phase_statuses
+            .iter()
+            .all(|phase_status| phase_status == "completed")
+    {
+        "completed"
+    } else {
+        "planning"
+    };
+    let changed = transaction
         .execute(
             r#"
             UPDATE goals
             SET status = ?1, updated_at = ?2
             WHERE workspace_id = ?3
-              AND id = ?4
+            AND id = ?4
               AND status = 'paused'
             "#,
             params![resumed_status, u64_to_i64(now), workspace_id, goal_id],
         )
         .map_err(sqlite_api_error)?;
-    insert_goal_event_connection(
-        &connection,
+    if changed != 1 {
+        transaction.commit().map_err(sqlite_api_error)?;
+        return goal_status_sqlite(path, workspace_id, goal_id);
+    }
+    let event = insert_goal_event_connection_deferred(
+        &transaction,
         goal_id,
         "goal-resumed",
         "Goal resumed by user.",
         json!({ "resumed_at": now, "status": resumed_status }),
     )
     .map_err(sqlite_api_error)?;
+    transaction.commit().map_err(sqlite_api_error)?;
+    broadcast_goal_event(event);
     goal_status_sqlite(path, workspace_id, goal_id)
-}
-
-fn resumed_goal_status(goal: &GoalDto) -> &'static str {
-    if goal
-        .phases
-        .iter()
-        .any(|phase| matches!(phase.status.as_str(), "running" | "dispatched"))
-    {
-        "running"
-    } else if !goal.phases.is_empty()
-        && goal
-            .phases
-            .iter()
-            .all(|phase| phase.status.as_str() == "completed")
-    {
-        "completed"
-    } else {
-        "planning"
-    }
 }
 
 fn goal_status_response_from_goal(goal: GoalDto) -> GoalStatusResponse {
@@ -37786,6 +42701,62 @@ fn register_goal_loop_start(
     (response, Some(cancel))
 }
 
+/// 只停止同一 workspace 下的 loop。registry 目前以 goal_id 兼容旧状态接口索引，
+/// 因此所有生产调用必须额外比对 workspace_id，不能只按 goal_id 发 AtomicBool。
+fn request_goal_loop_stop_scoped(
+    workspace_id: &str,
+    goal_id: &str,
+) -> GoalLoopStatusResponse {
+    request_goal_loop_stop_scoped_with_transition(workspace_id, goal_id).0
+}
+
+/// 设置匹配 workspace 的 loop stop flag，并返回本次是否从未请求变为已请求。
+/// 该 transition 结果用于避免重复写 loop stop 事件；runtime stop event 的
+/// 幂等性仍由其 SQLite CAS 保证。
+fn request_goal_loop_stop_scoped_with_transition(
+    workspace_id: &str,
+    goal_id: &str,
+) -> (GoalLoopStatusResponse, bool) {
+    let mut registry = goal_loop_registry()
+        .lock()
+        .expect("goal loop registry lock poisoned");
+    if let Some(record) = registry.get_mut(goal_id) {
+        if record.workspace_id != workspace_id {
+            return (GoalLoopStatusResponse {
+                goal_id: goal_id.to_string(),
+                workspace_id: None,
+                running: false,
+                stop_requested: false,
+                max_steps: 0,
+                completed_steps: 0,
+                started_at: None,
+                completed_at: None,
+                stopped_reason: Some("No active goal loop.".to_string()),
+                generated_at: unix_timestamp_millis(),
+            }, false);
+        }
+        let newly_requested = !record.stop_requested;
+        record.stop_requested = true;
+        record.stopped_reason = Some("Stop requested by user.".to_string());
+        record.cancel.store(true, Ordering::SeqCst);
+        return (goal_loop_status_from_record(goal_id, record), newly_requested);
+    }
+    (GoalLoopStatusResponse {
+        goal_id: goal_id.to_string(),
+        workspace_id: None,
+        running: false,
+        stop_requested: false,
+        max_steps: 0,
+        completed_steps: 0,
+        started_at: None,
+        completed_at: None,
+        stopped_reason: Some("No active goal loop.".to_string()),
+        generated_at: unix_timestamp_millis(),
+    }, false)
+}
+
+/// 兼容旧测试/内部历史调用的非 scoped 包装。生产 stop/interrupt 路径不得使用它。
+#[cfg(test)]
 fn request_goal_loop_stop(goal_id: &str) -> GoalLoopStatusResponse {
     let mut registry = goal_loop_registry()
         .lock()
@@ -37829,6 +42800,40 @@ fn finish_goal_loop_status(goal_id: &str, completed_steps: usize, stopped_reason
     }
 }
 
+fn mark_goal_loop_progress_scoped(
+    workspace_id: &str,
+    goal_id: &str,
+    completed_steps: usize,
+) {
+    if let Ok(mut registry) = goal_loop_registry().lock() {
+        if let Some(record) = registry
+            .get_mut(goal_id)
+            .filter(|record| record.workspace_id == workspace_id)
+        {
+            record.completed_steps = completed_steps;
+        }
+    }
+}
+
+fn finish_goal_loop_status_scoped(
+    workspace_id: &str,
+    goal_id: &str,
+    completed_steps: usize,
+    stopped_reason: String,
+) {
+    if let Ok(mut registry) = goal_loop_registry().lock() {
+        if let Some(record) = registry
+            .get_mut(goal_id)
+            .filter(|record| record.workspace_id == workspace_id)
+        {
+            record.running = false;
+            record.completed_steps = completed_steps;
+            record.completed_at = Some(unix_timestamp_millis());
+            record.stopped_reason = Some(stopped_reason);
+        }
+    }
+}
+
 fn goal_loop_status(goal_id: &str) -> GoalLoopStatusResponse {
     let registry = goal_loop_registry()
         .lock()
@@ -37846,6 +42851,28 @@ fn goal_loop_status(goal_id: &str) -> GoalLoopStatusResponse {
             started_at: None,
             completed_at: None,
             stopped_reason: Some("No loop has been started for this goal.".to_string()),
+            generated_at: unix_timestamp_millis(),
+        })
+}
+
+fn goal_loop_status_scoped(workspace_id: &str, goal_id: &str) -> GoalLoopStatusResponse {
+    let registry = goal_loop_registry()
+        .lock()
+        .expect("goal loop registry lock poisoned");
+    registry
+        .get(goal_id)
+        .filter(|record| record.workspace_id == workspace_id)
+        .map(|record| goal_loop_status_from_record(goal_id, record))
+        .unwrap_or_else(|| GoalLoopStatusResponse {
+            goal_id: goal_id.to_string(),
+            workspace_id: None,
+            running: false,
+            stop_requested: false,
+            max_steps: 0,
+            completed_steps: 0,
+            started_at: None,
+            completed_at: None,
+            stopped_reason: Some("No active goal loop.".to_string()),
             generated_at: unix_timestamp_millis(),
         })
 }
@@ -38056,7 +43083,7 @@ fn query_goal_phases_connection(
         SELECT id, goal_id, title, assigned_role, status, depends_on_json,
                skills_json, output_artifacts_json, verification_json, created_at, updated_at,
                retry_count, max_retries, last_verdict, last_reason, last_evidence_json, route_hint,
-               requires_human_ack, human_ack
+               requires_human_ack, human_ack, active_run_id
         FROM goal_phases
         WHERE goal_id = ?1
         ORDER BY created_at, id
@@ -38076,6 +43103,7 @@ fn query_goal_phases_connection(
         // 回退路由列（v13）。retry/max 用 NOT NULL DEFAULT 建列，读回不会是 NULL；
         // last_evidence_json 落库是 JSON 字符串，这里解析回 JsonValue 交给前端。
         let last_evidence_json: Option<String> = row.get(15)?;
+        let active_run_id: Option<String> = row.get(19)?;
         Ok(GoalPhaseDto {
             id: row.get(0)?,
             goal_id: row.get(1)?,
@@ -38098,6 +43126,7 @@ fn query_goal_phases_connection(
             route_hint: row.get(16)?,
             requires_human_ack: row.get::<_, i64>(17)? != 0,
             human_ack: row.get(18)?,
+            active_run_id,
             created_at: i64_to_u64(row.get::<_, i64>(9)?),
             updated_at: i64_to_u64(row.get::<_, i64>(10)?),
         })
@@ -38153,11 +43182,12 @@ fn insert_goal_event_connection_deferred(
     payload: JsonValue,
 ) -> rusqlite::Result<GoalEventDto> {
     let now = unix_timestamp_millis();
+    let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
     let event_id = format!(
         "goal-event-{now}-{:08x}",
-        (hash_bytes(format!("{goal_id}|{event_type}|{message}").as_bytes()) & 0xffff_ffff) as u32
+        (hash_bytes(format!("{goal_id}|{event_type}|{message}|{payload_json}").as_bytes())
+            & 0xffff_ffff) as u32
     );
-    let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
     let event = GoalEventDto {
         id: event_id,
         goal_id: goal_id.to_string(),
@@ -38466,7 +43496,9 @@ fn reserve_goal_iteration_connection(
 ) -> rusqlite::Result<Option<(u32, u32)>> {
     let changed = connection.execute(
         "UPDATE goals SET current_iteration = current_iteration + 1, updated_at = ?1 \
-         WHERE workspace_id = ?2 AND id = ?3 AND current_iteration < max_iterations",
+         WHERE workspace_id = ?2 AND id = ?3 \
+           AND status NOT IN ('paused', 'cancelled', 'completed') \
+           AND current_iteration < max_iterations",
         params![u64_to_i64(unix_timestamp_millis()), workspace_id, goal_id],
     )?;
     if changed == 0 {
@@ -38748,6 +43780,940 @@ fn goal_phase_result_evidence(answer_text: &str, tool_messages: &[ChatMessageDto
         .find(|content| !content.is_empty())
         .map(|content| content.chars().take(2_000).collect())
         .unwrap_or_else(|| "Goal phase returned no textual evidence.".to_string())
+}
+
+/// 只构造内存中的 Goal 结果消息；这里不能触碰 SessionStore、SQLite 或 memory。
+/// 事务 finalizer 在完成 ownership 校验后再把 tool/summary 消息一并写入两张消息表。
+fn build_goal_phase_result_messages(
+    phase_id: &str,
+    agent: &AgentSessionDto,
+    response: &AgentModelResponse,
+    mut tool_messages: Vec<ChatMessageDto>,
+) -> Vec<ChatMessageDto> {
+    let now = unix_timestamp_millis();
+    let mut messages = Vec::new();
+    if !response.reasoning_text.trim().is_empty() {
+        messages.push(ChatMessageDto {
+            id: format!("msg-goal-{now}-{phase_id}-thinking"),
+            author: visible_reasoning_author(agent),
+            role: "assistant".to_string(),
+            target: "Goal phase reasoning".to_string(),
+            content: sanitize_visible_model_text(agent, &response.reasoning_text),
+            kind: "reasoning".to_string(),
+            attachments: Vec::new(),
+        });
+    }
+    if !response.answer_text.trim().is_empty() {
+        let mut answer_content = sanitize_visible_model_text(agent, &response.answer_text);
+        append_context_footer(&mut answer_content, response.context_footer.as_deref());
+        messages.push(ChatMessageDto {
+            id: format!("msg-goal-{now}-{phase_id}"),
+            author: visible_agent_author(agent),
+            role: "assistant".to_string(),
+            target: "Goal phase".to_string(),
+            content: answer_content,
+            kind: if response.used_real_model {
+                "assistant-reply".to_string()
+            } else {
+                "assistant-fallback".to_string()
+            },
+            attachments: Vec::new(),
+        });
+    }
+    messages.append(&mut tool_messages);
+    messages
+}
+
+#[derive(Debug)]
+struct GoalPhaseFinalizedResult {
+    assigned_session_id: String,
+    chat_room_id: String,
+    messages: Vec<ChatMessageDto>,
+    status: GoalStatusResponse,
+    memory_eligible: bool,
+}
+
+#[derive(Debug)]
+struct GoalPhaseStopEvents {
+    runtime: RuntimeRunEventDto,
+    goal: GoalEventDto,
+}
+
+fn stale_goal_phase_result_error() -> ApiError {
+    // 不把 run id/token/owner/lease 或 SQLite error_json 拼进公开错误，避免内部 claim
+    // identity 通过 stale 结果回显。
+    api_error(
+        StatusCode::CONFLICT,
+        "Goal phase result is stale or no longer owns the active execution claim.",
+    )
+}
+
+/// Goal loop 收到 phase stop/interrupted/stale 409 时应结束本轮循环，不能把
+/// stop finalizer 的竞争当作可重试 phase。其它非冲突错误仍按普通失败记录。
+fn goal_phase_stop_conflict(error: &ApiError) -> bool {
+    error.0 == StatusCode::CONFLICT
+        && {
+            let message = error.1.error.as_str();
+            message.contains("stale")
+                || message.contains("stop")
+                || message.contains("interrupted")
+                || message.contains("workspace")
+        }
+}
+
+fn query_goal_for_finalizer(
+    connection: &Connection,
+    workspace_id: &str,
+    goal_id: &str,
+) -> ApiResult<GoalDto> {
+    let row = connection
+        .query_row(
+            r#"
+            SELECT id, workspace_id, chat_room_id, title, status, max_iterations,
+                   current_iteration, background, originating_user_msg_id,
+                   completion_condition_json, plan_json, created_at, updated_at, cancelled_at
+            FROM goals
+            WHERE workspace_id = ?1 AND id = ?2
+            "#,
+            params![workspace_id, goal_id],
+            goal_row_from_row,
+        )
+        .optional()
+        .map_err(sqlite_api_error)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Goal 不存"))?;
+    goal_dto_from_row(connection, row)
+}
+
+/// 在 token-aware finalizer 事务中先验证并占用当前 claim。即使 SET 是 no-op，SQLite
+/// `changes()` 仍会对命中的 row 返回 1；这一步位于任何 message/verdict/context 前，
+/// 使 stale 结果在副作用前 fail-closed。
+fn goal_phase_result_ownership_cas(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    goal_id: &str,
+    phase_id: &str,
+    run_id: &str,
+    claim_token: &str,
+    session_id: &str,
+    room_id: &str,
+) -> rusqlite::Result<()> {
+    let phase_changed = transaction.execute(
+        r#"
+        UPDATE goal_phases
+           SET updated_at = updated_at
+         WHERE goal_id = ?1 AND id = ?2 AND status = 'running'
+           AND active_run_id = ?3 AND claim_token = ?4
+        "#,
+        params![goal_id, phase_id, run_id, claim_token],
+    )?;
+    if phase_changed != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let runtime_changed = transaction.execute(
+        r#"
+        UPDATE runtime_runs
+           SET heartbeat_at = heartbeat_at
+         WHERE id = ?1 AND kind = 'goal_phase'
+           AND workspace_id = ?2 AND goal_id = ?3 AND phase_id = ?4
+           AND chat_room_id = ?5 AND session_id = ?6
+           AND claim_token = ?7 AND state IN ('running','stop_requested')
+        "#,
+        params![
+            run_id,
+            workspace_id,
+            goal_id,
+            phase_id,
+            room_id,
+            session_id,
+            claim_token
+        ],
+    )?;
+    if runtime_changed != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    Ok(())
+}
+
+/// stop_requested / path drift / startup recovery 共用的自有 token 中断收敛。
+/// `expected_state` 只允许 running 或 stop_requested；所有 scope 和 token 都在两个
+/// ownership UPDATE 的 WHERE 中再次校验。调用方必须在同一 Immediate transaction 内调用。
+fn finalize_goal_phase_interrupted_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    goal_id: &str,
+    phase_id: &str,
+    run_id: &str,
+    claim_token: &str,
+    expected_state: &str,
+    goal_status: &str,
+    reason: &str,
+) -> rusqlite::Result<GoalPhaseStopEvents> {
+    if !matches!(expected_state, "running" | "stop_requested") {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let now = unix_timestamp_millis();
+    let run_changed = transaction.execute(
+        r#"
+        UPDATE runtime_runs
+           SET state = 'interrupted',
+               stop_reason = COALESCE(stop_reason, ?7),
+               finished_at = ?8
+         WHERE id = ?1 AND kind = 'goal_phase'
+           AND workspace_id = ?2 AND goal_id = ?3 AND phase_id = ?4
+           AND claim_token = ?5 AND state = ?6
+        "#,
+        params![
+            run_id,
+            workspace_id,
+            goal_id,
+            phase_id,
+            claim_token,
+            expected_state,
+            reason,
+            u64_to_i64(now),
+        ],
+    )?;
+    if run_changed != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+
+    // cancelled 允许 phase 一并落 cancelled；其它 Goal 状态（包括 completed/paused）
+    // 都必须把仍在 running 的 phase 收敛到 pending/manual_reconcile。completed Goal
+    // 是更高优先级事实，下面只清理自有 phase claim，不覆盖 Goal 本身。
+    let (next_phase_status, next_route_hint): (&str, Option<&str>) = if goal_status == "cancelled"
+    {
+        ("cancelled", None)
+    } else {
+        ("pending", Some("manual_reconcile"))
+    };
+    let phase_changed = transaction.execute(
+        r#"
+        UPDATE goal_phases
+           SET active_run_id = NULL, claim_token = NULL, claim_owner = NULL,
+               claimed_at = NULL, lease_until = NULL, status = ?5,
+               route_hint = ?6, updated_at = ?7
+         WHERE goal_id = ?1 AND id = ?2 AND status = 'running'
+           AND active_run_id = ?3 AND claim_token = ?4
+        "#,
+        params![
+            goal_id,
+            phase_id,
+            run_id,
+            claim_token,
+            next_phase_status,
+            next_route_hint,
+            u64_to_i64(now)
+        ],
+    )?;
+    if phase_changed != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+
+    // Goal terminal 状态不可被覆盖；paused 保持 paused，只有活动 Goal 才转为 paused。
+    if !matches!(goal_status, "cancelled" | "completed" | "paused") {
+        let goal_changed = transaction.execute(
+            r#"
+            UPDATE goals SET status = 'paused', updated_at = ?1
+             WHERE workspace_id = ?2 AND id = ?3
+               AND status NOT IN ('cancelled','completed','paused')
+            "#,
+            params![u64_to_i64(now), workspace_id, goal_id],
+        )?;
+        if goal_changed != 1 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+    }
+
+    let runtime = append_runtime_run_event_deferred(
+        transaction,
+        run_id,
+        "run.interrupted",
+        json!({
+            "kind": "goal_phase",
+            "workspace_id": workspace_id,
+            "goal_id": goal_id,
+            "phase_id": phase_id,
+            "previous_state": expected_state,
+            "reason": reason,
+        }),
+    )?;
+    let goal = insert_goal_event_connection_deferred(
+        transaction,
+        goal_id,
+        "run-interrupted-needs-review",
+        &format!("Goal phase {phase_id} was interrupted and needs manual reconciliation."),
+        json!({
+            "caller": "goal-finalizer",
+            "phase_id": phase_id,
+            "run_id": run_id,
+            "reason": reason,
+            "goal_status": goal_status,
+        }),
+    )?;
+    Ok(GoalPhaseStopEvents { runtime, goal })
+}
+
+/// captured DB path 漂移时只收敛自己的旧 run；不插入结果消息/verdict，也不访问新 DB。
+fn cleanup_goal_phase_path_drift(
+    path: &Path,
+    workspace_id: &str,
+    goal_id: &str,
+    phase_id: &str,
+    run_id: &str,
+    claim_token: &str,
+) -> ApiResult<()> {
+    if !path.exists() {
+        return Err(stale_goal_phase_result_error());
+    }
+    let mut connection = open_session_connection(path).map_err(sqlite_api_error)?;
+    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sqlite_api_error)?;
+    let Some(run) = query_runtime_run_connection(&transaction, run_id).map_err(sqlite_api_error)?
+    else {
+        return Err(stale_goal_phase_result_error());
+    };
+    if run.kind != "goal_phase"
+        || run.workspace_id != workspace_id
+        || run.goal_id.as_deref() != Some(goal_id)
+        || run.phase_id.as_deref() != Some(phase_id)
+        || run.claim_token != claim_token
+        || !matches!(run.state.as_str(), "running" | "stop_requested")
+    {
+        return Err(stale_goal_phase_result_error());
+    }
+    let goal = query_goal_for_finalizer(&transaction, workspace_id, goal_id)
+        .map_err(|_| stale_goal_phase_result_error())?;
+    if run.chat_room_id.as_deref() != Some(goal.chat_room_id.as_str())
+        || run.session_id.is_none()
+    {
+        return Err(stale_goal_phase_result_error());
+    }
+    let phase_state: Option<(String, Option<String>)> = transaction
+        .query_row(
+            "SELECT status, active_run_id FROM goal_phases WHERE goal_id = ?1 AND id = ?2",
+            params![goal_id, phase_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|_| stale_goal_phase_result_error())?;
+    let Some((phase_status, active_run_id)) = phase_state else {
+        return Err(stale_goal_phase_result_error());
+    };
+    if phase_status != "running" || active_run_id.as_deref() != Some(run_id) {
+        return Err(stale_goal_phase_result_error());
+    }
+    // stop_requested 在 path drift 时同样只能由当前 token 收敛；不让迟到的正常结果覆盖。
+    let events = finalize_goal_phase_interrupted_transaction(
+        &transaction,
+        workspace_id,
+        goal_id,
+        phase_id,
+        run_id,
+        claim_token,
+        &run.state,
+        &goal.status,
+        "workspace_path_drift",
+    )
+    .map_err(sqlite_api_error)?;
+    transaction.commit().map_err(sqlite_api_error)?;
+    broadcast_runtime_run_event(events.runtime);
+    broadcast_goal_event(events.goal);
+    Ok(())
+}
+
+/// token-aware 失败回退 helper。retry 与 blocked 都清空五列 claim，并且 phase/Goal
+/// route、verdict、evidence、Goal event 仍属于外层结果事务。
+fn apply_phase_fail_retry_token_connection(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    goal_id: &str,
+    phase_id: &str,
+    run_id: &str,
+    claim_token: &str,
+    reason: &str,
+    evidence: &JsonValue,
+    retry_status: &str,
+    pause_goal_on_retry: bool,
+    route_hint: &str,
+) -> rusqlite::Result<PhaseRetryOutcome> {
+    if !matches!(retry_status, "running" | "pending") {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "retry_status".to_string(),
+        ));
+    }
+    let (retry_count, max_retries, phase_status, active_run_id, stored_token, goal_status): (
+        i64,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = transaction.query_row(
+        r#"
+        SELECT p.retry_count, p.max_retries, p.status, p.active_run_id, p.claim_token, g.status
+        FROM goal_phases p JOIN goals g ON g.id = p.goal_id
+        WHERE p.goal_id = ?1 AND p.id = ?2 AND g.workspace_id = ?3
+        "#,
+        params![goal_id, phase_id, workspace_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    if phase_status != "running"
+        || active_run_id.as_deref() != Some(run_id)
+        || stored_token.as_deref() != Some(claim_token)
+        || matches!(goal_status.as_str(), "cancelled" | "completed")
+    {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let new_retry = retry_count.saturating_add(1);
+    let blocked = new_retry > max_retries;
+    let next_status = if blocked { "blocked" } else { retry_status };
+    let next_route = if blocked { "manual_reconcile" } else { route_hint };
+    let now = unix_timestamp_millis();
+    let changed = transaction.execute(
+        r#"
+        UPDATE goal_phases
+           SET retry_count = ?1, last_verdict = 'fail', last_reason = ?2,
+               last_evidence_json = ?3, status = ?4, route_hint = ?5,
+               active_run_id = NULL, claim_token = NULL, claim_owner = NULL,
+               claimed_at = NULL, lease_until = NULL, updated_at = ?6
+         WHERE goal_id = ?7 AND id = ?8 AND status = 'running'
+           AND active_run_id = ?9 AND claim_token = ?10
+        "#,
+        params![
+            new_retry,
+            reason,
+            evidence.to_string(),
+            next_status,
+            next_route,
+            u64_to_i64(now),
+            goal_id,
+            phase_id,
+            run_id,
+            claim_token,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    if blocked || pause_goal_on_retry {
+        if !matches!(goal_status.as_str(), "paused" | "cancelled" | "completed") {
+            let goal_changed = transaction.execute(
+                r#"
+                UPDATE goals SET status = 'paused', updated_at = ?1
+                 WHERE workspace_id = ?2 AND id = ?3
+                   AND status NOT IN ('completed','cancelled','paused')
+                "#,
+                params![u64_to_i64(now), workspace_id, goal_id],
+            )?;
+            if goal_changed != 1 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+        }
+    }
+    let (event_type, message) = if blocked {
+        (
+            "goal-phase-blocked",
+            format!(
+                "Phase {phase_id} blocked after {new_retry} attempt(s) exceeded max_retries={max_retries}; goal paused for human intervention."
+            ),
+        )
+    } else {
+        (
+            "goal-phase-retry",
+            format!(
+                "Phase {phase_id} verdict fail; retry {new_retry}/{max_retries}, routed back to the assigned role to fix."
+            ),
+        )
+    };
+    let event = insert_goal_event_connection_deferred(
+        transaction,
+        goal_id,
+        event_type,
+        &message,
+        json!({
+            "caller": "goal-finalizer",
+            "phase_id": phase_id,
+            "retry_count": new_retry,
+            "max_retries": max_retries,
+            "reason": reason,
+            "route_hint": next_route,
+        }),
+    )?;
+    Ok(PhaseRetryOutcome {
+        retry_count: new_retry as u32,
+        max_retries: max_retries.max(0) as u32,
+        blocked,
+        event,
+    })
+}
+
+/// 在自动结果事务中把自有的 running runtime 收敛到 terminal 状态，并把 runtime
+/// 事件延迟到 commit 后由调用方广播。scope/token/state 全部参与 CAS；命中行数不是
+/// 1 时调用方必须让外层事务回滚，避免迟到结果污染新的 run。
+fn finalize_goal_phase_runtime_terminal_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    goal_id: &str,
+    phase_id: &str,
+    run_id: &str,
+    claim_token: &str,
+    terminal_state: &str,
+    reason: Option<&str>,
+) -> rusqlite::Result<RuntimeRunEventDto> {
+    let event_type = runtime_terminal_event_type(terminal_state)
+        .ok_or_else(|| rusqlite::Error::InvalidParameterName(terminal_state.to_string()))?;
+    let now = unix_timestamp_millis();
+    let error_json = reason.map(|value| json!({ "reason": value }).to_string());
+    let changed = transaction.execute(
+        r#"
+        UPDATE runtime_runs
+           SET state = ?1, error_json = COALESCE(?2, error_json), finished_at = ?3
+         WHERE id = ?4 AND kind = 'goal_phase'
+           AND workspace_id = ?5 AND goal_id = ?6 AND phase_id = ?7
+           AND claim_token = ?8 AND state = 'running'
+        "#,
+        params![
+            terminal_state,
+            error_json,
+            u64_to_i64(now),
+            run_id,
+            workspace_id,
+            goal_id,
+            phase_id,
+            claim_token,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let mut payload = json!({
+        "kind": "goal_phase",
+        "workspace_id": workspace_id,
+        "goal_id": goal_id,
+        "phase_id": phase_id,
+        "state": terminal_state,
+    });
+    if let Some(reason) = reason {
+        payload["reason"] = JsonValue::String(reason.to_string());
+    }
+    append_runtime_run_event_deferred(transaction, run_id, event_type, payload)
+}
+
+/// 自动 Goal 结果的 token-aware Immediate finalizer。所有消息、verdict/evidence、phase
+/// route/claim、runtime terminal 与 Goal event 都在一笔事务里；commit 后才广播。
+fn finalize_goal_phase_result_sqlite(
+    path: &Path,
+    workspace_id: &str,
+    goal_id: &str,
+    phase_id: &str,
+    run_id: &str,
+    claim_token: &str,
+    agent: &AgentSessionDto,
+    response: AgentModelResponse,
+    tool_messages: Vec<ChatMessageDto>,
+    command_failures: Vec<String>,
+) -> ApiResult<GoalPhaseFinalizedResult> {
+    if !path.exists() {
+        return Err(stale_goal_phase_result_error());
+    }
+    let mut connection = open_session_connection(path).map_err(sqlite_api_error)?;
+    initialize_session_schema(&connection).map_err(sqlite_api_error)?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sqlite_api_error)?;
+    let Some(run) = query_runtime_run_connection(&transaction, run_id).map_err(sqlite_api_error)?
+    else {
+        return Err(stale_goal_phase_result_error());
+    };
+    if run.kind != "goal_phase"
+        || run.workspace_id != workspace_id
+        || run.goal_id.as_deref() != Some(goal_id)
+        || run.phase_id.as_deref() != Some(phase_id)
+        || run.claim_token != claim_token
+        || run.session_id.as_deref() != Some(agent.id.as_str())
+        || run.chat_room_id.is_none()
+        || !matches!(run.state.as_str(), "running" | "stop_requested")
+    {
+        return Err(stale_goal_phase_result_error());
+    }
+    let goal = query_goal_for_finalizer(&transaction, workspace_id, goal_id)
+        .map_err(|_| stale_goal_phase_result_error())?;
+    if run.chat_room_id.as_deref() != Some(goal.chat_room_id.as_str()) {
+        return Err(stale_goal_phase_result_error());
+    }
+    let phase = query_goal_phases_connection(&transaction, goal_id)
+        .map_err(sqlite_api_error)?
+        .into_iter()
+        .find(|phase| phase.id == phase_id)
+        .ok_or_else(stale_goal_phase_result_error)?;
+    let (phase_status, active_run_id, stored_claim_token): (String, Option<String>, Option<String>) =
+        transaction
+            .query_row(
+                "SELECT status, active_run_id, claim_token FROM goal_phases WHERE goal_id = ?1 AND id = ?2",
+                params![goal_id, phase_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(sqlite_api_error)?;
+    if phase_status != "running"
+        || phase.active_run_id.as_deref() != Some(run_id)
+        || active_run_id.as_deref() != Some(run_id)
+        || stored_claim_token.as_deref() != Some(claim_token)
+        || phase.assigned_session_id.as_deref() != Some(agent.id.as_str())
+    {
+        // `GoalPhaseDto` intentionally does not expose claim_token; the direct SQL check
+        // keeps internal claim identity out of the DTO and makes stale exits indistinguishable.
+        return Err(stale_goal_phase_result_error());
+    }
+
+    let room_id = run
+        .chat_room_id
+        .clone()
+        .ok_or_else(stale_goal_phase_result_error)?;
+    let session_id = run
+        .session_id
+        .clone()
+        .ok_or_else(stale_goal_phase_result_error)?;
+
+    if run.state != "stop_requested" && matches!(goal.status.as_str(), "cancelled" | "completed")
+    {
+        return Err(stale_goal_phase_result_error());
+    }
+
+    // stop_requested 与模型返回之间以同一 Immediate 事务裁决；一旦 stop 先赢，
+    // 迟到结果只能收敛为 interrupted，绝不能落结果消息/verdict/记忆。
+    if run.state == "stop_requested" {
+        let events = finalize_goal_phase_interrupted_transaction(
+            &transaction,
+            workspace_id,
+            goal_id,
+            phase_id,
+            run_id,
+            claim_token,
+            "stop_requested",
+            &goal.status,
+            run.stop_reason.as_deref().unwrap_or("stop_requested"),
+        )
+        .map_err(sqlite_api_error)?;
+        let status_goal = query_goal_for_finalizer(&transaction, workspace_id, goal_id)?;
+        let status = goal_status_response_from_goal(status_goal);
+        transaction.commit().map_err(sqlite_api_error)?;
+        broadcast_runtime_run_event(events.runtime);
+        broadcast_goal_event(events.goal);
+        return Ok(GoalPhaseFinalizedResult {
+            assigned_session_id: session_id,
+            chat_room_id: room_id,
+            messages: Vec::new(),
+            status,
+            memory_eligible: false,
+        });
+    }
+
+    // 这是所有正常结果的第一条写操作；它同时 CAS phase active pointer 与 runtime
+    // scope/token/state。任何不匹配都会让外层事务 rollback，且下面没有任何副作用。
+    goal_phase_result_ownership_cas(
+        &transaction,
+        workspace_id,
+        goal_id,
+        phase_id,
+        run_id,
+        claim_token,
+        &session_id,
+        &room_id,
+    )
+    .map_err(|_| stale_goal_phase_result_error())?;
+
+    let evidence = goal_phase_result_evidence(&response.answer_text, &tool_messages);
+    let base_messages = build_goal_phase_result_messages(phase_id, agent, &response, tool_messages);
+    let missing_artifacts = goal_phase_missing_files(&phase);
+    let blocked_reason = goal_phase_implementer_blocked_reason(&response.answer_text);
+
+    // pass：消息、pass verdict/evidence、phase 完成及 claim 清理、Goal 完成判定、
+    // runtime terminal 和事件全部共用这笔事务。
+    if blocked_reason.is_none() && missing_artifacts.is_empty() && command_failures.is_empty() {
+        let evidence_json = json!({ "text": evidence });
+        insert_goal_phase_messages_transaction(&transaction, &session_id, &room_id, &base_messages)
+            .map_err(sqlite_api_error)?;
+        let now = unix_timestamp_millis();
+        let phase_changed = transaction
+            .execute(
+                r#"
+                UPDATE goal_phases
+                   SET status = 'completed', last_verdict = 'pass', last_reason = NULL,
+                       last_evidence_json = ?1,
+                       active_run_id = NULL, claim_token = NULL, claim_owner = NULL,
+                       claimed_at = NULL, lease_until = NULL, updated_at = ?2
+                 WHERE goal_id = ?3 AND id = ?4 AND status = 'running'
+                   AND active_run_id = ?5 AND claim_token = ?6
+                "#,
+                params![
+                    evidence_json.to_string(),
+                    u64_to_i64(now),
+                    goal_id,
+                    phase_id,
+                    run_id,
+                    claim_token,
+                ],
+            )
+            .map_err(sqlite_api_error)?;
+        if phase_changed != 1 {
+            return Err(stale_goal_phase_result_error());
+        }
+        // 与手工 complete 相同的完成判定，但不调用会 save()/广播的旧入口。
+        cleanup_goal_task_skill_memory_if_finished_connection(
+            &transaction,
+            workspace_id,
+            goal_id,
+            now,
+        )
+        .map_err(sqlite_api_error)?;
+        let runtime_event = finalize_goal_phase_runtime_terminal_transaction(
+            &transaction,
+            workspace_id,
+            goal_id,
+            phase_id,
+            run_id,
+            claim_token,
+            "completed",
+            None,
+        )
+        .map_err(|_| stale_goal_phase_result_error())?;
+        let verdict_event = insert_goal_event_connection_deferred(
+            &transaction,
+            goal_id,
+            "goal-phase-verdict",
+            &format!("Phase {phase_id} verdict: pass."),
+            json!({
+                "caller": "goal-loop",
+                "phase_id": phase_id,
+                "run_id": run_id,
+                "verdict": "pass",
+                "assigned_role": phase.assigned_role.clone(),
+                "evidence": evidence.clone(),
+            }),
+        )
+        .map_err(sqlite_api_error)?;
+        let phase_event = insert_goal_event_connection_deferred(
+            &transaction,
+            goal_id,
+            "phase-completed",
+            &format!("Phase {phase_id} completed with evidence."),
+            json!({
+                "caller": "goal-loop",
+                "phase_id": phase_id,
+                "run_id": run_id,
+                "assigned_role": phase.assigned_role.clone(),
+                "assigned_session_id": session_id.clone(),
+                "evidence": evidence.clone(),
+            }),
+        )
+        .map_err(sqlite_api_error)?;
+        let status_goal = query_goal_for_finalizer(&transaction, workspace_id, goal_id)?;
+        let status = goal_status_response_from_goal(status_goal);
+        transaction.commit().map_err(sqlite_api_error)?;
+        broadcast_runtime_run_event(runtime_event);
+        broadcast_goal_event(verdict_event);
+        broadcast_goal_event(phase_event);
+        return Ok(GoalPhaseFinalizedResult {
+            assigned_session_id: session_id,
+            chat_room_id: room_id,
+            messages: base_messages,
+            status,
+            memory_eligible: true,
+        });
+    }
+
+    // fail/retry：missing artifact、command gate、implementer blocked 均在同一事务内
+    // 写消息、verdict/evidence/route、清理 claim、runtime failed 与 Goal 事件。
+    let (
+        reason,
+        evidence_json,
+        retry_status,
+        pause_goal_on_retry,
+        route_hint,
+        specific_event_type,
+        specific_note,
+        summary,
+    ) = if let Some(blocked_reason) = blocked_reason {
+        let attempt = phase.retry_count.saturating_add(1);
+        let will_block = attempt > phase.max_retries;
+        let reason = format!("implementer blocked: {blocked_reason}");
+        let evidence_json = json!({
+            "blocked_reason": blocked_reason.clone(),
+            "text": evidence.clone()
+        });
+        let summary = if will_block {
+            format!(
+                "Goal escalation: phase {phase_id} blocked after {attempt}/{} cumulative failures. Commander/human intervention required before further dispatch.",
+                phase.max_retries
+            )
+        } else {
+            format!(
+                "Goal phase reported blocked by implementer (cumulative failures {attempt}/{}): {blocked_reason}. Routed back to planner to revise the plan; goal paused.",
+                phase.max_retries
+            )
+        };
+        (
+            reason,
+            evidence_json,
+            "pending",
+            true,
+            "planner",
+            "goal-phase-blocked-needs-replan",
+            format!("Goal phase reported blocked by implementer: {blocked_reason}."),
+            summary,
+        )
+    } else if !missing_artifacts.is_empty() {
+        let attempt = phase.retry_count.saturating_add(1);
+        let will_block = attempt > phase.max_retries;
+        let missing = missing_artifacts.join(", ");
+        let reason = format!("required file artifact(s) missing or invalid: {missing}");
+        let evidence_json = json!({
+            "missing_artifacts": missing_artifacts,
+            "text": evidence.clone()
+        });
+        let summary = if will_block {
+            format!(
+                "Goal phase blocked: required file artifact(s) still missing or invalid after {attempt}/{} attempts: {missing}. The goal loop is paused; rerun after the assigned role creates valid exact file(s) or the plan is adjusted.",
+                phase.max_retries
+            )
+        } else {
+            format!(
+                "Goal verifier rejected the phase (retry {attempt}/{}): required file artifact(s) missing or invalid: {missing}. The phase stays running for the implementer to revise.",
+                phase.max_retries
+            )
+        };
+        (
+            reason,
+            evidence_json,
+            "running",
+            false,
+            "implementer",
+            "goal-phase-verification-blocked",
+            format!("Goal verifier rejected the phase: required file artifact(s) missing or invalid: {missing}. Feedback routed back to implementer to revise."),
+            summary,
+        )
+    } else {
+        let attempt = phase.retry_count.saturating_add(1);
+        let will_block = attempt > phase.max_retries;
+        let failures = command_failures.join("\n---\n");
+        let reason = "command gate failed".to_string();
+        let evidence_json = json!({
+            "command_failures": command_failures,
+            "text": evidence.clone()
+        });
+        let summary = if will_block {
+            format!(
+                "Goal phase blocked: command gate still failing after {attempt}/{} attempts. The goal loop is paused; rerun after the implementer fixes the build/test failures or the plan is adjusted.",
+                phase.max_retries
+            )
+        } else {
+            format!(
+                "Goal verifier rejected the phase (retry {attempt}/{}): command gate failed. The phase stays running for the implementer to fix.",
+                phase.max_retries
+            )
+        };
+        (
+            reason,
+            evidence_json,
+            "running",
+            false,
+            "implementer",
+            "goal-phase-command-gate-failed",
+            format!("Goal verifier rejected the phase: command gate failed:\n{failures}\nFeedback routed back to implementer to fix."),
+            summary,
+        )
+    };
+    let mut messages = base_messages;
+    messages.push(ChatMessageDto {
+        id: format!("msg-goal-{}-{}-failure", unix_timestamp_millis(), phase_id),
+        author: if specific_event_type == "goal-phase-blocked-needs-replan" {
+            "Goal feedback"
+        } else {
+            "Goal verification"
+        }
+        .to_string(),
+        role: "assistant".to_string(),
+        target: "Goal phase".to_string(),
+        content: summary,
+        kind: "task-summary".to_string(),
+        attachments: Vec::new(),
+    });
+    insert_goal_phase_messages_transaction(&transaction, &session_id, &room_id, &messages)
+        .map_err(sqlite_api_error)?;
+    let mut specific_payload = json!({
+        "caller": "goal-finalizer",
+        "phase_id": phase_id,
+        "run_id": run_id,
+        "assigned_role": phase.assigned_role,
+        "assigned_session_id": session_id,
+        "evidence": evidence.clone(),
+    });
+    if let Some(value) = evidence_json.get("blocked_reason") {
+        specific_payload["blocked_reason"] = value.clone();
+    }
+    if let Some(value) = evidence_json.get("missing_artifacts") {
+        specific_payload["missing_artifacts"] = value.clone();
+    }
+    if let Some(value) = evidence_json.get("command_failures") {
+        specific_payload["failures"] = value.clone();
+    }
+    let specific_event = insert_goal_event_connection_deferred(
+        &transaction,
+        goal_id,
+        specific_event_type,
+        &specific_note,
+        specific_payload,
+    )
+    .map_err(sqlite_api_error)?;
+    let outcome = apply_phase_fail_retry_token_connection(
+        &transaction,
+        workspace_id,
+        goal_id,
+        phase_id,
+        run_id,
+        claim_token,
+        &reason,
+        &evidence_json,
+        retry_status,
+        pause_goal_on_retry,
+        route_hint,
+    )
+    .map_err(|_| stale_goal_phase_result_error())?;
+    let runtime_event = finalize_goal_phase_runtime_terminal_transaction(
+        &transaction,
+        workspace_id,
+        goal_id,
+        phase_id,
+        run_id,
+        claim_token,
+        "failed",
+        Some(reason.as_str()),
+    )
+    .map_err(|_| stale_goal_phase_result_error())?;
+    let status_goal = query_goal_for_finalizer(&transaction, workspace_id, goal_id)?;
+    let status = goal_status_response_from_goal(status_goal);
+    transaction.commit().map_err(sqlite_api_error)?;
+    broadcast_runtime_run_event(runtime_event);
+    broadcast_goal_event(specific_event);
+    broadcast_goal_event(outcome.event);
+    Ok(GoalPhaseFinalizedResult {
+        assigned_session_id: session_id,
+        chat_room_id: room_id,
+        messages,
+        status,
+        memory_eligible: false,
+    })
 }
 
 fn goal_phase_missing_files(phase: &GoalPhaseDto) -> Vec<String> {
@@ -39313,6 +45279,23 @@ fn set_goal_plan_sqlite(
     let tx = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(sqlite_api_error)?;
+    // re-plan 会 DELETE + 重建 phases，不能覆盖正在执行的 durable claim。把检查放在
+    // 同一个 Immediate 事务里，确保检查通过后到 DELETE 之间不会插入新的 claim。
+    let active_claim: Option<String> = tx
+        .query_row(
+            "SELECT active_run_id FROM goal_phases \
+             WHERE goal_id = ?1 AND active_run_id IS NOT NULL LIMIT 1",
+            params![goal_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_api_error)?;
+    if active_claim.is_some() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "cannot re-plan a goal with an active phase claim",
+        ));
+    }
     // DELETE 之前先抓旧 phase 的回退路由状态，重建时对号保留，
     // 否则每次 re-plan 都会把 retry_count/verdict 清零。
     let preserved_routing =
@@ -40558,6 +46541,117 @@ fn persist_attachment_refs(
     Ok(())
 }
 
+/// 在已有 Immediate 事务中追加聊天消息。这个 helper 刻意不做 `save()`、不改内存，
+/// 也不自动创建 parent；parent 缺失会让整个外层结果事务回滚，避免 room/session 只有一份。
+fn insert_goal_phase_messages_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    room_id: &str,
+    messages: &[ChatMessageDto],
+) -> rusqlite::Result<()> {
+    let session_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+        params![session_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    let room_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM chat_rooms WHERE id = ?1)",
+        params![room_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !session_exists || !room_exists {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    let mut session_stmt = transaction.prepare(
+        r#"
+        INSERT INTO session_messages(
+            session_id, id, author, role, target, content, kind, attachments_json, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )?;
+    let mut room_stmt = transaction.prepare(
+        r#"
+        INSERT INTO chat_room_messages(
+            room_id, id, author, role, target, content, kind, attachments_json, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )?;
+    let mut session_attachment_stmt = transaction.prepare(
+        r#"
+        INSERT OR REPLACE INTO attachment_refs(
+            id, message_id, message_tbl, file_name, byte_size, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )?;
+    let mut room_attachment_stmt = transaction.prepare(
+        r#"
+        INSERT OR REPLACE INTO attachment_refs(
+            id, message_id, message_tbl, file_name, byte_size, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )?;
+    for message in messages {
+        let created_at = unix_timestamp_millis();
+        let attachments = serde_json::to_string(&message.attachments).map_err(|error| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+        })?;
+        session_stmt.execute(rusqlite::params![
+            session_id,
+            &message.id,
+            &message.author,
+            &message.role,
+            &message.target,
+            &message.content,
+            &message.kind,
+            &attachments,
+            u64_to_i64(created_at),
+        ])?;
+        room_stmt.execute(rusqlite::params![
+            room_id,
+            &message.id,
+            &message.author,
+            &message.role,
+            &message.target,
+            &message.content,
+            &message.kind,
+            &attachments,
+            u64_to_i64(created_at),
+        ])?;
+        persist_attachment_refs(
+            &mut session_attachment_stmt,
+            "session_messages",
+            &message.id,
+            &message.attachments,
+            created_at,
+        )?;
+        persist_attachment_refs(
+            &mut room_attachment_stmt,
+            "chat_room_messages",
+            &message.id,
+            &message.attachments,
+            created_at,
+        )?;
+    }
+    let now = u64_to_i64(unix_timestamp_millis());
+    if transaction.execute(
+        "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+        params![now, session_id],
+    )? != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    if transaction.execute(
+        "UPDATE chat_rooms SET updated_at = ?1 WHERE id = ?2",
+        params![now, room_id],
+    )? != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    Ok(())
+}
+
 fn attachment_file_names_for_message_ids(
     conn: &rusqlite::Connection,
     message_tbl: &str,
@@ -40714,6 +46808,12 @@ fn purge_deleted_session_auxiliary_sqlite(path: &Path, session_id: &str) -> ApiR
     connection
         .execute(
             "DELETE FROM goal_role_configs WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(sqlite_api_error)?;
+    connection
+        .execute(
+            "DELETE FROM memory_jobs WHERE session_id = ?1",
             params![session_id],
         )
         .map_err(sqlite_api_error)?;
@@ -41040,6 +47140,8 @@ fn save_session_state_to_sqlite(
         "memory_access",
         "memory_meta",
         "memory_edges",
+        "memory_settings",
+        "memory_jobs",
     ] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE session_id NOT IN (SELECT id FROM sessions)"),
@@ -41275,7 +47377,8 @@ fn seed_session() -> PersistedSession {
     let now = unix_timestamp_millis();
     PersistedSession {
         id: "mario-demo".to_string(),
-        name: "mario-demo".to_string(),
+        // 保留内部 ID 以兼容已有配置与测试，仅把新安装的可见名称改为正式主 Agent。
+        name: "主 Agent".to_string(),
         provider: "智谱 AI".to_string(),
         model: config_reasoning_model()
             .filter(|value| !value.trim().is_empty())
@@ -41290,28 +47393,7 @@ fn seed_session() -> PersistedSession {
         created_at: now,
         updated_at: now,
         context_reset_at: 0,
-        messages: vec![
-            PersistedChatMessage {
-                id: "seed-user-1".to_string(),
-                author: "".to_string(),
-                role: "user".to_string(),
-                target: "mario-demo".to_string(),
-                content: "帮我分析一下当前工程的模块结构，并列出核心模块的职责".to_string(),
-                kind: "text".to_string(),
-                attachments: Vec::new(),
-                created_at: now.saturating_sub(2_000),
-            },
-            PersistedChatMessage {
-                id: "seed-bot-1".to_string(),
-                author: "COOLZHU AGENT".to_string(),
-                role: "assistant".to_string(),
-                target: "聊天".to_string(),
-                content: "已接入会话聊天室与模型配置入口，后续每个会话都会独立维护模型、API Key 引用和记忆".to_string(),
-                kind: "task-summary".to_string(),
-                attachments: Vec::new(),
-                created_at: now.saturating_sub(1_000),
-            },
-        ],
+        messages: Vec::new(),
     }
 }
 
@@ -41327,28 +47409,7 @@ fn seed_chat_room() -> PersistedChatRoom {
         name: "主聊天室".to_string(),
         created_at: now,
         updated_at: now,
-        messages: vec![
-            PersistedChatMessage {
-                id: "room-seed-user-1".to_string(),
-                author: "".to_string(),
-                role: "user".to_string(),
-                target: "mario-demo".to_string(),
-                content: "帮我分析一下当前工程的模块结构，并列出核心模块的职责".to_string(),
-                kind: "text".to_string(),
-                attachments: Vec::new(),
-                created_at: now.saturating_sub(2_000),
-            },
-            PersistedChatMessage {
-                id: "room-seed-bot-1".to_string(),
-                author: "COOLZHU AGENT".to_string(),
-                role: "assistant".to_string(),
-                target: "聊天".to_string(),
-                content: "主聊天室会保留多个会话 Agent 的回复流；切换左侧 Agent 只切换配置、记忆和目标上下文".to_string(),
-                kind: "task-summary".to_string(),
-                attachments: Vec::new(),
-                created_at: now.saturating_sub(1_000),
-            },
-        ],
+        messages: Vec::new(),
     }
 }
 
@@ -41551,7 +47612,72 @@ fn custom_provider_urls(
 }
 
 fn default_reasoning_effort() -> String {
-    "medium".to_string()
+    "auto".to_string()
+}
+
+fn validate_reasoning_effort(value: Option<&str>) -> ApiResult<()> {
+    api::parse_reasoning_effort(value)
+        .map(|_| ())
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "reasoning_effort 非法值 {:?}，允许值：auto、none、minimal、low、medium、high、xhigh、max",
+                    error.raw
+                ),
+            )
+        })
+}
+
+/// 供 reasoning resolver 使用的最小 provider 迁移映射。
+/// 持久层仍保留原始 provider 字符串；只有解析边界 canonicalize。
+fn canonical_provider_id_for_reasoning(provider: &str) -> String {
+    let normalized = provider
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '_', '-', '(', ')', '.'], "");
+    match normalized.as_str() {
+        "deepseek" | "深度求索" => "deepseek".to_string(),
+        "zhipuai" | "zhipu" | "zai" | "bigmodel" | "zhupuai" | "智谱ai" | "智谱" => {
+            "zhipuai".to_string()
+        }
+        "openai" => "openai".to_string(),
+        "anthropic" | "clawapi" | "claw" => "clawapi".to_string(),
+        "xai" | "grok" => "xai".to_string(),
+        "alibababailian" | "alibaba" | "aliyun" | "bailian" | "dashscope" => {
+            "alibaba-bailian".to_string()
+        }
+        "bytedance" | "bytedanceark" | "ark" | "volcengine" | "doubao" => {
+            "bytedance".to_string()
+        }
+        "baidu" | "baiduqianfan" | "qianfan" | "wenxin" => "baidu".to_string(),
+        "custom" | "customopenai" | "customopenaicompatible" | "ollama" | "本地" => {
+            "custom".to_string()
+        }
+        _ => api::provider_kind_from_name(provider)
+            .map(|kind| match kind {
+                api::ProviderKind::ClawApi | api::ProviderKind::Anthropic => "clawapi",
+                api::ProviderKind::OpenAi => "openai",
+                api::ProviderKind::Xai => "xai",
+                api::ProviderKind::ZhipuAi => "zhipuai",
+                api::ProviderKind::AlibabaBailian => "alibaba-bailian",
+                api::ProviderKind::BaiduQianfan => "baidu",
+                api::ProviderKind::ByteDanceArk => "bytedance",
+                api::ProviderKind::DeepSeek => "deepseek",
+                api::ProviderKind::Custom => "custom",
+            })
+            .map(str::to_string)
+            .unwrap_or_else(|| provider.trim().to_string()),
+    }
+}
+
+fn reasoning_resolution_for_session(
+    provider: &str,
+    model: &str,
+    raw_reasoning_effort: Option<&str>,
+) -> api::ReasoningResolution {
+    let provider_id = canonical_provider_id_for_reasoning(provider);
+    api::resolve_legacy_reasoning(&provider_id, model, raw_reasoning_effort)
 }
 
 fn default_model_type() -> String {
@@ -41598,22 +47724,6 @@ fn resolve_model_type(model: &str) -> String {
         return "embedding".to_string();
     }
     "text".to_string()
-}
-
-fn normalize_reasoning_effort(value: Option<&str>) -> String {
-    match value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("medium")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "low" => "low".to_string(),
-        "high" => "high".to_string(),
-        "xhigh" | "extra_high" | "extra-high" | "超高" => "xhigh".to_string(),
-        "max" | "maximum" | "最" => "max".to_string(),
-        _ => "medium".to_string(),
-    }
 }
 
 fn vision_session_config() -> VisionSessionConfig {
@@ -42294,7 +48404,7 @@ struct AgentRegistryResponse {
     memory: MemoryPolicy,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct AgentSessionDto {
     id: String,
     name: String,
@@ -42312,6 +48422,39 @@ struct AgentSessionDto {
     system: bool,
     default_timeout_ms: u64,
     memory_beads: Vec<MemoryBeadDto>,
+}
+
+impl Serialize for AgentSessionDto {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let resolution = reasoning_resolution_for_session(
+            &self.provider,
+            &self.model,
+            Some(&self.reasoning_effort),
+        );
+        let resolution_dto = ReasoningResolutionDto::from(&resolution);
+        let mut state = serializer.serialize_struct("AgentSessionDto", 17)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("display_name", &self.display_name)?;
+        state.serialize_field("avatar", &self.avatar)?;
+        state.serialize_field("model", &self.model)?;
+        state.serialize_field("model_type", &self.model_type)?;
+        state.serialize_field("provider", &self.provider)?;
+        state.serialize_field("base_url", &self.base_url)?;
+        state.serialize_field("endpoint", &self.endpoint)?;
+        state.serialize_field("reasoning_effort", &resolution.requested.as_str())?;
+        state.serialize_field("reasoning_resolution", &resolution_dto)?;
+        state.serialize_field("api_key_status", &self.api_key_status)?;
+        state.serialize_field("selectable", &self.selectable)?;
+        state.serialize_field("enabled", &self.enabled)?;
+        state.serialize_field("system", &self.system)?;
+        state.serialize_field("default_timeout_ms", &self.default_timeout_ms)?;
+        state.serialize_field("memory_beads", &self.memory_beads)?;
+        state.end()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -42390,6 +48533,7 @@ fn memory_bead_kind_weight(kind: &str) -> f64 {
         "decision" => 1.0,
         "tool" => 0.95,
         "result" | "task" => 0.9,
+        "compaction" => 0.86,
         "fact" => 0.75,
         "reasoning" => 0.6,
         "chat" => 0.3,
@@ -42586,8 +48730,21 @@ impl PersistedSession {
             model_type: self.model_type.clone(),
             base_url: self.base_url.clone(),
             endpoint: self.endpoint.clone(),
-            reasoning_effort: normalize_reasoning_effort(Some(&self.reasoning_effort)),
+            reasoning_effort: reasoning_resolution_for_session(
+                &self.provider,
+                &self.model,
+                Some(&self.reasoning_effort),
+            )
+            .requested
+            .as_str()
+            .to_string(),
+            reasoning_resolution: ReasoningResolutionDto::from(&reasoning_resolution_for_session(
+                &self.provider,
+                &self.model,
+                Some(&self.reasoning_effort),
+            )),
             api_key_status: api_key_configuration_status(&self.api_key_ref),
+            memory_mode: memory_mode_for_session(&self.id),
             active,
             updated_at: self.updated_at,
         }
@@ -42610,7 +48767,9 @@ impl PersistedSession {
             provider: self.provider.clone(),
             base_url: self.base_url.clone(),
             endpoint: self.endpoint.clone(),
-            reasoning_effort: normalize_reasoning_effort(Some(&self.reasoning_effort)),
+            // Agent registry 需要保留持久层 raw 值，序列化时再由 legacy resolver
+            // 给出 canonical requested 与 legacy_fallback 证据。
+            reasoning_effort: self.reasoning_effort.clone(),
             api_key_status: api_key_configuration_status(&self.api_key_ref),
             selectable: true,
             enabled: true,
@@ -42793,7 +48952,9 @@ struct SessionSummaryDto {
     base_url: Option<String>,
     endpoint: Option<String>,
     reasoning_effort: String,
+    reasoning_resolution: ReasoningResolutionDto,
     api_key_status: String,
+    memory_mode: String,
     active: bool,
     updated_at: u64,
 }
@@ -42824,6 +48985,14 @@ struct VisionAgentConfigResponse {
 #[derive(Debug, Deserialize)]
 struct MessageQuery {
     limit: Option<usize>,
+    before: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SessionHistoryQuery {
+    /// 每页返回的 turn 数；item 会随所属 turn 一起返回。
+    limit: Option<usize>,
+    /// 上一页返回的 turn id（也兼容该 turn 的首条 item id）。
     before: Option<String>,
 }
 
@@ -42904,6 +49073,8 @@ struct GoalPhaseDto {
     assigned_session_display_name: Option<String>,
     assigned_session_available: bool,
     status: String,
+    /// 当前 phase 的公开 durable run 关联；claim token/owner/lease 永不出现在 DTO。
+    active_run_id: Option<String>,
     depends_on: Vec<String>,
     skills_required: Vec<String>,
     output_artifacts: Vec<String>,
@@ -43049,6 +49220,10 @@ struct GoalPhaseRunResponse {
     messages: Vec<ChatMessageDto>,
     status: GoalStatusResponse,
     generated_at: u64,
+    /// 自动 finalizer 只在同一事务成功完成 phase 时允许沉淀 memory。
+    /// 这是内部标记，不能成为公开 API 字段。
+    #[serde(skip)]
+    memory_eligible: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43116,8 +49291,14 @@ struct GoalPhaseRunContext {
     agent: AgentSessionDto,
     prompt: String,
     chat_room_id: String,
+    goal_id: String,
+    phase_id: String,
     context_history: Vec<PersistedChatMessage>,
     collaboration_roster: Option<ChatRosterResponse>,
+    // 执行 claim 仅供内部生命周期使用；不派生 serde，也不进入任何对外 DTO/日志。
+    run_id: String,
+    claim_token: String,
+    db_path: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43214,11 +49395,546 @@ struct SessionMutationResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct SessionResumeResponse {
+    session: SessionSummaryDto,
+    resumed: bool,
+    history: SessionHistoryResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionForkRequest {
+    /// 可选：history 返回的 turn id 或 item id；省略时复制完整会话。
+    before: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionForkResponse {
+    source_session_id: String,
+    source_cursor: Option<String>,
+    session: SessionSummaryDto,
+    copied_messages: usize,
+    copied_memory_beads: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionRollbackRequest {
+    /// history 返回的 turn id 或 item id；回滚保留该目标及其之前的消息。
+    before: String,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionRollbackResponse {
+    session: SessionSummaryDto,
+    target: String,
+    kept_messages: usize,
+    removed_messages: usize,
+    removed_memory_beads: usize,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct SessionMessagesResponse {
     session: SessionSummaryDto,
     messages: Vec<PersistedChatMessage>,
     has_more: bool,
     next_before: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionHistoryItemDto {
+    id: String,
+    turn_id: String,
+    /// `user_message`、`assistant_message`、`tool_result`、`system` 或 `compaction`。
+    kind: String,
+    role: String,
+    author: String,
+    target: String,
+    content: String,
+    source: String,
+    created_at: u64,
+    attachments: Vec<ChatAttachmentDto>,
+    message_count: Option<usize>,
+    token_count: Option<u32>,
+    /// 由 Context usage 尾部回填的上下文快照；旧消息没有该字段时保持空值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_snapshot_id: Option<String>,
+    /// 真实运行时回合 ID；与 history item 自身派生的 turn_id 分开。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_turn_id: Option<String>,
+    /// ToolCall/ToolResult 的可重放元数据；普通消息和 compaction 不填充。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_route: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionHistoryTurnDto {
+    id: String,
+    session_id: String,
+    status: String,
+    started_at: u64,
+    completed_at: Option<u64>,
+    item_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionHistoryResponse {
+    session: SessionSummaryDto,
+    turns: Vec<SessionHistoryTurnDto>,
+    items: Vec<SessionHistoryItemDto>,
+    has_more: bool,
+    next_before: Option<String>,
+}
+
+/// P1-3：可供 CLI/headless 回放的统一事件 envelope。
+/// `event_id` 由 thread/turn/item 稳定计算，同一页重放不会产生随机 id。
+#[derive(Debug, Clone, Serialize)]
+struct AgentEventEnvelope {
+    schema: String,
+    event_id: String,
+    event_type: String,
+    sequence: u64,
+    thread_id: String,
+    turn_id: Option<String>,
+    item_id: Option<String>,
+    /// item 若来自模型回复的 Context usage 尾部，则在 envelope 顶层复现同一快照 ID。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_snapshot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_turn_id: Option<String>,
+    created_at: u64,
+    payload: JsonValue,
+}
+
+#[derive(Debug, Clone)]
+struct SessionHistoryTurnBundle {
+    turn: SessionHistoryTurnDto,
+    items: Vec<SessionHistoryItemDto>,
+}
+
+fn agent_event_id(
+    thread_id: &str,
+    event_type: &str,
+    turn_id: Option<&str>,
+    item_id: Option<&str>,
+) -> String {
+    let key = format!(
+        "{thread_id}\u{1f}{event_type}\u{1f}{}\u{1f}{}",
+        turn_id.unwrap_or_default(),
+        item_id.unwrap_or_default()
+    );
+    format!("event-{:016x}", hash_bytes(key.as_bytes()))
+}
+
+fn history_message_context_snapshot_id(message: &PersistedChatMessage) -> Option<String> {
+    const MARKER: &str = "Context snapshot:";
+    message.content.lines().find_map(|line| {
+        let value = line.split_once(MARKER)?.1.split(';').next()?.trim();
+        (!value.is_empty() && value != "-").then(|| value.to_string())
+    })
+}
+
+fn history_message_context_turn_id(message: &PersistedChatMessage) -> Option<String> {
+    const MARKER: &str = "Context turn:";
+    message.content.lines().find_map(|line| {
+        let value = line.split_once(MARKER)?.1.split(';').next()?.trim();
+        (!value.is_empty() && value != "none" && value != "-").then(|| value.to_string())
+    })
+}
+
+fn session_history_item_event_type(item: &SessionHistoryItemDto) -> &'static str {
+    match item.kind.as_str() {
+        "reasoning" => "reasoning.completed",
+        "tool_call" => "tool.call",
+        "tool_result" => "tool.result",
+        _ => "item.completed",
+    }
+}
+
+fn session_history_item_event_payload(item: &SessionHistoryItemDto) -> JsonValue {
+    match item.kind.as_str() {
+        "reasoning" => json!({
+            "item": item,
+            "reasoning": {
+                "visibility": "summary",
+                "redacted": false,
+            },
+        }),
+        "tool_call" | "tool_result" => json!({
+            "item": item,
+            "tool_call": {
+                "id": item.tool_call_id.as_deref(),
+                "name": item.tool_name.as_deref(),
+                "status": item.tool_status.as_deref(),
+                "route": item.tool_route.as_deref(),
+            },
+        }),
+        _ => json!(item),
+    }
+}
+
+fn session_agent_events_jsonl(history: &SessionHistoryResponse) -> String {
+    let thread_id = history.session.id.clone();
+    let mut lines = Vec::new();
+    let mut sequence = 0_u64;
+    let mut push_event = |event_type: &str,
+                          turn_id: Option<&str>,
+                          item_id: Option<&str>,
+                          created_at: u64,
+                          payload: JsonValue| {
+        let context_snapshot_id = payload
+            .get("context_snapshot_id")
+            .or_else(|| {
+                payload
+                    .get("item")
+                    .and_then(|item| item.get("context_snapshot_id"))
+            })
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        let context_turn_id = payload
+            .get("context_turn_id")
+            .or_else(|| {
+                payload
+                    .get("item")
+                    .and_then(|item| item.get("context_turn_id"))
+            })
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        let event = AgentEventEnvelope {
+            schema: "coolzhu.agent.event.v1".to_string(),
+            event_id: agent_event_id(&thread_id, event_type, turn_id, item_id),
+            event_type: event_type.to_string(),
+            sequence,
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.map(str::to_string),
+            item_id: item_id.map(str::to_string),
+            context_snapshot_id,
+            context_turn_id,
+            created_at,
+            payload,
+        };
+        sequence = sequence.saturating_add(1);
+        if let Ok(line) = serde_json::to_string(&event) {
+            lines.push(line);
+        }
+    };
+
+    push_event(
+        "thread.snapshot",
+        None,
+        None,
+        history.session.updated_at,
+        json!({
+            "session": &history.session,
+            "turn_count": history.turns.len(),
+            "item_count": history.items.len(),
+            "has_more": history.has_more,
+            "next_before": history.next_before.as_deref(),
+        }),
+    );
+    for turn in &history.turns {
+        push_event(
+            "turn.started",
+            Some(&turn.id),
+            None,
+            turn.started_at,
+            json!(turn),
+        );
+        for item in history.items.iter().filter(|item| item.turn_id == turn.id) {
+            let event_type = session_history_item_event_type(item);
+            push_event(
+                event_type,
+                Some(&turn.id),
+                Some(&item.id),
+                item.created_at,
+                session_history_item_event_payload(item),
+            );
+        }
+        push_event(
+            "turn.completed",
+            Some(&turn.id),
+            None,
+            turn.completed_at.unwrap_or(turn.started_at),
+            json!(turn),
+        );
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
+/// 将 history API 的游标解析为要保留的消息数量。
+/// 压缩条目不是原始消息，不能作为 rollback/fork 的截断边界，避免把摘要
+/// 当成普通对话消息后产生不可重放的上下文。
+fn session_history_message_end(session: &PersistedSession, cursor: &str) -> Option<usize> {
+    let cursor = cursor.trim();
+    if cursor.is_empty() {
+        return None;
+    }
+    if let Some(index) = session
+        .messages
+        .iter()
+        .position(|message| message.id == cursor)
+    {
+        return Some(index + 1);
+    }
+    let mut ranges = Vec::new();
+    let mut range_start = None;
+    for (index, message) in session.messages.iter().enumerate() {
+        if message.role.eq_ignore_ascii_case("user") {
+            if let Some(start) = range_start.replace(index) {
+                ranges.push((start, index));
+            }
+        } else if range_start.is_none() {
+            range_start = Some(index);
+        }
+    }
+    if let Some(start) = range_start {
+        ranges.push((start, session.messages.len()));
+    }
+    ranges.into_iter().find_map(|(start, end)| {
+        let first = session.messages.get(start)?;
+        (history_turn_id(&session.id, &first.id) == cursor).then_some(end)
+    })
+}
+
+fn history_message_item_kind(message: &PersistedChatMessage) -> String {
+    let role = message.role.trim().to_ascii_lowercase();
+    if role == "user" {
+        return "user_message".to_string();
+    }
+    let kind = message.kind.trim().to_ascii_lowercase();
+    if kind == "reasoning" {
+        return "reasoning".to_string();
+    }
+    if role == "tool" || matches!(kind.as_str(), "tool-result" | "tool_result") {
+        return "tool_result".to_string();
+    }
+    if role == "system" {
+        return "system".to_string();
+    }
+    if kind.contains("tool") {
+        return "tool_call".to_string();
+    }
+    "assistant_message".to_string()
+}
+
+/// 从已有的聊天室工具摘要中提取不含原始参数的稳定工具元数据。
+///
+/// 旧会话只持久化了可读摘要，没有独立 ToolCall 表，因此这里兼容
+/// `tool_name:/route:/status:` 行和 `工具 \`name\`` 摘要格式；参数正文
+/// 不回填到 history/event，避免把潜在凭据重新暴露给回放消费者。
+fn history_tool_metadata(
+    message: &PersistedChatMessage,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let kind = message.kind.trim().to_ascii_lowercase();
+    let role = message.role.trim().to_ascii_lowercase();
+    if role != "tool" && !kind.contains("tool") {
+        return (None, None, None, None);
+    }
+    let line_value = |prefix: &str| {
+        message
+            .content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(prefix).map(str::trim))
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let tool_name = line_value("tool_name:").or_else(|| {
+        let marker = "工具 `";
+        let start = message.content.find(marker)? + marker.len();
+        let rest = &message.content[start..];
+        let end = rest.find('`')?;
+        let value = rest[..end].trim();
+        (!value.is_empty()).then(|| value.to_string())
+    });
+    let route = line_value("route:");
+    let status = line_value("status:").or_else(|| {
+        let lower = message.content.to_ascii_lowercase();
+        if lower.contains("失败") || lower.contains("failed") {
+            Some("failed".to_string())
+        } else if lower.contains("超时") || lower.contains("timeout") {
+            Some("timeout".to_string())
+        } else if lower.contains("拒绝") || lower.contains("rejected") {
+            Some("rejected".to_string())
+        } else if lower.contains("预览") || lower.contains("dry-run") {
+            Some("dry-run".to_string())
+        } else {
+            Some("completed".to_string())
+        }
+    });
+    // provider tool id 只有新写入的结构化摘要才会提供；旧消息退回 item id，
+    // 这样跨页仍有可关联的稳定键，但不会伪造模型侧 provider id。
+    let call_id = line_value("tool_call_id:").or_else(|| Some(message.id.clone()));
+    (call_id, tool_name, status, route)
+}
+
+fn history_turn_id(session_id: &str, cursor: &str) -> String {
+    format!(
+        "turn-{:016x}",
+        hash_bytes(format!("{session_id}\u{1f}{cursor}").as_bytes())
+    )
+}
+
+fn history_compaction_turn_id(bead_id: &str) -> String {
+    format!("turn-compaction-{:016x}", hash_bytes(bead_id.as_bytes()))
+}
+
+fn session_history_response(
+    session: &PersistedSession,
+    active: bool,
+    query: SessionHistoryQuery,
+) -> SessionHistoryResponse {
+    let mut bundles = Vec::new();
+    let mut ranges = Vec::new();
+    let mut range_start = None;
+    for (index, message) in session.messages.iter().enumerate() {
+        if message.role.eq_ignore_ascii_case("user") {
+            if let Some(start) = range_start.replace(index) {
+                ranges.push((start, index));
+            }
+        } else if range_start.is_none() {
+            range_start = Some(index);
+        }
+    }
+    if let Some(start) = range_start {
+        ranges.push((start, session.messages.len()));
+    }
+
+    for (start, end) in ranges {
+        let Some(first) = session.messages.get(start) else {
+            continue;
+        };
+        let Some(last) = session.messages.get(end.saturating_sub(1)) else {
+            continue;
+        };
+        let turn_id = history_turn_id(&session.id, &first.id);
+        let items = session.messages[start..end]
+            .iter()
+            .map(|message| {
+                let (tool_call_id, tool_name, tool_status, tool_route) =
+                    history_tool_metadata(message);
+                SessionHistoryItemDto {
+                    id: message.id.clone(),
+                    turn_id: turn_id.clone(),
+                    kind: history_message_item_kind(message),
+                    role: message.role.clone(),
+                    author: message.author.clone(),
+                    target: message.target.clone(),
+                    content: message.content.clone(),
+                    source: "session_messages".to_string(),
+                    created_at: message.created_at,
+                    attachments: message.attachments.clone(),
+                    message_count: None,
+                    token_count: Some(estimate_message_tokens(message)),
+                    context_snapshot_id: history_message_context_snapshot_id(message),
+                    context_turn_id: history_message_context_turn_id(message),
+                    tool_call_id,
+                    tool_name,
+                    tool_status,
+                    tool_route,
+                }
+            })
+            .collect::<Vec<_>>();
+        bundles.push(SessionHistoryTurnBundle {
+            turn: SessionHistoryTurnDto {
+                id: turn_id,
+                session_id: session.id.clone(),
+                status: if last.role.eq_ignore_ascii_case("user") {
+                    "open".to_string()
+                } else {
+                    "completed".to_string()
+                },
+                started_at: first.created_at,
+                completed_at: (!last.role.eq_ignore_ascii_case("user")).then_some(last.created_at),
+                item_ids: items.iter().map(|item| item.id.clone()).collect(),
+            },
+            items,
+        });
+    }
+
+    // 自动压缩不是普通聊天消息，作为独立 typed item 暴露，便于恢复/回放时区分摘要与原文。
+    for bead in session
+        .memory_beads
+        .iter()
+        .filter(|bead| bead.source == "context:auto-compact")
+    {
+        let turn_id = history_compaction_turn_id(&bead.id);
+        let item = SessionHistoryItemDto {
+            id: bead.id.clone(),
+            turn_id: turn_id.clone(),
+            kind: "compaction".to_string(),
+            role: "system".to_string(),
+            author: "COOLZHU AGENT".to_string(),
+            target: session.id.clone(),
+            content: bead.summary.clone(),
+            source: bead.source.clone(),
+            created_at: bead.created_at,
+            attachments: Vec::new(),
+            message_count: None,
+            token_count: bead.token_count,
+            context_snapshot_id: None,
+            context_turn_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_status: None,
+            tool_route: None,
+        };
+        bundles.push(SessionHistoryTurnBundle {
+            turn: SessionHistoryTurnDto {
+                id: turn_id,
+                session_id: session.id.clone(),
+                status: "compacted".to_string(),
+                started_at: bead.created_at,
+                completed_at: Some(bead.created_at),
+                item_ids: vec![item.id.clone()],
+            },
+            items: vec![item],
+        });
+    }
+    bundles.sort_by(|left, right| {
+        left.turn
+            .started_at
+            .cmp(&right.turn.started_at)
+            .then_with(|| left.turn.id.cmp(&right.turn.id))
+    });
+
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let end = query
+        .before
+        .as_deref()
+        .and_then(|cursor| {
+            bundles.iter().position(|bundle| {
+                bundle.turn.id == cursor
+                    || bundle.turn.item_ids.first().is_some_and(|id| id == cursor)
+            })
+        })
+        .unwrap_or(bundles.len());
+    let start = end.saturating_sub(limit);
+    let selected = &bundles[start..end];
+    SessionHistoryResponse {
+        session: session.summary(active),
+        turns: selected.iter().map(|bundle| bundle.turn.clone()).collect(),
+        items: selected
+            .iter()
+            .flat_map(|bundle| bundle.items.iter().cloned())
+            .collect(),
+        has_more: start > 0,
+        next_before: (start > 0).then(|| bundles[start].turn.id.clone()),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -43785,6 +50501,88 @@ struct SendMessageRequest {
     attachments: Option<Vec<ChatAttachmentDto>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ChatTurnInterruptRequest {
+    session_id: Option<String>,
+    chat_room_id: String,
+    turn_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatTurnInterruptResponse {
+    turn_id: String,
+    status: ChatTurnStatus,
+    outcome: String,
+    idempotent: bool,
+}
+
+/// Runtime run 对外状态；owner/claim_token/error_json 只留在 SQLite，不能泄露到 API。
+#[derive(Debug, Clone, Serialize)]
+struct RunStatusDto {
+    run_id: String,
+    kind: String,
+    workspace_id: String,
+    session_id: Option<String>,
+    chat_room_id: Option<String>,
+    goal_id: Option<String>,
+    phase_id: Option<String>,
+    /// `runtime_runs.legacy_turn_id` 的稳定公开别名。
+    turn_id: Option<String>,
+    provider_turn_id: Option<String>,
+    state: String,
+    stop_reason: Option<String>,
+    created_at: u64,
+    started_at: Option<u64>,
+    stop_requested_at: Option<u64>,
+    heartbeat_at: Option<u64>,
+    finished_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeRunEventDto {
+    /// SQLite `runtime_run_events.id`，同时作为 SSE numeric id。
+    id: i64,
+    run_id: String,
+    event_type: String,
+    payload: JsonValue,
+    created_at: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RunEventsQuery {
+    /// 非法值在反序列化时归一为 0，避免 Axum 直接返回 400。
+    #[serde(deserialize_with = "deserialize_run_event_after", default)]
+    after: Option<i64>,
+}
+
+fn deserialize_run_event_after<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.map(|value| {
+        value
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|parsed| *parsed >= 0)
+            .unwrap_or(0)
+    }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RunInterruptRequest {
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunInterruptResponse {
+    run_id: String,
+    state: String,
+    outcome: String,
+    idempotent: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ChatAttachmentDto {
     kind: String,
@@ -43864,7 +50662,18 @@ struct ChatStreamDelta {
 }
 
 #[derive(Debug, Serialize)]
+struct ChatStreamStarted {
+    turn_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct ChatStreamDone {
+    turn_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    status: ChatTurnStatus,
     accepted_agent_ids: Vec<String>,
     tasks: Vec<AgentTaskDto>,
 }
@@ -47080,7 +53889,9 @@ async fn api_realtime_model_stream_probe(
         )));
     }
 
-    let stream_result = stream_agent_model(&agent, &prompt, &[], &[], None, None).await;
+    let stream_turn_id = diagnostics::TraceIdType::generate().to_hex();
+    let stream_result =
+        stream_agent_model(&agent, &prompt, &[], &[], None, &stream_turn_id, None).await;
     let Ok((mut model_stream, _assembly)) = stream_result else {
         return Ok(Json(error_response(format!(
             "Model stream probe failed to start: {}",
@@ -49139,7 +55950,7 @@ mod tests {
         CaptureFileInfo, ChatAttachmentDto, ComputerActionPlanRequest, ConfigVisionDetection,
         MemoryBeadDto, OutputContentBlock, PersistedSession, PointDto, PromptMemoryQuery,
         RealtimeSessionState, RoiDto, ScreenDimensions, ToolDispatchRequest,
-        VisionRealtimeElementState, MAX_MEMORY_BEADS_PER_SESSION,
+        VisionRealtimeElementState, DEFAULT_CHAT_ROOM_ID, MAX_MEMORY_BEADS_PER_SESSION,
     };
     use super::{detection_launcher_hint, detection_service_health_url};
     use axum::Json;
@@ -49230,6 +56041,66 @@ mod tests {
             assert!(!content.is_empty(), "empty embedded static file: {path}");
         }
         assert!(super::embedded_static_file(Path::new("assets/icons/code.png")).is_none());
+    }
+
+    #[tokio::test]
+    async fn static_fallback_http_returns_plain_404_and_keeps_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind isolated static fallback listener");
+        let address = listener
+            .local_addr()
+            .expect("static fallback listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, super::app())
+                .await
+                .expect("static fallback server");
+        });
+
+        let client = reqwest::Client::builder()
+            .http1_only()
+            .build()
+            .expect("HTTP regression client");
+        let base_url = format!("http://{address}");
+        let missing = client
+            .get(format!("{base_url}/does-not-exist"))
+            .send()
+            .await
+            .expect("unknown static path response");
+        assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(';').next().unwrap_or(value)),
+            Some("text/plain")
+        );
+        let missing_body = missing.text().await.expect("unknown static path body");
+        assert!(!missing_body.trim().is_empty());
+
+        let index = client
+            .get(format!("{base_url}/"))
+            .send()
+            .await
+            .expect("index response after unknown static path");
+        assert_eq!(index.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            index
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(';').next().unwrap_or(value)),
+            Some("text/html")
+        );
+        assert!(index
+            .text()
+            .await
+            .expect("index body after unknown static path")
+            .contains("COOLZHU"));
+
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
@@ -50788,6 +57659,7 @@ mod tests {
 
     #[test]
     fn chat_dispatch_routes_semantic_hotkey_to_tool_agent() {
+        let _guard = config_test_guard();
         let dispatch = super::prepare_chat_dispatch(super::SendMessageRequest {
             session_id: None,
             chat_room_id: None,
@@ -51335,6 +58207,7 @@ mod tests {
                 assigned_session_display_name: None,
                 assigned_session_available: true,
                 status: "running".to_string(),
+                active_run_id: None,
                 depends_on: phase.depends_on.clone(),
                 skills_required: phase.skills_required.clone(),
                 output_artifacts: phase.output_artifacts.clone(),
@@ -52371,6 +59244,7 @@ mod tests {
                 image_token_estimate: 512,
                 max_memory_beads: 4,
                 history_floor_millis: None,
+                chat_room_id: None,
             },
         );
 
@@ -52397,6 +59271,7 @@ mod tests {
                 image_token_estimate: 512,
                 max_memory_beads: 0,
                 history_floor_millis: None,
+                chat_room_id: None,
             },
         );
 
@@ -52435,6 +59310,7 @@ mod tests {
                 image_token_estimate: 512,
                 max_memory_beads: 4,
                 history_floor_millis: None,
+                chat_room_id: Some("room-context".to_string()),
             },
         );
 
@@ -52455,8 +59331,136 @@ mod tests {
             vec!["bead-alpha"]
         );
         assert_eq!(assembly.history_message_count, 2);
+        assert_eq!(assembly.history_selection.source, "chat_room.messages");
+        assert_eq!(assembly.history_selection.candidate_ids, vec!["h1", "h2"]);
+        assert_eq!(assembly.history_selection.selected_ids, vec!["h1", "h2"]);
+        assert!(assembly.history_selection.excluded_ids.is_empty());
         assert!(!assembly.truncated);
         assert!(assembly.token_budget.total <= assembly.token_budget.budget);
+        assert_eq!(
+            assembly.runtime_snapshot.chat_room_id.as_deref(),
+            Some("room-context")
+        );
+        assert_eq!(
+            assembly.runtime_snapshot.snapshot_id,
+            assembly.context_snapshot_id
+        );
+        assert_eq!(assembly.runtime_snapshot.model, agent.model);
+        assert_eq!(assembly.runtime_snapshot.provider, agent.provider);
+        assert!(!assembly.runtime_snapshot.workspace_id.is_empty());
+        assert!(assembly
+            .runtime_snapshot
+            .tool_catalog_revision
+            .starts_with("tools-"));
+        assert_eq!(assembly.memory_selection.selected_ids, vec!["bead-alpha"]);
+        assert!(assembly
+            .memory_selection
+            .candidate_ids
+            .contains(&"bead-alpha".to_string()));
+        assert_eq!(assembly.memory_selection.token_budget, 80);
+        assert!(assembly.memory_selection.used_tokens <= 80);
+        assert!(assembly.memory_selection.superseded_ids.is_empty());
+    }
+
+    #[test]
+    fn context_memory_mode_blocks_auto_recall_with_explicit_evidence() {
+        let agent = context_test_agent();
+        let options = super::ContextBuildOptions {
+            memory_token_budget: 80,
+            max_memory_beads: 4,
+            ..Default::default()
+        };
+
+        let (beads, evidence) =
+            super::select_context_memory_beads(&agent, "alpha click target", &options, "disabled");
+
+        assert!(beads.is_empty());
+        assert_eq!(evidence.strategy, "disabled_blocked");
+        assert!(evidence.candidate_ids.is_empty());
+        assert!(evidence.selected_ids.is_empty());
+        assert_eq!(evidence.used_tokens, 0);
+        assert_eq!(evidence.token_budget, 80);
+    }
+
+    #[test]
+    fn context_snapshot_id_changes_when_runtime_scope_changes() {
+        let agent = context_test_agent();
+        let history = vec![persisted_role_message("h1", "user", "history", 1)];
+        let base = super::context_snapshot_id(
+            &agent,
+            "mem-1",
+            None,
+            &["bead-1".to_string()],
+            &history,
+            "system",
+            "input",
+            "workspace-a",
+            Some("room-a"),
+            "workspace-write",
+            "enabled",
+            "tools-a",
+        );
+        let workspace_changed = super::context_snapshot_id(
+            &agent,
+            "mem-1",
+            None,
+            &["bead-1".to_string()],
+            &history,
+            "system",
+            "input",
+            "workspace-b",
+            Some("room-a"),
+            "workspace-write",
+            "enabled",
+            "tools-a",
+        );
+        let permission_changed = super::context_snapshot_id(
+            &agent,
+            "mem-1",
+            None,
+            &["bead-1".to_string()],
+            &history,
+            "system",
+            "input",
+            "workspace-a",
+            Some("room-a"),
+            "full-access",
+            "enabled",
+            "tools-a",
+        );
+        let tools_changed = super::context_snapshot_id(
+            &agent,
+            "mem-1",
+            None,
+            &["bead-1".to_string()],
+            &history,
+            "system",
+            "input",
+            "workspace-a",
+            Some("room-a"),
+            "workspace-write",
+            "enabled",
+            "tools-b",
+        );
+        let memory_mode_changed = super::context_snapshot_id(
+            &agent,
+            "mem-1",
+            None,
+            &["bead-1".to_string()],
+            &history,
+            "system",
+            "input",
+            "workspace-a",
+            Some("room-a"),
+            "workspace-write",
+            "disabled",
+            "tools-a",
+        );
+
+        assert_ne!(base, workspace_changed);
+        assert_ne!(base, permission_changed);
+        assert_ne!(base, tools_changed);
+        assert_ne!(base, memory_mode_changed);
     }
 
     #[test]
@@ -52479,6 +59483,7 @@ mod tests {
                 image_token_estimate: 512,
                 max_memory_beads: 4,
                 history_floor_millis: Some(20),
+                chat_room_id: None,
             },
         );
 
@@ -52492,6 +59497,9 @@ mod tests {
         assert!(joined.contains("new task context"));
         assert!(joined.contains("continue from the new task"));
         assert_eq!(assembly.history_message_count, 1);
+        assert_eq!(assembly.history_selection.source, "chat_room.messages");
+        assert_eq!(assembly.history_selection.selected_ids, vec!["h-new"]);
+        assert_eq!(assembly.history_selection.excluded_ids, vec!["h-old"]);
     }
 
     #[test]
@@ -52514,6 +59522,7 @@ mod tests {
                 image_token_estimate: 512,
                 max_memory_beads: 4,
                 history_floor_millis: None,
+                chat_room_id: None,
             },
         );
 
@@ -54639,11 +61648,14 @@ attach: last_assistant
 
         let refreshed = super::get_goal_sqlite(&db_path, "workspace-dispatch-ready", &goal.id)
             .expect("refreshed goal");
+        assert_eq!(refreshed.status, "running");
         assert_eq!(refreshed.phases[0].status, "running");
         assert!(refreshed.recent_events.iter().any(|event| {
             event.event_type == "goal-phase-dispatched"
                 && event.payload["phase_id"] == serde_json::json!("plan")
-                && event.payload["handoff_id"] == serde_json::json!(handoffs[0].id.clone())
+                && event.payload["run_id"].as_str().is_some()
+                // 事件在 handoff 副作用之前提交，handoff_id 此时按契约为 null。
+                && event.payload["handoff_id"].is_null()
         }));
         let connection = super::open_session_connection(&db_path).expect("open db");
         let overlay_count: i64 = connection
@@ -54790,7 +61802,17 @@ attach: last_assistant
         assert!(result.dispatched[0].handoff_id.is_none());
         let refreshed = super::get_goal_sqlite(&db_path, "workspace-self-role-dispatch", &goal.id)
             .expect("refreshed goal");
+        assert_eq!(refreshed.status, "running");
         assert_eq!(refreshed.phases[0].status, "running");
+        let active_run_id = refreshed.phases[0]
+            .active_run_id
+            .clone()
+            .expect("self dispatch keeps accepted run claim");
+        let accepted_run = super::query_runtime_run_sqlite(&db_path, &active_run_id)
+            .expect("query self dispatch run")
+            .expect("self dispatch run exists");
+        assert_eq!(accepted_run.kind, "goal_phase");
+        assert_eq!(accepted_run.state, "accepted");
         assert!(refreshed.recent_events.iter().any(|event| {
             event.event_type == "goal-phase-dispatched"
                 && event.payload["phase_id"] == serde_json::json!("implement")
@@ -55250,6 +62272,7 @@ attach: last_assistant
             assigned_session_display_name: Some("implementer".to_string()),
             assigned_session_available: true,
             status: "running".to_string(),
+            active_run_id: None,
             depends_on: Vec::new(),
             skills_required: vec!["implement".to_string()],
             output_artifacts: vec![artifact.clone()],
@@ -55587,6 +62610,17 @@ attach: last_assistant
             .memory_beads
             .iter()
             .any(|bead| bead.kind == "goal-task-skill"));
+
+        // E3a 的 dispatch 只负责 durable claim；这里模拟 E3b finalizer 已收口 claim，
+        // 再验证原有完成报告与 overlay 清理路径。
+        let connection = super::open_session_connection(&db_path).expect("claim db");
+        connection
+            .execute(
+                "UPDATE goal_phases SET active_run_id=NULL, claim_token=NULL, claim_owner=NULL, claimed_at=NULL, lease_until=NULL \
+                 WHERE goal_id=?1 AND id='plan'",
+                super::params![&goal.id],
+            )
+            .expect("release claim fixture");
 
         let status = store
             .complete_goal_phase(
@@ -57504,9 +64538,3136 @@ attach: last_assistant
         );
     }
 
+    fn sample_runtime_run(id: &str, state: &str) -> super::RuntimeRunRecord {
+        super::RuntimeRunRecord {
+            id: id.to_string(),
+            kind: "chat_turn".to_string(),
+            workspace_id: "test-workspace".to_string(),
+            session_id: Some("test-session".to_string()),
+            chat_room_id: Some("test-room".to_string()),
+            goal_id: None,
+            phase_id: None,
+            legacy_turn_id: Some(format!("legacy-{id}")),
+            provider_turn_id: Some(format!("provider-{id}")),
+            state: state.to_string(),
+            owner_id: Some("test-owner".to_string()),
+            claim_token: format!("claim-{id}"),
+            stop_reason: None,
+            error_json: None,
+            created_at: 1,
+            started_at: Some(2),
+            stop_requested_at: None,
+            heartbeat_at: Some(3),
+            finished_at: None,
+        }
+    }
+
+    fn seed_recovery_goal_phase_claim(
+        db: &Path,
+        workspace_id: &str,
+        goal_id: &str,
+        phase_id: &str,
+        run_id: &str,
+        run_state: &str,
+        goal_status: &str,
+    ) -> super::RuntimeRunRecord {
+        seed_recovery_goal_phase_claim_with_scope(
+            db,
+            workspace_id,
+            goal_id,
+            phase_id,
+            run_id,
+            run_state,
+            goal_status,
+            workspace_id,
+            phase_id,
+            &format!("claim-{run_id}"),
+            &format!("claim-{run_id}"),
+        )
+    }
+
+    fn seed_recovery_goal_phase_claim_with_scope(
+        db: &Path,
+        workspace_id: &str,
+        goal_id: &str,
+        phase_id: &str,
+        run_id: &str,
+        run_state: &str,
+        goal_status: &str,
+        run_workspace_id: &str,
+        run_phase_id: &str,
+        run_claim_token: &str,
+        phase_claim_token: &str,
+    ) -> super::RuntimeRunRecord {
+        let connection = super::open_session_connection(db).expect("open recovery goal db");
+        super::initialize_session_schema(&connection).expect("recovery goal schema");
+        connection
+            .execute(
+                "INSERT INTO goals(\
+                    id, workspace_id, chat_room_id, title, status, max_iterations,\
+                    current_iteration, background, originating_user_msg_id,\
+                    completion_condition_json, plan_json, created_at, updated_at, cancelled_at\
+                ) VALUES (?1, ?2, ?3, 'Recovery goal', ?4, 5, 0, 0, NULL, '{}', NULL, 1, 1, NULL)",
+                super::params![goal_id, workspace_id, format!("room-{goal_id}"), goal_status],
+            )
+            .expect("seed recovery goal");
+        connection
+            .execute(
+                "INSERT INTO goal_phases(\
+                    id, goal_id, title, assigned_role, status, depends_on_json,\
+                    skills_json, output_artifacts_json, verification_json, created_at, updated_at\
+                ) VALUES (?1, ?2, 'Recovery phase', 'implementer', 'running', '[]', '[]', '[]', NULL, 1, 1)",
+                super::params![phase_id, goal_id],
+            )
+            .expect("seed recovery phase");
+        let run = super::RuntimeRunRecord {
+            id: run_id.to_string(),
+            kind: "goal_phase".to_string(),
+            workspace_id: run_workspace_id.to_string(),
+            session_id: Some("recovery-session".to_string()),
+            chat_room_id: Some(format!("room-{goal_id}")),
+            goal_id: Some(goal_id.to_string()),
+            phase_id: Some(run_phase_id.to_string()),
+            legacy_turn_id: None,
+            provider_turn_id: None,
+            state: run_state.to_string(),
+            owner_id: Some(format!("owner-{run_id}")),
+            claim_token: run_claim_token.to_string(),
+            stop_reason: None,
+            error_json: None,
+            created_at: 1,
+            started_at: Some(2),
+            stop_requested_at: None,
+            heartbeat_at: Some(3),
+            finished_at: None,
+        };
+        super::insert_runtime_run_connection(&connection, &run).expect("seed recovery run");
+        connection
+            .execute(
+                "UPDATE goal_phases SET active_run_id=?1, claim_token=?2, claim_owner='recovery-owner', claimed_at=3, lease_until=4 WHERE goal_id=?3 AND id=?4",
+                super::params![run_id, phase_claim_token, goal_id, phase_id],
+            )
+            .expect("seed recovery claim");
+        drop(connection);
+        run
+    }
+
+    fn seed_pending_goal_phase(
+        db: &Path,
+        workspace_id: &str,
+        goal_id: &str,
+        room_id: &str,
+        phase_id: &str,
+    ) -> super::GoalPhaseDto {
+        let connection = super::open_session_connection(db).expect("open goal db");
+        super::initialize_session_schema(&connection).expect("goal schema");
+        connection
+            .execute(
+                "INSERT INTO goals(\
+                    id, workspace_id, chat_room_id, title, status, max_iterations,\
+                    current_iteration, background, originating_user_msg_id,\
+                    completion_condition_json, plan_json, created_at, updated_at, cancelled_at\
+                ) VALUES (?1, ?2, ?3, 'Claim test goal', 'planning', 5, 0, 0, NULL, '{}', NULL, 1, 1, NULL)",
+                rusqlite::params![goal_id, workspace_id, room_id],
+            )
+            .expect("seed goal");
+        connection
+            .execute(
+                "INSERT INTO goal_phases(\
+                    id, goal_id, title, assigned_role, status, depends_on_json,\
+                    skills_json, output_artifacts_json, verification_json, created_at, updated_at\
+                ) VALUES (?1, ?2, 'Claim test phase', 'implementer', 'pending', '[]', '[]', '[]', NULL, 1, 1)",
+                rusqlite::params![phase_id, goal_id],
+            )
+            .expect("seed phase");
+        super::GoalPhaseDto {
+            id: phase_id.to_string(),
+            goal_id: goal_id.to_string(),
+            title: "Claim test phase".to_string(),
+            assigned_role: "implementer".to_string(),
+            assigned_session_id: Some("goal-implementer".to_string()),
+            assigned_session_display_name: Some("implementer".to_string()),
+            assigned_session_available: true,
+            status: "pending".to_string(),
+            active_run_id: None,
+            depends_on: Vec::new(),
+            skills_required: Vec::new(),
+            output_artifacts: Vec::new(),
+            verification: None,
+            retry_count: 0,
+            max_retries: 2,
+            last_verdict: None,
+            last_reason: None,
+            last_evidence: None,
+            route_hint: None,
+            requires_human_ack: false,
+            human_ack: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn goal_dispatch_fixture(
+        temp: &tempfile::TempDir,
+        workspace_id: &str,
+        title: &str,
+    ) -> (super::SessionStore, super::GoalDto) {
+        let db_path = temp.path().join("goal-dispatch.sqlite3");
+        let now = super::unix_timestamp_millis();
+        let mut commander = super::seed_session();
+        commander.id = "base".to_string();
+        commander.name = "commander".to_string();
+        commander.messages.clear();
+        commander.memory_beads.clear();
+        commander.created_at = now;
+        commander.updated_at = now;
+        let mut planner = super::seed_session();
+        planner.id = "goal-planner".to_string();
+        planner.name = "planner".to_string();
+        planner.messages.clear();
+        planner.memory_beads.clear();
+        planner.created_at = now;
+        planner.updated_at = now;
+        let mut store = super::SessionStore {
+            path: db_path.clone(),
+            legacy_json_path: temp.path().join("sessions.json"),
+            capacity: super::SessionStoreCapacity::default(),
+            state: super::PersistedSessionState {
+                sessions: vec![commander, planner],
+                active_session_id: Some("base".to_string()),
+                active_vision_session_id: None,
+                chat_rooms: vec![super::PersistedChatRoom {
+                    id: "room-dispatch".to_string(),
+                    name: "Dispatch room".to_string(),
+                    created_at: now,
+                    updated_at: now,
+                    messages: vec![persisted_role_message(
+                        "origin-1",
+                        "user",
+                        "dispatch fixture",
+                        now,
+                    )],
+                }],
+                active_chat_room_id: Some("room-dispatch".to_string()),
+            },
+        };
+        store.save().expect("seed dispatch fixture");
+        super::upsert_goal_role_config_sqlite(
+            &db_path,
+            "base",
+            super::GoalRoleConfigUpdateRequest {
+                role: Some("commander".to_string()),
+                responsibility: Some("Dispatch ready phases".to_string()),
+                commander: Some(true),
+                heartbeat_timeout_ms: Some(60_000),
+                task_timeout_ms: Some(600_000),
+            },
+        )
+        .expect("commander config");
+        super::upsert_goal_role_config_sqlite(
+            &db_path,
+            "goal-planner",
+            super::GoalRoleConfigUpdateRequest {
+                role: Some("planner".to_string()),
+                responsibility: Some("Implement the phase".to_string()),
+                commander: Some(false),
+                heartbeat_timeout_ms: Some(60_000),
+                task_timeout_ms: Some(600_000),
+            },
+        )
+        .expect("planner config");
+        super::record_goal_role_heartbeat_sqlite(
+            &db_path,
+            "goal-planner",
+            super::GoalRoleHeartbeatRequest {
+                task_active: Some(true),
+            },
+        )
+        .expect("planner heartbeat");
+        let goal = super::create_goal_sqlite(
+            &db_path,
+            workspace_id,
+            "room-dispatch",
+            super::CreateGoalRequest {
+                title: title.to_string(),
+                chat_room_id: Some("room-dispatch".to_string()),
+                max_iterations: Some(3),
+                background: Some(true),
+                originating_user_msg_id: Some("origin-1".to_string()),
+                completion_condition: Some(json!({ "type": "UserConfirm" })),
+            },
+        )
+        .expect("fixture goal");
+        let planned = super::set_goal_plan_sqlite(
+            &db_path,
+            workspace_id,
+            &goal.id,
+            super::GoalPlanRequest {
+                phases: vec![
+                    super::GoalPlanPhaseRequest {
+                        id: "phase-one".to_string(),
+                        title: "First phase".to_string(),
+                        assigned_role: Some("planner".to_string()),
+                        depends_on: Vec::new(),
+                        skills_required: vec!["first".to_string()],
+                        output_artifacts: Vec::new(),
+                        verification: Some(json!({ "type": "UserConfirm" })),
+                        requires_human_ack: false,
+                    },
+                    super::GoalPlanPhaseRequest {
+                        id: "phase-two".to_string(),
+                        title: "Second phase".to_string(),
+                        assigned_role: Some("planner".to_string()),
+                        depends_on: vec!["phase-one".to_string()],
+                        skills_required: vec!["second".to_string()],
+                        output_artifacts: Vec::new(),
+                        verification: Some(json!({ "type": "UserConfirm" })),
+                        requires_human_ack: false,
+                    },
+                ],
+            },
+        )
+        .expect("fixture plan");
+        (store, planned)
+    }
+
+    fn token_finalizer_fixture(
+        temp: &tempfile::TempDir,
+        workspace_id: &str,
+    ) -> (super::SessionStore, super::GoalPhaseRunContext) {
+        token_finalizer_fixture_with_role(temp, workspace_id, "planner")
+    }
+
+    fn token_finalizer_fixture_with_role(
+        temp: &tempfile::TempDir,
+        workspace_id: &str,
+        assigned_role: &str,
+    ) -> (super::SessionStore, super::GoalPhaseRunContext) {
+        let (mut store, goal) = goal_dispatch_fixture(temp, workspace_id, "Token finalizer");
+        let db = store.path.clone();
+        if assigned_role != "planner" {
+            let mut role_session = store
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == "goal-planner")
+                .cloned()
+                .expect("role session template");
+            role_session.id = format!("goal-{assigned_role}");
+            role_session.name = assigned_role.to_string();
+            role_session.messages.clear();
+            role_session.memory_beads.clear();
+            store.state.sessions.push(role_session);
+            store.save().expect("save role session");
+            super::upsert_goal_role_config_sqlite(
+                &db,
+                &format!("goal-{assigned_role}"),
+                super::GoalRoleConfigUpdateRequest {
+                    role: Some(assigned_role.to_string()),
+                    responsibility: Some("Token finalizer test role".to_string()),
+                    commander: Some(false),
+                    heartbeat_timeout_ms: Some(60_000),
+                    task_timeout_ms: Some(600_000),
+                },
+            )
+            .expect("role config");
+            super::record_goal_role_heartbeat_sqlite(
+                &db,
+                &format!("goal-{assigned_role}"),
+                super::GoalRoleHeartbeatRequest {
+                    task_active: Some(true),
+                },
+            )
+            .expect("role heartbeat");
+        }
+        // 只保留一个 phase，便于断言 pass 后 Goal 完成判定也属于同一事务。
+        let connection = super::open_session_connection(&db).expect("open finalizer db");
+        connection
+            .execute(
+                "DELETE FROM goal_phases WHERE goal_id = ?1 AND id = 'phase-two'",
+                super::params![&goal.id],
+            )
+            .expect("remove second phase");
+        connection
+            .execute(
+                "UPDATE goal_phases SET assigned_role = ?1 WHERE goal_id = ?2 AND id = 'phase-one'",
+                super::params![assigned_role, &goal.id],
+            )
+            .expect("set finalizer role");
+        drop(connection);
+        let fresh_goal = super::get_goal_sqlite(&db, workspace_id, &goal.id).expect("fresh goal");
+        let phase = fresh_goal
+            .phases
+            .iter()
+            .find(|phase| phase.id == "phase-one")
+            .expect("phase")
+            .clone();
+        let target_session_id = phase
+            .assigned_session_id
+            .clone()
+            .expect("assigned target session");
+        let claim = super::claim_goal_phase_for_dispatch(
+            &db,
+            workspace_id,
+            &goal.id,
+            "room-dispatch",
+            &phase,
+            &target_session_id,
+            "base",
+            "token-finalizer-test",
+            false,
+        )
+        .expect("claim")
+        .expect("claim wins");
+        let context = store
+            .prepare_goal_phase_run_context(workspace_id, &goal.id, "phase-one")
+            .expect("start claimed run");
+        assert_eq!(context.run_id, claim.run_id);
+        assert_eq!(context.claim_token, claim.claim_token);
+        (store, context)
+    }
+
+    fn token_finalizer_response(answer: &str) -> super::AgentModelResponse {
+        super::AgentModelResponse {
+            answer_text: answer.to_string(),
+            reasoning_text: "token-aware finalizer test".to_string(),
+            tool_requests: Vec::new(),
+            tool_write_executed: false,
+            model_tool_calls_executed: false,
+            turn_id: "token-finalizer-turn".to_string(),
+            used_real_model: false,
+            diagnostic_note: None,
+            context_footer: None,
+            context_usage: None,
+        }
+    }
+
+    #[test]
+    fn goal_phase_token_finalizer_pass_is_one_transaction_and_clears_claim() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, context) = token_finalizer_fixture(&temp, "ws-token-pass");
+        let overlay_source = super::goal_task_skill_memory_source(&context.goal_id);
+        store
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == context.agent.id)
+            .expect("assigned session")
+            .memory_beads
+            .push(super::MemoryBeadDto {
+                id: "overlay-token-pass".to_string(),
+                kind: "goal-task-skill".to_string(),
+                layer: "L1".to_string(),
+                summary: "temporary overlay".to_string(),
+                source: overlay_source.clone(),
+                pinned: false,
+                confidence: 0.9,
+                created_at: super::unix_timestamp_millis(),
+                origin_message_id: None,
+                origin_table: None,
+                token_count: None,
+            });
+        let result = store
+            .record_goal_phase_model_result_at_path_with_claim(
+                &context.db_path,
+                "ws-token-pass",
+                &context.goal_id,
+                &context.phase_id,
+                &context.run_id,
+                &context.claim_token,
+                &context.agent,
+                token_finalizer_response("phase output is complete"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("pass finalizer");
+        assert!(result.memory_eligible);
+        assert_eq!(result.status.goal.status, "completed");
+        assert!(!store
+            .state
+            .sessions
+            .iter()
+            .flat_map(|session| session.memory_beads.iter())
+            .any(|bead| bead.kind == "goal-task-skill" && bead.source == overlay_source));
+        let connection = super::open_session_connection(&context.db_path).expect("check db");
+        let (phase_status, active_run_id, claim_token, claim_owner, claimed_at, lease_until): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        ) = connection
+            .query_row(
+                "SELECT status, active_run_id, claim_token, claim_owner, claimed_at, lease_until
+                 FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                super::params![&context.goal_id, &context.phase_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("phase state");
+        assert_eq!(phase_status, "completed");
+        assert!(active_run_id.is_none());
+        assert!(claim_token.is_none() && claim_owner.is_none());
+        assert!(claimed_at.is_none() && lease_until.is_none());
+        let run = super::query_runtime_run_sqlite(&context.db_path, &context.run_id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(run.state, "completed");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_messages WHERE session_id=?1 AND id LIKE 'msg-goal-%'",
+                    super::params![&context.agent.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("session messages"),
+            result.messages.len() as i64
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM chat_room_messages WHERE room_id='room-dispatch' AND id LIKE 'msg-goal-%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("room messages"),
+            result.messages.len() as i64
+        );
+        let runtime_events = super::query_runtime_run_events_sqlite(&context.db_path, &context.run_id, 0)
+            .expect("runtime events");
+        assert!(runtime_events.iter().any(|event| event.event_type == "run.completed"));
+        let goal = super::get_goal_sqlite(&context.db_path, "ws-token-pass", &context.goal_id)
+            .expect("goal");
+        assert!(goal
+            .recent_events
+            .iter()
+            .any(|event| event.event_type == "phase-completed"));
+        assert!(goal
+            .recent_events
+            .iter()
+            .any(|event| event.event_type == "goal-phase-verdict"
+                && event.payload["verdict"] == "pass"));
+        let public_json = serde_json::to_string(&result).expect("public response");
+        assert!(!public_json.contains("claim_token"));
+        assert!(!public_json.contains("claim_owner"));
+        assert!(!public_json.contains("lease_until"));
+        assert!(!public_json.contains("error_json"));
+    }
+
+    #[test]
+    fn goal_phase_token_finalizer_result_first_then_interrupt_is_already_finished() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, context) = token_finalizer_fixture(&temp, "ws-token-result-first");
+        store
+            .record_goal_phase_model_result_at_path_with_claim(
+                &context.db_path,
+                "ws-token-result-first",
+                &context.goal_id,
+                &context.phase_id,
+                &context.run_id,
+                &context.claim_token,
+                &context.agent,
+                token_finalizer_response("result committed before stop"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("pass finalizer");
+        let connection = super::open_session_connection(&context.db_path).expect("open db");
+        let before_interrupted: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1 AND event_type='run.interrupted'",
+                super::params![&context.run_id],
+                |row| row.get(0),
+            )
+            .expect("interrupted count");
+        let before_review: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1 AND event_type='run-interrupted-needs-review'",
+                super::params![&context.goal_id],
+                |row| row.get(0),
+            )
+            .expect("review count");
+        drop(connection);
+
+        let stop = super::interrupt_runtime_run_sqlite(
+            &context.db_path,
+            &context.run_id,
+            Some("late stop"),
+        )
+        .expect("interrupt completed run");
+        assert_eq!(stop.state, "completed");
+        assert_eq!(stop.outcome, "already_finished");
+        assert!(stop.idempotent);
+        let run = super::query_runtime_run_sqlite(&context.db_path, &context.run_id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(run.state, "completed");
+        let connection = super::open_session_connection(&context.db_path).expect("check db");
+        let after_interrupted: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1 AND event_type='run.interrupted'",
+                super::params![&context.run_id],
+                |row| row.get(0),
+            )
+            .expect("interrupted count");
+        let after_review: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1 AND event_type='run-interrupted-needs-review'",
+                super::params![&context.goal_id],
+                |row| row.get(0),
+            )
+            .expect("review count");
+        assert_eq!(after_interrupted, before_interrupted);
+        assert_eq!(after_review, before_review);
+    }
+
+    #[test]
+    fn goal_phase_token_finalizer_retry_fails_run_clears_claim_for_new_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, context) = token_finalizer_fixture(&temp, "ws-token-retry");
+        let result = store
+            .record_goal_phase_model_result_at_path_with_claim(
+                &context.db_path,
+                "ws-token-retry",
+                &context.goal_id,
+                &context.phase_id,
+                &context.run_id,
+                &context.claim_token,
+                &context.agent,
+                token_finalizer_response("build failed"),
+                Vec::new(),
+                vec!["cargo test failed".to_string()],
+            )
+            .expect("retry finalizer");
+        assert!(!result.memory_eligible);
+        let connection = super::open_session_connection(&context.db_path).expect("check db");
+        let (phase_status, retry_count, route_hint, active_run): (String, i64, Option<String>, Option<String>) =
+            connection
+                .query_row(
+                    "SELECT status, retry_count, route_hint, active_run_id FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                    super::params![&context.goal_id, &context.phase_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("phase retry state");
+        assert_eq!(phase_status, "running");
+        assert_eq!(retry_count, 1);
+        assert_eq!(route_hint.as_deref(), Some("implementer"));
+        assert!(active_run.is_none());
+        let run = super::query_runtime_run_sqlite(&context.db_path, &context.run_id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(run.state, "failed");
+        // running retry 已清 claim；下一次由 prepare（legacy no-claim 分支）创建新 run，
+        // 不能复用旧 token，也不能用只接受 pending 的 dispatch helper 代替。
+        let next_context = store
+            .prepare_goal_phase_run_context("ws-token-retry", &context.goal_id, &context.phase_id)
+            .expect("new run can prepare after retry");
+        assert_ne!(next_context.run_id, context.run_id);
+        assert_ne!(next_context.claim_token, context.claim_token);
+    }
+
+    #[test]
+    fn goal_phase_token_finalizer_blocked_replans_then_blocks_at_retry_limit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, context) =
+            token_finalizer_fixture_with_role(&temp, "ws-token-blocked", "implementer");
+        let connection = super::open_session_connection(&context.db_path).expect("open db");
+        connection
+            .execute(
+                "UPDATE goal_phases SET max_retries=1 WHERE goal_id=?1 AND id=?2",
+                super::params![&context.goal_id, &context.phase_id],
+            )
+            .expect("set retry limit");
+        drop(connection);
+
+        let first = store
+            .record_goal_phase_model_result_at_path_with_claim(
+                &context.db_path,
+                "ws-token-blocked",
+                &context.goal_id,
+                &context.phase_id,
+                &context.run_id,
+                &context.claim_token,
+                &context.agent,
+                token_finalizer_response("BLOCKED: plan cannot complete with the available artifact"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("first blocked finalizer");
+        assert!(!first.memory_eligible);
+        assert_eq!(first.status.goal.status, "paused");
+        let first_run = super::query_runtime_run_sqlite(&context.db_path, &context.run_id)
+            .expect("first run query")
+            .expect("first run");
+        assert_eq!(first_run.state, "failed");
+        let connection = super::open_session_connection(&context.db_path).expect("first state db");
+        let (phase_status, retry_count, route_hint, active_run):
+            (String, i64, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT status, retry_count, route_hint, active_run_id FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                super::params![&context.goal_id, &context.phase_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("first blocked state");
+        assert_eq!(phase_status, "pending");
+        assert_eq!(retry_count, 1);
+        assert_eq!(route_hint.as_deref(), Some("planner"));
+        assert!(active_run.is_none());
+        let first_goal = super::get_goal_sqlite(&context.db_path, "ws-token-blocked", &context.goal_id)
+            .expect("first goal");
+        assert!(first_goal
+            .recent_events
+            .iter()
+            .any(|event| event.event_type == "goal-phase-blocked-needs-replan"));
+
+        // 模拟用户恢复后由 planner route 重新 claim；这里仍走 token-aware finalizer，
+        // 覆盖第二次 blocked 超过上限后的 blocked/manual_reconcile 收敛。
+        super::resume_goal_sqlite(&context.db_path, "ws-token-blocked", &context.goal_id)
+            .expect("resume for replan");
+        let resumed_goal =
+            super::get_goal_sqlite(&context.db_path, "ws-token-blocked", &context.goal_id)
+                .expect("resumed goal");
+        let resumed_phase = resumed_goal
+            .phases
+            .iter()
+            .find(|phase| phase.id == context.phase_id)
+            .expect("resumed phase")
+            .clone();
+        let second_claim = super::claim_goal_phase_for_dispatch(
+            &context.db_path,
+            "ws-token-blocked",
+            &context.goal_id,
+            "room-dispatch",
+            &resumed_phase,
+            &context.agent.id,
+            "base",
+            "token-blocked-retry-test",
+            false,
+        )
+        .expect("second claim")
+        .expect("second claim wins");
+        let second_context = store
+            .prepare_goal_phase_run_context("ws-token-blocked", &context.goal_id, &context.phase_id)
+            .expect("second run starts");
+        assert_eq!(second_context.run_id, second_claim.run_id);
+        let second = store
+            .record_goal_phase_model_result_at_path_with_claim(
+                &second_context.db_path,
+                "ws-token-blocked",
+                &second_context.goal_id,
+                &second_context.phase_id,
+                &second_context.run_id,
+                &second_context.claim_token,
+                &second_context.agent,
+                token_finalizer_response("BLOCKED: still impossible after replanning"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("retry-limit blocked finalizer");
+        assert!(!second.memory_eligible);
+        assert_eq!(second.status.goal.status, "paused");
+        let connection = super::open_session_connection(&context.db_path).expect("second state db");
+        let (phase_status, retry_count, route_hint, active_run):
+            (String, i64, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT status, retry_count, route_hint, active_run_id FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                super::params![&context.goal_id, &context.phase_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("second blocked state");
+        assert_eq!(phase_status, "blocked");
+        assert_eq!(retry_count, 2);
+        assert_eq!(route_hint.as_deref(), Some("manual_reconcile"));
+        assert!(active_run.is_none());
+        let second_run = super::query_runtime_run_sqlite(&context.db_path, &second_context.run_id)
+            .expect("second run query")
+            .expect("second run");
+        assert_eq!(second_run.state, "failed");
+        let final_goal = super::get_goal_sqlite(&context.db_path, "ws-token-blocked", &context.goal_id)
+            .expect("final goal");
+        assert!(final_goal
+            .recent_events
+            .iter()
+            .any(|event| event.event_type == "goal-phase-blocked"));
+        assert!(final_goal
+            .recent_events
+            .iter()
+            .any(|event| event.event_type == "goal-phase-blocked-needs-replan"));
+    }
+
+    #[test]
+    fn goal_phase_token_finalizer_stale_token_has_zero_result_side_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, context) = token_finalizer_fixture(&temp, "ws-token-stale");
+        let connection = super::open_session_connection(&context.db_path).expect("open db");
+        let before_messages: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM chat_room_messages WHERE room_id='room-dispatch'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("message count");
+        let before_goal_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1",
+                super::params![&context.goal_id],
+                |row| row.get(0),
+            )
+            .expect("goal event count");
+        drop(connection);
+        let error = store
+            .record_goal_phase_model_result_at_path_with_claim(
+                &context.db_path,
+                "ws-token-stale",
+                &context.goal_id,
+                &context.phase_id,
+                &context.run_id,
+                "wrong-token",
+                &context.agent,
+                token_finalizer_response("must not persist"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("wrong token must be stale");
+        assert_eq!(error.0, super::StatusCode::CONFLICT);
+        let connection = super::open_session_connection(&context.db_path).expect("check db");
+        let after_messages: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM chat_room_messages WHERE room_id='room-dispatch'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("message count");
+        let after_goal_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1",
+                super::params![&context.goal_id],
+                |row| row.get(0),
+            )
+            .expect("goal event count");
+        assert_eq!(after_messages, before_messages);
+        assert_eq!(after_goal_events, before_goal_events);
+        let run = super::query_runtime_run_sqlite(&context.db_path, &context.run_id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(run.state, "running");
+    }
+
+    #[test]
+    fn goal_phase_legacy_result_entrypoint_rejects_active_claim() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, context) = token_finalizer_fixture(&temp, "ws-token-legacy-guard");
+        let error = store
+            .record_goal_phase_model_result(
+                "ws-token-legacy-guard",
+                &context.goal_id,
+                &context.phase_id,
+                &context.agent,
+                token_finalizer_response("legacy path must not bypass claim"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("legacy path must reject active claim");
+        assert_eq!(error.0, super::StatusCode::CONFLICT);
+        let run = super::query_runtime_run_sqlite(&context.db_path, &context.run_id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(run.state, "running");
+    }
+
+    #[test]
+    fn goal_phase_token_finalizer_stop_wins_without_result_message_or_verdict() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, context) = token_finalizer_fixture(&temp, "ws-token-stop");
+        let stop = super::interrupt_runtime_run_sqlite(
+            &context.db_path,
+            &context.run_id,
+            Some("user stop"),
+        )
+        .expect("stop request");
+        assert_eq!(stop.state, "stop_requested");
+        let result = store
+            .record_goal_phase_model_result_at_path_with_claim(
+                &context.db_path,
+                "ws-token-stop",
+                &context.goal_id,
+                &context.phase_id,
+                &context.run_id,
+                &context.claim_token,
+                &context.agent,
+                token_finalizer_response("late result must be ignored"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("stop finalizer");
+        assert!(result.messages.is_empty());
+        assert!(!result.memory_eligible);
+        assert_eq!(result.status.goal.status, "paused");
+        let connection = super::open_session_connection(&context.db_path).expect("check db");
+        let (phase_status, active_run, verdict): (String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT status, active_run_id, last_verdict FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                super::params![&context.goal_id, &context.phase_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("stop phase");
+        assert_eq!(phase_status, "pending");
+        assert!(active_run.is_none() && verdict.is_none());
+        let run = super::query_runtime_run_sqlite(&context.db_path, &context.run_id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(run.state, "interrupted");
+        let events = super::query_runtime_run_events_sqlite(&context.db_path, &context.run_id, 0)
+            .expect("runtime events");
+        assert_eq!(events.iter().filter(|event| event.event_type == "run.interrupted").count(), 1);
+        let goal = super::get_goal_sqlite(&context.db_path, "ws-token-stop", &context.goal_id)
+            .expect("goal");
+        assert!(goal
+            .recent_events
+            .iter()
+            .any(|event| event.event_type == "run-interrupted-needs-review"));
+    }
+
+    #[test]
+    fn goal_cancel_running_requests_stop_atomically_and_late_result_is_interrupted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, context) = token_finalizer_fixture(&temp, "ws-stop-cancel");
+        let goal = super::cancel_goal_sqlite(&context.db_path, "ws-stop-cancel", &context.goal_id)
+            .expect("cancel goal");
+        assert_eq!(goal.status, "cancelled");
+        let run = super::query_runtime_run_sqlite(&context.db_path, &context.run_id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(run.state, "stop_requested");
+        let stop_events = super::query_runtime_run_events_sqlite(&context.db_path, &context.run_id, 0)
+            .expect("runtime events")
+            .into_iter()
+            .filter(|event| event.event_type == "run.stop_requested")
+            .count();
+        assert_eq!(stop_events, 1);
+
+        let result = store
+            .record_goal_phase_model_result_at_path_with_claim(
+                &context.db_path,
+                "ws-stop-cancel",
+                &context.goal_id,
+                &context.phase_id,
+                &context.run_id,
+                &context.claim_token,
+                &context.agent,
+                token_finalizer_response("late cancel result must be ignored"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("late result should converge");
+        assert!(result.messages.is_empty());
+        assert!(!result.memory_eligible);
+        assert_eq!(result.status.goal.status, "cancelled");
+        let connection = super::open_session_connection(&context.db_path).expect("check db");
+        let (phase_status, active_run, verdict): (String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT status, active_run_id, last_verdict FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                super::params![&context.goal_id, &context.phase_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("phase state");
+        assert_eq!(phase_status, "cancelled");
+        assert!(active_run.is_none() && verdict.is_none());
+        let run = super::query_runtime_run_sqlite(&context.db_path, &context.run_id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(run.state, "interrupted");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM chat_room_messages WHERE room_id='room-dispatch' AND id LIKE 'msg-goal-%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("result messages"),
+            0
+        );
+    }
+
+    #[test]
+    fn goal_pause_running_requests_stop_and_late_result_needs_manual_reconcile() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, context) = token_finalizer_fixture(&temp, "ws-stop-pause");
+        let status = super::pause_goal_sqlite(&context.db_path, "ws-stop-pause", &context.goal_id)
+            .expect("pause goal");
+        assert_eq!(status.goal.status, "paused");
+        let run = super::query_runtime_run_sqlite(&context.db_path, &context.run_id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(run.state, "stop_requested");
+
+        let result = store
+            .record_goal_phase_model_result_at_path_with_claim(
+                &context.db_path,
+                "ws-stop-pause",
+                &context.goal_id,
+                &context.phase_id,
+                &context.run_id,
+                &context.claim_token,
+                &context.agent,
+                token_finalizer_response("late pause result must be ignored"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("late result should converge");
+        assert!(result.messages.is_empty());
+        assert_eq!(result.status.goal.status, "paused");
+        let connection = super::open_session_connection(&context.db_path).expect("check db");
+        let (phase_status, route_hint, active_run): (String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT status, route_hint, active_run_id FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                super::params![&context.goal_id, &context.phase_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("phase state");
+        assert_eq!(phase_status, "pending");
+        assert_eq!(route_hint.as_deref(), Some("manual_reconcile"));
+        assert!(active_run.is_none());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1 AND event_type='run.interrupted'",
+                    super::params![&context.run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("interrupted event count"),
+            1
+        );
+    }
+
+    #[test]
+    fn goal_prepare_converges_accepted_stop_before_model_and_clears_claim() {
+        for (cancel, expected_phase_status) in [(false, "pending"), (true, "cancelled")] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (store, goal) = goal_dispatch_fixture(
+                &temp,
+                if cancel { "ws-accepted-cancel" } else { "ws-accepted-pause" },
+                "accepted stop window",
+            );
+            let workspace_id = if cancel { "ws-accepted-cancel" } else { "ws-accepted-pause" };
+            let db = store.path.clone();
+            let phase = super::get_goal_sqlite(&db, workspace_id, &goal.id)
+                .expect("goal")
+                .phases
+                .into_iter()
+                .find(|phase| phase.id == "phase-one")
+                .expect("phase");
+            let target_session = phase.assigned_session_id.clone().expect("target session");
+            let claim = super::claim_goal_phase_for_dispatch(
+                &db,
+                workspace_id,
+                &goal.id,
+                "room-dispatch",
+                &phase,
+                &target_session,
+                "base",
+                "accepted-stop-test",
+                false,
+            )
+            .expect("claim")
+            .expect("claim wins");
+            if cancel {
+                super::cancel_goal_sqlite(&db, workspace_id, &goal.id).expect("cancel");
+            } else {
+                super::pause_goal_sqlite(&db, workspace_id, &goal.id).expect("pause");
+            }
+            let accepted_run = super::query_runtime_run_sqlite(&db, &claim.run_id)
+                .expect("run query")
+                .expect("run");
+            assert_eq!(accepted_run.state, "stop_requested");
+            assert!(accepted_run.started_at.is_none());
+
+            let error = store
+                .prepare_goal_phase_run_context(workspace_id, &goal.id, "phase-one")
+                .expect_err("accepted stop must not enter model");
+            assert_eq!(error.0, super::StatusCode::CONFLICT);
+            assert!(error.1.error.contains("no model call"));
+            let connection = super::open_session_connection(&db).expect("check db");
+            let (phase_state, active_run, token, owner, claimed_at, lease_until, route_hint):
+                (String, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<String>) = connection
+                .query_row(
+                    "SELECT status, active_run_id, claim_token, claim_owner, claimed_at, lease_until, route_hint
+                     FROM goal_phases WHERE goal_id=?1 AND id='phase-one'",
+                    super::params![&goal.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+                )
+                .expect("reconciled state");
+            let run_state = super::query_runtime_run_sqlite(&db, &claim.run_id)
+                .expect("run query")
+                .expect("run")
+                .state;
+            assert_eq!(run_state, "interrupted");
+            assert_eq!(phase_state, expected_phase_status);
+            assert!(active_run.is_none());
+            assert!(token.is_none() && owner.is_none() && claimed_at.is_none() && lease_until.is_none());
+            if !cancel {
+                assert_eq!(route_hint.as_deref(), Some("manual_reconcile"));
+            }
+            let events = super::query_runtime_run_events_sqlite(&db, &claim.run_id, 0)
+                .expect("runtime events");
+            assert_eq!(events.iter().filter(|event| event.event_type == "run.interrupted").count(), 1);
+            let goal = super::get_goal_sqlite(&db, workspace_id, &goal.id).expect("goal");
+            assert!(goal
+                .recent_events
+                .iter()
+                .any(|event| event.event_type == "run-interrupted-needs-review"));
+        }
+    }
+
+    #[test]
+    fn goal_loop_stop_is_durable_idempotent_and_workspace_scoped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (store, goal) = goal_dispatch_fixture(&temp, "ws-loop-stop", "loop stop");
+        let db = store.path.clone();
+        let phase = super::get_goal_sqlite(&db, "ws-loop-stop", &goal.id)
+            .expect("goal")
+            .phases
+            .into_iter()
+            .find(|phase| phase.id == "phase-one")
+            .expect("phase");
+        let target_session = phase.assigned_session_id.clone().expect("target session");
+        let claim = super::claim_goal_phase_for_dispatch(
+            &db,
+            "ws-loop-stop",
+            &goal.id,
+            "room-dispatch",
+            &phase,
+            &target_session,
+            "base",
+            "loop-stop-test",
+            false,
+        )
+        .expect("claim")
+        .expect("claim wins");
+        super::forget_goal_loop_status(&goal.id);
+        let (loop_status, cancel) = super::register_goal_loop_start("ws-loop-stop", &goal.id, 3);
+        assert!(loop_status.running);
+        let cancel = cancel.expect("loop cancellation flag");
+        assert_eq!(
+            super::request_goal_phase_stop_requests_sqlite(
+                &db,
+                "ws-loop-stop",
+                &goal.id,
+                Some("loop stop test"),
+            )
+            .expect("durable stop"),
+            1
+        );
+        let wrong_workspace = super::request_goal_loop_stop_scoped("ws-other", &goal.id);
+        assert!(!wrong_workspace.stop_requested);
+        assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
+        let right_workspace = super::request_goal_loop_stop_scoped("ws-loop-stop", &goal.id);
+        assert!(right_workspace.stop_requested);
+        assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            super::request_goal_phase_stop_requests_sqlite(
+                &db,
+                "ws-loop-stop",
+                &goal.id,
+                Some("repeat loop stop"),
+            )
+            .expect("repeat durable stop"),
+            0
+        );
+        let events = super::query_runtime_run_events_sqlite(&db, &claim.run_id, 0)
+            .expect("runtime events");
+        assert_eq!(events.iter().filter(|event| event.event_type == "run.stop_requested").count(), 1);
+        let connection = super::open_session_connection(&db).expect("check db");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_runs WHERE kind='goal_loop' AND goal_id=?1",
+                    super::params![&goal.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("goal loop rows"),
+            0
+        );
+        super::forget_goal_loop_status(&goal.id);
+    }
+
+    #[test]
+    fn direct_goal_run_interrupt_wakes_only_matching_loop_and_chat_path_survives() {
+        let _config_guard = config_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("web-sessions.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open db");
+        super::initialize_session_schema(&connection).expect("schema");
+
+        let mut goal_run = sample_runtime_run("run-direct-goal-interrupt", "running");
+        goal_run.kind = "goal_phase".to_string();
+        goal_run.workspace_id = "ws-direct-owner".to_string();
+        goal_run.goal_id = Some("goal-direct-interrupt".to_string());
+        goal_run.phase_id = Some("phase-direct".to_string());
+        super::insert_runtime_run_connection(&connection, &goal_run).expect("goal run");
+        drop(connection);
+
+        super::forget_goal_loop_status("goal-direct-interrupt");
+        let (_, wrong_workspace_cancel) =
+            super::register_goal_loop_start("ws-direct-other", "goal-direct-interrupt", 3);
+        let wrong_workspace_cancel = wrong_workspace_cancel.expect("wrong loop flag");
+        let response = super::interrupt_runtime_run_sqlite(
+            &db,
+            &goal_run.id,
+            Some("direct goal stop"),
+        )
+        .expect("goal interrupt");
+        super::signal_runtime_run_after_interrupt(&db, &response);
+        assert_eq!(response.state, "stop_requested");
+        assert!(!wrong_workspace_cancel.load(std::sync::atomic::Ordering::SeqCst));
+        let stored = super::query_runtime_run_sqlite(&db, &goal_run.id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(stored.state, "stop_requested");
+
+        super::forget_goal_loop_status("goal-direct-interrupt");
+        let (_, right_workspace_cancel) =
+            super::register_goal_loop_start("ws-direct-owner", "goal-direct-interrupt", 3);
+        let right_workspace_cancel = right_workspace_cancel.expect("right loop flag");
+        // 已经 stop_requested 的重复 interrupt 仍返回幂等 ACK，但必须能重新唤醒
+        // 正确 workspace 的同一 loop。
+        let response = super::interrupt_runtime_run_sqlite(
+            &db,
+            &goal_run.id,
+            Some("repeat direct goal stop"),
+        )
+        .expect("repeat goal interrupt");
+        super::signal_runtime_run_after_interrupt(&db, &response);
+        assert_eq!(response.state, "stop_requested");
+        assert!(response.idempotent);
+        assert!(right_workspace_cancel.load(std::sync::atomic::Ordering::SeqCst));
+
+        super::clear_chat_turn_registry_for_test();
+        super::forget_goal_loop_status("goal-chat-interrupt");
+        let (_, goal_cancel) =
+            super::register_goal_loop_start("ws-direct-owner", "goal-chat-interrupt", 3);
+        let goal_cancel = goal_cancel.expect("chat test goal loop flag");
+        let mut chat_run = sample_runtime_run("run-direct-chat-interrupt", "running");
+        chat_run.workspace_id = "ws-direct-owner".to_string();
+        super::insert_runtime_run_connection(
+            &super::open_session_connection(&db).expect("open chat db"),
+            &chat_run,
+        )
+        .expect("chat run");
+        let chat_cancel = super::register_chat_turn_with_run(
+            "turn-direct-chat-interrupt",
+            Some(chat_run.id.clone()),
+            Some("test-session".to_string()),
+            "test-room".to_string(),
+        );
+        let response = super::interrupt_runtime_run_sqlite(
+            &db,
+            &chat_run.id,
+            Some("chat stop"),
+        )
+        .expect("chat interrupt");
+        super::signal_runtime_run_after_interrupt(&db, &response);
+        assert_eq!(response.state, "stop_requested");
+        assert!(chat_cancel.is_requested());
+        assert!(!goal_cancel.load(std::sync::atomic::Ordering::SeqCst));
+        super::clear_chat_turn_registry_for_test();
+        super::forget_goal_loop_status("goal-direct-interrupt");
+        super::forget_goal_loop_status("goal-chat-interrupt");
+    }
+
+    #[test]
+    fn goal_prepare_wrong_session_stop_keeps_accepted_claim_for_reconcile() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (store, goal) = goal_dispatch_fixture(&temp, "ws-wrong-session", "wrong session");
+        let db = store.path.clone();
+        let fresh_goal = super::get_goal_sqlite(&db, "ws-wrong-session", &goal.id).expect("goal");
+        let phase = fresh_goal
+            .phases
+            .iter()
+            .find(|phase| phase.id == "phase-one")
+            .expect("phase")
+            .clone();
+        let target_session = phase.assigned_session_id.clone().expect("target session");
+        let claim = super::claim_goal_phase_for_dispatch(
+            &db,
+            "ws-wrong-session",
+            &goal.id,
+            "room-dispatch",
+            &phase,
+            &target_session,
+            "base",
+            "wrong-session-test",
+            false,
+        )
+        .expect("claim")
+        .expect("claim wins");
+        let connection = super::open_session_connection(&db).expect("open db");
+        connection
+            .execute(
+                "UPDATE runtime_runs SET session_id='wrong-session' WHERE id=?1",
+                super::params![&claim.run_id],
+            )
+            .expect("corrupt run session for scope test");
+        drop(connection);
+        super::pause_goal_sqlite(&db, "ws-wrong-session", &goal.id).expect("pause");
+        let error = store
+            .prepare_goal_phase_run_context("ws-wrong-session", &goal.id, "phase-one")
+            .expect_err("wrong session must not be reconciled");
+        assert_eq!(error.0, super::StatusCode::CONFLICT);
+        let run = super::query_runtime_run_sqlite(&db, &claim.run_id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(run.state, "stop_requested");
+        assert!(run.started_at.is_none());
+        let connection = super::open_session_connection(&db).expect("reopen");
+        let (phase_status, active_run, token, owner):
+            (String, Option<String>, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT status, active_run_id, claim_token, claim_owner FROM goal_phases WHERE goal_id=?1 AND id='phase-one'",
+                super::params![&goal.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("phase state");
+        assert_eq!(phase_status, "running");
+        assert_eq!(active_run.as_deref(), Some(claim.run_id.as_str()));
+        assert!(token.is_some() && owner.is_some());
+    }
+
+    #[test]
+    fn goal_stop_transaction_rolls_back_goal_and_run_when_event_append_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (store, context) = token_finalizer_fixture(&temp, "ws-stop-rollback");
+        let connection = super::open_session_connection(&context.db_path).expect("open db");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER deny_goal_stop_runtime_events
+                BEFORE INSERT ON runtime_run_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'blocked goal stop event');
+                END;
+                "#,
+            )
+            .expect("trigger");
+        drop(connection);
+
+        assert!(super::cancel_goal_sqlite(&context.db_path, "ws-stop-rollback", &context.goal_id).is_err());
+        let goal = super::get_goal_sqlite(&context.db_path, "ws-stop-rollback", &context.goal_id)
+            .expect("goal after rollback");
+        assert_eq!(goal.status, "running");
+        let run = super::query_runtime_run_sqlite(&context.db_path, &context.run_id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(run.state, "running");
+        let connection = super::open_session_connection(&context.db_path).expect("reopen");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1 AND event_type='run.stop_requested'",
+                    super::params![&context.run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("stop event count"),
+            0
+        );
+        let _ = store;
+    }
+
+    #[test]
+    fn goal_stop_events_and_responses_do_not_expose_claim_internals() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (store, goal) = goal_dispatch_fixture(&temp, "ws-stop-public", "public stop");
+        let db = store.path.clone();
+        let phase = super::get_goal_sqlite(&db, "ws-stop-public", &goal.id)
+            .expect("goal")
+            .phases
+            .into_iter()
+            .find(|phase| phase.id == "phase-one")
+            .expect("phase");
+        let target_session = phase.assigned_session_id.clone().expect("target session");
+        let claim = super::claim_goal_phase_for_dispatch(
+            &db,
+            "ws-stop-public",
+            &goal.id,
+            "room-dispatch",
+            &phase,
+            &target_session,
+            "base",
+            "public-stop-test",
+            false,
+        )
+        .expect("claim")
+        .expect("claim wins");
+        super::request_goal_phase_stop_requests_sqlite(&db, "ws-stop-public", &goal.id, Some("public stop"))
+            .expect("stop");
+        let events = super::query_runtime_run_events_sqlite(&db, &claim.run_id, 0)
+            .expect("events");
+        let encoded = serde_json::to_string(&events).expect("serialize events");
+        for forbidden in ["claim_token", "claim_owner", "lease_until", "error_json"] {
+            assert!(!encoded.contains(forbidden), "stop event leaked {forbidden}");
+        }
+        let status = super::runtime_run_status_from_record(
+            &super::query_runtime_run_sqlite(&db, &claim.run_id)
+                .expect("run query")
+                .expect("run"),
+        );
+        let encoded = serde_json::to_string(&status).expect("serialize status");
+        for forbidden in ["claim_token", "claim_owner", "lease_until", "error_json"] {
+            assert!(!encoded.contains(forbidden), "run status leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn goal_phase_token_finalizer_stop_first_completed_goal_reconciles_phase() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, context) = token_finalizer_fixture(&temp, "ws-token-stop-completed");
+        let connection = super::open_session_connection(&context.db_path).expect("open db");
+        connection
+            .execute(
+                "UPDATE goals SET status='completed' WHERE workspace_id=?1 AND id=?2",
+                super::params!["ws-token-stop-completed", &context.goal_id],
+            )
+            .expect("pre-set completed goal");
+        let before_messages: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM chat_room_messages WHERE room_id='room-dispatch'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("message count");
+        let before_memory: i64 = connection
+            .query_row("SELECT COUNT(*) FROM memory_beads", [], |row| row.get(0))
+            .expect("memory count");
+        drop(connection);
+
+        let stop = super::interrupt_runtime_run_sqlite(
+            &context.db_path,
+            &context.run_id,
+            Some("completed goal stop reconciliation"),
+        )
+        .expect("stop request");
+        assert_eq!(stop.state, "stop_requested");
+        let result = store
+            .record_goal_phase_model_result_at_path_with_claim(
+                &context.db_path,
+                "ws-token-stop-completed",
+                &context.goal_id,
+                &context.phase_id,
+                &context.run_id,
+                &context.claim_token,
+                &context.agent,
+                token_finalizer_response("late result must not complete reconciled phase"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("completed-goal stop finalizer");
+        assert!(result.messages.is_empty());
+        assert!(!result.memory_eligible);
+        assert_eq!(result.status.goal.status, "completed");
+
+        let connection = super::open_session_connection(&context.db_path).expect("check db");
+        let (phase_status, active_run, claim_token, claim_owner, claimed_at, lease_until, route_hint, verdict):
+            (String, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>) =
+            connection
+                .query_row(
+                    "SELECT status, active_run_id, claim_token, claim_owner, claimed_at, lease_until, route_hint, last_verdict
+                     FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                    super::params![&context.goal_id, &context.phase_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+                )
+                .expect("reconciled phase state");
+        assert_eq!(phase_status, "pending");
+        assert!(active_run.is_none());
+        assert!(claim_token.is_none() && claim_owner.is_none());
+        assert!(claimed_at.is_none() && lease_until.is_none());
+        assert_eq!(route_hint.as_deref(), Some("manual_reconcile"));
+        assert!(verdict.is_none());
+        let run = super::query_runtime_run_sqlite(&context.db_path, &context.run_id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(run.state, "interrupted");
+        let goal = super::get_goal_sqlite(
+            &context.db_path,
+            "ws-token-stop-completed",
+            &context.goal_id,
+        )
+        .expect("goal");
+        assert_eq!(goal.status, "completed");
+        assert!(!goal
+            .recent_events
+            .iter()
+            .any(|event| matches!(event.event_type.as_str(), "goal-phase-verdict" | "phase-completed")));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1 AND event_type='run.completed'",
+                    super::params![&context.run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("completed runtime events"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM chat_room_messages WHERE room_id='room-dispatch'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("message count"),
+            before_messages
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM memory_beads", [], |row| row.get::<_, i64>(0))
+                .expect("memory count"),
+            before_memory
+        );
+    }
+
+    #[test]
+    fn goal_phase_token_finalizer_path_drift_cleans_only_captured_db() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut old_store, context) = token_finalizer_fixture(&temp, "ws-token-drift");
+        let old_db = context.db_path.clone();
+        let new_db = temp.path().join("new-workspace.sqlite3");
+        old_store.path = new_db.clone();
+        let error = old_store
+            .record_goal_phase_model_result_at_path_with_claim(
+                &old_db,
+                "ws-token-drift",
+                &context.goal_id,
+                &context.phase_id,
+                &context.run_id,
+                &context.claim_token,
+                &context.agent,
+                token_finalizer_response("drifted result"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("path drift must reject result");
+        assert_eq!(error.0, super::StatusCode::CONFLICT);
+        assert!(!new_db.exists());
+        let connection = super::open_session_connection(&old_db).expect("old db");
+        let (run_state, phase_status, active_run, verdict): (String, String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT r.state, p.status, p.active_run_id, p.last_verdict
+                 FROM runtime_runs r JOIN goal_phases p ON p.goal_id=?2 AND p.id=?3
+                 WHERE r.id=?1",
+                super::params![&context.run_id, &context.goal_id, &context.phase_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("captured cleanup");
+        assert_eq!(run_state, "interrupted");
+        assert_eq!(phase_status, "pending");
+        assert!(active_run.is_none() && verdict.is_none());
+    }
+
+    #[test]
+    fn goal_phase_token_finalizer_path_drift_wrong_token_has_zero_side_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut old_store, context) = token_finalizer_fixture(&temp, "ws-token-drift-wrong");
+        let old_db = context.db_path.clone();
+        let new_db = temp.path().join("new-workspace-wrong-token.sqlite3");
+        let connection = super::open_session_connection(&old_db).expect("open old db");
+        let before_messages: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM chat_room_messages WHERE room_id='room-dispatch'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("message count");
+        let before_goal_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1",
+                super::params![&context.goal_id],
+                |row| row.get(0),
+            )
+            .expect("goal event count");
+        let before_runtime_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1",
+                super::params![&context.run_id],
+                |row| row.get(0),
+            )
+            .expect("runtime event count");
+        drop(connection);
+        old_store.path = new_db.clone();
+        let error = old_store
+            .record_goal_phase_model_result_at_path_with_claim(
+                &old_db,
+                "ws-token-drift-wrong",
+                &context.goal_id,
+                &context.phase_id,
+                &context.run_id,
+                "wrong-token",
+                &context.agent,
+                token_finalizer_response("must not clean with another token"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("wrong token path drift must remain stale");
+        assert_eq!(error.0, super::StatusCode::CONFLICT);
+        assert!(!new_db.exists());
+        let connection = super::open_session_connection(&old_db).expect("check old db");
+        let (run_state, phase_status, active_run, claim_token):
+            (String, String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT r.state, p.status, p.active_run_id, p.claim_token
+                 FROM runtime_runs r JOIN goal_phases p ON p.goal_id=?2 AND p.id=?3
+                 WHERE r.id=?1",
+                super::params![&context.run_id, &context.goal_id, &context.phase_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("unchanged ownership state");
+        assert_eq!(run_state, "running");
+        assert_eq!(phase_status, "running");
+        assert_eq!(active_run.as_deref(), Some(context.run_id.as_str()));
+        assert_eq!(claim_token.as_deref(), Some(context.claim_token.as_str()));
+        let after_messages: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM chat_room_messages WHERE room_id='room-dispatch'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("message count");
+        let after_goal_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1",
+                super::params![&context.goal_id],
+                |row| row.get(0),
+            )
+            .expect("goal event count");
+        let after_runtime_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1",
+                super::params![&context.run_id],
+                |row| row.get(0),
+            )
+            .expect("runtime event count");
+        assert_eq!(after_messages, before_messages);
+        assert_eq!(after_goal_events, before_goal_events);
+        assert_eq!(after_runtime_events, before_runtime_events);
+    }
+
+    #[test]
+    fn goal_phase_token_finalizer_transaction_failure_rolls_back_all_result_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, context) = token_finalizer_fixture(&temp, "ws-token-rollback");
+        let connection = super::open_session_connection(&context.db_path).expect("open db");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_token_finalizer_goal_event BEFORE INSERT ON goal_events
+                 BEGIN SELECT RAISE(ABORT, 'injected goal event failure'); END;",
+            )
+            .expect("install fault");
+        drop(connection);
+        let error = store
+            .record_goal_phase_model_result_at_path_with_claim(
+                &context.db_path,
+                "ws-token-rollback",
+                &context.goal_id,
+                &context.phase_id,
+                &context.run_id,
+                &context.claim_token,
+                &context.agent,
+                token_finalizer_response("rollback me"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("event fault must fail result");
+        assert_eq!(error.0, super::StatusCode::INTERNAL_SERVER_ERROR);
+        let connection = super::open_session_connection(&context.db_path).expect("check db");
+        let (phase_status, active_run, verdict, run_state): (String, Option<String>, Option<String>, String) = connection
+            .query_row(
+                "SELECT p.status, p.active_run_id, p.last_verdict, r.state
+                 FROM goal_phases p JOIN runtime_runs r ON r.id=?1
+                 WHERE p.goal_id=?2 AND p.id=?3",
+                super::params![&context.run_id, &context.goal_id, &context.phase_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("rollback state");
+        assert_eq!(phase_status, "running");
+        assert_eq!(active_run.as_deref(), Some(context.run_id.as_str()));
+        assert!(verdict.is_none());
+        assert_eq!(run_state, "running");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM chat_room_messages WHERE room_id='room-dispatch' AND id LIKE 'msg-goal-%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("no partial room message"),
+            0
+        );
+    }
+
+    #[test]
+    fn goal_phase_execution_claim_starts_existing_accepted_run_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (store, goal) = goal_dispatch_fixture(&temp, "ws-execution-accepted", "Execution claim");
+        let db = store.path.clone();
+        let phase = super::get_goal_sqlite(&db, "ws-execution-accepted", &goal.id)
+            .expect("fresh goal")
+            .phases
+            .into_iter()
+            .find(|phase| phase.id == "phase-one")
+            .expect("phase");
+        let claim = super::claim_goal_phase_for_dispatch(
+            &db,
+            "ws-execution-accepted",
+            &goal.id,
+            "room-dispatch",
+            &phase,
+            "goal-planner",
+            "base",
+            "execution-test",
+            false,
+        )
+        .expect("dispatch claim")
+        .expect("claim wins");
+
+        let context = store
+            .prepare_goal_phase_run_context("ws-execution-accepted", &goal.id, "phase-one")
+            .expect("accepted run can be taken over");
+        assert_eq!(context.run_id, claim.run_id);
+        assert_eq!(context.claim_token, claim.claim_token);
+        assert_eq!(context.db_path, db);
+        let connection = super::open_session_connection(&context.db_path).expect("open db");
+        let (run_state, started_at): (String, Option<i64>) = connection
+            .query_row(
+                "SELECT state, started_at FROM runtime_runs WHERE id=?1",
+                rusqlite::params![&claim.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("started run");
+        assert_eq!(run_state, "running");
+        assert!(started_at.is_some());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT current_iteration FROM goals WHERE workspace_id=?1 AND id=?2",
+                    rusqlite::params!["ws-execution-accepted", &goal.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("reserved iteration"),
+            1
+        );
+        for (event_type, expected) in [("run.accepted", 1_i64), ("run.started", 1_i64)] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1 AND event_type=?2",
+                        rusqlite::params![&claim.run_id, event_type],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("runtime event count"),
+                expected,
+                "unexpected {event_type} count"
+            );
+        }
+
+        let second = store
+            .prepare_goal_phase_run_context("ws-execution-accepted", &goal.id, "phase-one")
+            .expect_err("second execution must not call the model");
+        assert_eq!(second.0, super::StatusCode::CONFLICT);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT current_iteration FROM goals WHERE workspace_id=?1 AND id=?2",
+                    rusqlite::params!["ws-execution-accepted", &goal.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("iteration unchanged"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1 AND event_type='run.started'",
+                    rusqlite::params![&claim.run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("started event unchanged"),
+            1
+        );
+
+        let phase_json = serde_json::to_string(
+            &super::get_goal_sqlite(&db, "ws-execution-accepted", &goal.id)
+                .expect("public goal")
+                .phases[0],
+        )
+        .expect("phase json");
+        assert!(phase_json.contains(&claim.run_id));
+        assert!(!phase_json.contains(&claim.claim_token));
+        assert!(!phase_json.contains("claim_owner"));
+    }
+
+    #[test]
+    fn goal_phase_execution_rejects_missing_chat_room_before_persisting_claim() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut store, goal) = goal_dispatch_fixture(&temp, "ws-execution-room", "Missing room");
+        let db = store.path.clone();
+        let connection = super::open_session_connection(&db).expect("open db");
+        connection
+            .execute(
+                "UPDATE goals SET status='running', current_iteration=0 WHERE workspace_id=?1 AND id=?2",
+                rusqlite::params!["ws-execution-room", &goal.id],
+            )
+            .expect("mark goal running");
+        connection
+            .execute(
+                "UPDATE goal_phases SET status='running' WHERE goal_id=?1 AND id='phase-one'",
+                rusqlite::params![&goal.id],
+            )
+            .expect("mark phase running");
+        drop(connection);
+        store.state.chat_rooms.clear();
+        let error = store
+            .prepare_goal_phase_run_context("ws-execution-room", &goal.id, "phase-one")
+            .expect_err("missing room must fail closed");
+        assert_eq!(error.0, super::StatusCode::NOT_FOUND);
+
+        let connection = super::open_session_connection(&db).expect("reopen db");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_runs WHERE goal_id=?1 AND phase_id='phase-one'",
+                    rusqlite::params![&goal.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("no run persisted"),
+            0
+        );
+        let (current_iteration, active_run_id): (i64, Option<String>) = connection
+            .query_row(
+                "SELECT g.current_iteration, p.active_run_id FROM goals g JOIN goal_phases p ON p.goal_id=g.id WHERE g.id=?1 AND p.id='phase-one'",
+                rusqlite::params![&goal.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("state unchanged");
+        assert_eq!(current_iteration, 0);
+        assert!(active_run_id.is_none());
+    }
+
+    #[test]
+    fn goal_phase_execution_legacy_running_claim_is_unique_and_reserves_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (store, goal) = goal_dispatch_fixture(&temp, "ws-execution-legacy", "Legacy execution");
+        let db = store.path.clone();
+        let connection = super::open_session_connection(&db).expect("open db");
+        connection
+            .execute(
+                "UPDATE goals SET status='running', current_iteration=0 WHERE workspace_id=?1 AND id=?2",
+                rusqlite::params!["ws-execution-legacy", &goal.id],
+            )
+            .expect("mark goal running");
+        connection
+            .execute(
+                "UPDATE goal_phases SET status='running', active_run_id=NULL, claim_token=NULL, claim_owner=NULL, claimed_at=NULL, lease_until=NULL WHERE goal_id=?1 AND id='phase-one'",
+                rusqlite::params![&goal.id],
+            )
+            .expect("mark legacy phase running");
+        drop(connection);
+
+        let shared = std::sync::Arc::new(store);
+        let first_store = std::sync::Arc::clone(&shared);
+        let second_store = std::sync::Arc::clone(&shared);
+        let goal_id = goal.id.clone();
+        let first_goal_id = goal_id.clone();
+        let second_goal_id = goal_id.clone();
+        let first = std::thread::spawn(move || {
+            first_store.prepare_goal_phase_run_context(
+                "ws-execution-legacy",
+                &first_goal_id,
+                "phase-one",
+            )
+        });
+        let second = std::thread::spawn(move || {
+            second_store.prepare_goal_phase_run_context(
+                "ws-execution-legacy",
+                &second_goal_id,
+                "phase-one",
+            )
+        });
+        let first_result = first.join().expect("first execution thread");
+        let second_result = second.join().expect("second execution thread");
+        let successes = [&first_result, &second_result]
+            .into_iter()
+            .filter(|result| result.is_ok())
+            .count();
+        assert_eq!(successes, 1);
+        let conflicts = [&first_result, &second_result]
+            .into_iter()
+            .filter_map(|result| result.as_ref().err())
+            .filter(|error| error.0 == super::StatusCode::CONFLICT)
+            .count();
+        assert_eq!(conflicts, 1);
+
+        let connection = super::open_session_connection(&db).expect("check db");
+        let (run_count, accepted_count, started_count, current_iteration): (i64, i64, i64, i64) =
+            connection
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM runtime_runs WHERE goal_id=?1 AND phase_id='phase-one'),
+                         (SELECT COUNT(*) FROM runtime_run_events WHERE event_type='run.accepted' AND run_id IN (SELECT id FROM runtime_runs WHERE goal_id=?1 AND phase_id='phase-one')),
+                         (SELECT COUNT(*) FROM runtime_run_events WHERE event_type='run.started' AND run_id IN (SELECT id FROM runtime_runs WHERE goal_id=?1 AND phase_id='phase-one')),
+                         (SELECT current_iteration FROM goals WHERE workspace_id=?2 AND id=?1)",
+                    rusqlite::params![&goal_id, "ws-execution-legacy"],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("execution counts");
+        assert_eq!(run_count, 1);
+        assert_eq!(accepted_count, 1);
+        assert_eq!(started_count, 1);
+        assert_eq!(current_iteration, 1);
+        let (phase_status, active_run_id): (String, Option<String>) = connection
+            .query_row(
+                "SELECT status, active_run_id FROM goal_phases WHERE goal_id=?1 AND id='phase-one'",
+                rusqlite::params![&goal_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("claimed phase");
+        assert_eq!(phase_status, "running");
+        assert!(active_run_id.is_some());
+    }
+
+    #[test]
+    fn goal_phase_execution_legacy_budget_rolls_back_run_and_pauses_goal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (store, goal) = goal_dispatch_fixture(&temp, "ws-execution-legacy-budget", "Legacy budget");
+        let db = store.path.clone();
+        let connection = super::open_session_connection(&db).expect("open db");
+        connection
+            .execute(
+                "UPDATE goals SET status='running', current_iteration=max_iterations WHERE workspace_id=?1 AND id=?2",
+                rusqlite::params!["ws-execution-legacy-budget", &goal.id],
+            )
+            .expect("exhaust budget");
+        connection
+            .execute(
+                "UPDATE goal_phases SET status='running', active_run_id=NULL, claim_token=NULL, claim_owner=NULL, claimed_at=NULL, lease_until=NULL WHERE goal_id=?1 AND id='phase-one'",
+                rusqlite::params![&goal.id],
+            )
+            .expect("mark legacy phase running");
+        drop(connection);
+
+        let error = store
+            .prepare_goal_phase_run_context(
+                "ws-execution-legacy-budget",
+                &goal.id,
+                "phase-one",
+            )
+            .expect_err("budget must fail before model");
+        assert_eq!(error.0, super::StatusCode::BAD_REQUEST);
+        let connection = super::open_session_connection(&db).expect("check db");
+        let (goal_status, current_iteration, phase_status, active_run_id, claim_token, owner, claimed_at, lease_until): (
+            String,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        ) = connection
+            .query_row(
+                "SELECT g.status, g.current_iteration, p.status, p.active_run_id, p.claim_token, p.claim_owner, p.claimed_at, p.lease_until
+                 FROM goals g JOIN goal_phases p ON p.goal_id=g.id
+                 WHERE g.workspace_id=?1 AND g.id=?2 AND p.id='phase-one'",
+                rusqlite::params!["ws-execution-legacy-budget", &goal.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+            )
+            .expect("legacy budget state");
+        assert_eq!(goal_status, "paused");
+        assert_eq!(current_iteration, 3);
+        assert_eq!(phase_status, "running");
+        assert!(active_run_id.is_none() && claim_token.is_none() && owner.is_none());
+        assert!(claimed_at.is_none() && lease_until.is_none());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_runs WHERE goal_id=?1 AND phase_id='phase-one'",
+                    rusqlite::params![&goal.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("no half-written legacy run"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1 AND event_type='goal-iteration-budget-exhausted'",
+                    rusqlite::params![&goal.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("budget event"),
+            1
+        );
+    }
+
+    #[test]
+    fn goal_phase_execution_accepted_budget_failure_terminalizes_matching_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (store, goal) = goal_dispatch_fixture(&temp, "ws-execution-accepted-budget", "Accepted budget");
+        let db = store.path.clone();
+        let phase = super::get_goal_sqlite(&db, "ws-execution-accepted-budget", &goal.id)
+            .expect("fresh goal")
+            .phases
+            .into_iter()
+            .find(|phase| phase.id == "phase-one")
+            .expect("phase");
+        let claim = super::claim_goal_phase_for_dispatch(
+            &db,
+            "ws-execution-accepted-budget",
+            &goal.id,
+            "room-dispatch",
+            &phase,
+            "goal-planner",
+            "base",
+            "execution-budget-test",
+            false,
+        )
+        .expect("dispatch claim")
+        .expect("claim wins");
+        let connection = super::open_session_connection(&db).expect("open db");
+        connection
+            .execute(
+                "UPDATE goals SET current_iteration=max_iterations WHERE workspace_id=?1 AND id=?2",
+                rusqlite::params!["ws-execution-accepted-budget", &goal.id],
+            )
+            .expect("exhaust budget after accepted claim");
+        drop(connection);
+
+        let error = store
+            .prepare_goal_phase_run_context(
+                "ws-execution-accepted-budget",
+                &goal.id,
+                "phase-one",
+            )
+            .expect_err("accepted budget must fail before model");
+        assert_eq!(error.0, super::StatusCode::BAD_REQUEST);
+        let connection = super::open_session_connection(&db).expect("check db");
+        let (run_state, phase_status, active_run_id, claim_token, claim_owner, current_iteration, goal_status): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            String,
+        ) = connection
+            .query_row(
+                "SELECT r.state, p.status, p.active_run_id, p.claim_token, p.claim_owner, g.current_iteration, g.status
+                 FROM runtime_runs r JOIN goal_phases p ON p.goal_id=r.goal_id AND p.id=r.phase_id
+                 JOIN goals g ON g.id=r.goal_id
+                 WHERE r.id=?1",
+                rusqlite::params![&claim.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .expect("accepted budget state");
+        assert_eq!(run_state, "failed");
+        assert_eq!(phase_status, "pending");
+        assert!(active_run_id.is_none() && claim_token.is_none() && claim_owner.is_none());
+        assert_eq!(current_iteration, 3);
+        assert_eq!(goal_status, "paused");
+        for (event_type, expected) in [
+            ("run.accepted", 1_i64),
+            ("run.started", 0_i64),
+            ("run.failed", 1_i64),
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1 AND event_type=?2",
+                        rusqlite::params![&claim.run_id, event_type],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("budget runtime event"),
+                expected,
+                "unexpected {event_type} count"
+            );
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1 AND event_type='goal-iteration-budget-exhausted'",
+                    rusqlite::params![&goal.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("budget goal event"),
+            1
+        );
+    }
+
+    #[test]
+    fn goal_phase_execution_result_guard_rejects_workspace_db_path_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_db = temp.path().join("old-workspace.sqlite3");
+        let new_db = temp.path().join("new-workspace.sqlite3");
+        let mut store = super::SessionStore {
+            path: old_db.clone(),
+            legacy_json_path: temp.path().join("sessions.json"),
+            capacity: super::SessionStoreCapacity::default(),
+            state: super::PersistedSessionState::default(),
+        };
+        let agent = super::seed_session().to_agent_session(true);
+        let error = store
+            .record_goal_phase_model_result_at_path(
+                &new_db,
+                "workspace-drift",
+                "goal-drift",
+                "phase-drift",
+                &agent,
+                super::AgentModelResponse {
+                    answer_text: "must not write".to_string(),
+                    reasoning_text: String::new(),
+                    tool_requests: Vec::new(),
+                    tool_write_executed: false,
+                    model_tool_calls_executed: false,
+                    turn_id: "turn-drift".to_string(),
+                    used_real_model: false,
+                    diagnostic_note: None,
+                    context_footer: None,
+                    context_usage: None,
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("path drift must fail closed");
+        assert_eq!(error.0, super::StatusCode::CONFLICT);
+        assert!(!old_db.exists());
+        assert!(!new_db.exists());
+    }
+
+    #[test]
+    fn goal_phase_execution_entrypoints_use_captured_db_path_and_result_guard() {
+        let source = WEB_MAIN_RS;
+        for (function, next_function) in [
+            ("async fn api_run_goal_phase(", "async fn api_run_next_goal_phase"),
+            ("async fn api_run_next_goal_phase(", "async fn api_run_all_goal_phases"),
+            ("async fn api_run_all_goal_phases(", "async fn run_goal_loop_background"),
+            ("async fn run_goal_loop_background(", "async fn run_goal_phase_once"),
+        ] {
+            let start = source
+                .find(function)
+                .unwrap_or_else(|| panic!("missing {function}"));
+            let rest = &source[start..];
+            let body = rest
+                .split_once(next_function)
+                .map(|(body, _)| body)
+                .unwrap_or(rest);
+            assert!(body.contains("run_goal_phase_once"), "{function} must pass a path");
+            assert!(body.contains("&db_path"), "{function} must use captured db path");
+        }
+        for (function, next_function) in [
+            ("async fn api_goal_loop_start(", "async fn api_goal_loop_stop"),
+            ("fn clawbot_continue_task(", "fn clawbot_stop_task"),
+        ] {
+            let start = source
+                .find(function)
+                .unwrap_or_else(|| panic!("missing {function}"));
+            let rest = &source[start..];
+            let body = rest
+                .split_once(next_function)
+                .map(|(body, _)| body)
+                .unwrap_or(rest);
+            assert!(body.contains("default_session_sqlite_path()"));
+            assert!(body.contains("run_goal_loop_background"));
+            assert!(body.contains("db_path"), "{function} must forward db path");
+        }
+        let background_start = source
+            .find("async fn run_goal_loop_background(")
+            .expect("background loop entrypoint");
+        let background_rest = &source[background_start..];
+        let background_body = background_rest
+            .split_once("\nasync fn run_goal_phase_once")
+            .map(|(body, _)| body)
+            .expect("background loop boundary");
+        assert!(!background_body.contains("default_session_sqlite_path()"));
+        let start = source
+            .find("async fn run_goal_phase_once(")
+            .expect("run phase entrypoint");
+        let rest = &source[start..];
+        let body = rest
+            .split_once("\nasync fn api_attachment_index")
+            .map(|(body, _)| body)
+            .expect("run phase boundary");
+        assert!(body.contains("run_context.db_path"));
+        assert!(body.contains("record_goal_phase_model_result_at_path"));
+        assert!(!body.contains("store.path.clone()"));
+    }
+
+    #[test]
+    fn migration_v20_adds_goal_phase_claim_columns_idempotently_without_losing_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("goal-claim-migration.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        connection
+            .execute(
+                "INSERT INTO goals(\
+                    id, workspace_id, chat_room_id, title, status, max_iterations,\
+                    current_iteration, background, originating_user_msg_id,\
+                    completion_condition_json, plan_json, created_at, updated_at, cancelled_at\
+                ) VALUES ('g1', 'ws', 'room', 'old goal', 'running', 5, 1, 0, NULL, '{}', NULL, 10, 20, NULL)",
+                [],
+            )
+            .expect("goal");
+        connection
+            .execute(
+                "INSERT INTO goal_phases(\
+                    id, goal_id, title, assigned_role, status, depends_on_json,\
+                    skills_json, output_artifacts_json, verification_json, created_at, updated_at\
+                ) VALUES ('p1', 'g1', 'old phase', 'planner', 'pending', '[]', '[]', '[]', NULL, 11, 12)",
+                [],
+            )
+            .expect("phase");
+        let run = sample_runtime_run("run-v20-preserved", "accepted");
+        super::insert_runtime_run_connection(&connection, &run).expect("runtime run");
+        let tx = connection.unchecked_transaction().expect("event tx");
+        super::append_runtime_run_event_deferred(
+            &tx,
+            &run.id,
+            "run.accepted",
+            json!({"source":"v20-test"}),
+        )
+        .expect("runtime event");
+        tx.commit().expect("event commit");
+        connection
+            .execute_batch(
+                "DROP INDEX idx_goal_phases_active_run; PRAGMA user_version = 19;",
+            )
+            .expect("simulate interrupted v20");
+
+        super::initialize_session_schema(&connection).expect("repair v20");
+        super::initialize_session_schema(&connection).expect("idempotent v20");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 20);
+        let columns: Vec<String> = connection
+            .prepare("PRAGMA table_info(goal_phases)")
+            .expect("columns")
+            .query_map([], |row| row.get(1))
+            .expect("column rows")
+            .filter_map(Result::ok)
+            .collect();
+        for (column, _) in super::GOAL_PHASE_CLAIM_COLUMNS {
+            assert!(columns.contains(&(*column).to_string()), "missing {column}");
+        }
+        let index_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_goal_phases_active_run'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("claim index");
+        assert_eq!(index_count, 1);
+        let (title, status, active_run): (String, String, Option<String>) = connection
+            .query_row(
+                "SELECT title, status, active_run_id FROM goal_phases WHERE goal_id='g1' AND id='p1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("preserved phase");
+        assert_eq!((title, status, active_run), ("old phase".to_string(), "pending".to_string(), None));
+        assert!(super::query_runtime_run_sqlite(&db, &run.id)
+            .expect("query preserved run")
+            .is_some());
+        assert_eq!(
+            super::query_runtime_run_events_sqlite(&db, &run.id, 0)
+                .expect("query preserved event")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn goal_phase_dispatch_claim_cas_creates_one_run_claim_and_event() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("goal-claim-cas.sqlite3");
+        let phase = seed_pending_goal_phase(&db, "ws-cas", "g-cas", "room-cas", "p-cas");
+        // 两个独立调用模拟并发 dispatch；Immediate + phase 条件 CAS 只允许一个成功。
+        let db_a = db.clone();
+        let db_b = db.clone();
+        let phase_a = phase.clone();
+        let phase_b = phase.clone();
+        let first = std::thread::spawn(move || {
+            super::claim_goal_phase_for_dispatch(
+                &db_a,
+                "ws-cas",
+                "g-cas",
+                "room-cas",
+                &phase_a,
+                "goal-implementer",
+                "commander",
+                "handoff",
+                true,
+            )
+        });
+        let second = std::thread::spawn(move || {
+            super::claim_goal_phase_for_dispatch(
+                &db_b,
+                "ws-cas",
+                "g-cas",
+                "room-cas",
+                &phase_b,
+                "goal-implementer",
+                "commander",
+                "handoff",
+                true,
+            )
+        });
+        let claims = [
+            first
+                .join()
+                .expect("first claim thread")
+                .expect("first claim result"),
+            second
+                .join()
+                .expect("second claim thread")
+                .expect("second claim result"),
+        ];
+        assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+        let claim = claims
+            .iter()
+            .find_map(|claim| claim.as_ref())
+            .expect("one winning claim");
+        let connection = super::open_session_connection(&db).expect("check db");
+        let (status, active_run_id, token, owner): (String, Option<String>, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT status, active_run_id, claim_token, claim_owner FROM goal_phases WHERE goal_id='g-cas' AND id='p-cas'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("claimed phase");
+        assert_eq!(status, "running");
+        let goal_status: String = connection
+            .query_row(
+                "SELECT status FROM goals WHERE workspace_id='ws-cas' AND id='g-cas'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("claimed goal");
+        assert_eq!(goal_status, "running");
+        assert_eq!(active_run_id.as_deref(), Some(claim.run_id.as_str()));
+        assert_eq!(token.as_deref(), Some(claim.claim_token.as_str()));
+        assert!(owner.is_some());
+        let run_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_runs WHERE kind='goal_phase' AND goal_id='g-cas' AND phase_id='p-cas'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("run count");
+        let accepted_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE event_type='run.accepted' AND run_id=?1",
+                rusqlite::params![claim.run_id],
+                |row| row.get(0),
+            )
+            .expect("accepted count");
+        let dispatch_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE goal_id='g-cas' AND event_type='goal-phase-dispatched'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("dispatch count");
+        let handoff_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM chat_handoffs", [], |row| row.get(0))
+            .expect("handoff count");
+        assert_eq!(run_count, 1);
+        assert_eq!(accepted_count, 1);
+        assert_eq!(dispatch_count, 1);
+        assert_eq!(handoff_count, 0);
+        let payload: String = connection
+            .query_row(
+                "SELECT payload_json FROM goal_events WHERE goal_id='g-cas' AND event_type='goal-phase-dispatched'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("dispatch payload");
+        assert!(payload.contains(&claim.run_id));
+        assert!(!payload.contains("claim_token"));
+        assert!(!payload.contains("claim_owner"));
+    }
+
+    #[test]
+    fn goal_phase_dispatch_failure_rolls_back_matching_claim_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("goal-claim-failure.sqlite3");
+        let phase = seed_pending_goal_phase(&db, "ws-failure", "g-failure", "room-failure", "p-failure");
+        let claim = super::claim_goal_phase_for_dispatch(
+            &db,
+            "ws-failure",
+            "g-failure",
+            "room-failure",
+            &phase,
+            "goal-implementer",
+            "commander",
+            "self-role",
+            false,
+        )
+        .expect("claim")
+        .expect("claim wins");
+        super::fail_goal_phase_dispatch(&claim, "controlled rejection").expect("rollback claim");
+        let connection = super::open_session_connection(&db).expect("check db");
+        let (run_state, phase_state, active, token, owner, claimed_at, lease_until): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        ) = connection
+            .query_row(
+                "SELECT r.state, p.status, p.active_run_id, p.claim_token, p.claim_owner, p.claimed_at, p.lease_until \
+                 FROM runtime_runs r JOIN goal_phases p ON p.goal_id=?2 AND p.id=?3 \
+                 WHERE r.id=?1",
+                rusqlite::params![claim.run_id, claim.goal_id, claim.phase_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .expect("failed claim rows");
+        assert_eq!(run_state, "failed");
+        assert_eq!(phase_state, "pending");
+        assert!(active.is_none() && token.is_none() && owner.is_none());
+        assert!(claimed_at.is_none() && lease_until.is_none());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1 AND event_type='run.failed'",
+                    rusqlite::params![claim.run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("failed event count"),
+            1
+        );
+
+        let fresh_phase = super::get_goal_sqlite(&db, "ws-failure", "g-failure")
+            .expect("fresh goal")
+            .phases
+            .into_iter()
+            .find(|phase| phase.id == "p-failure")
+            .expect("fresh phase");
+        let retry_claim = super::claim_goal_phase_for_dispatch(
+            &db,
+            "ws-failure",
+            "g-failure",
+            "room-failure",
+            &fresh_phase,
+            "goal-implementer",
+            "commander",
+            "self-role",
+            false,
+        )
+        .expect("retry claim")
+        .expect("retry claim wins");
+        let forged = super::GoalPhaseClaim {
+            run_id: retry_claim.run_id.clone(),
+            claim_token: "wrong-token".to_string(),
+            claim_owner: retry_claim.claim_owner.clone(),
+            db_path: db.clone(),
+            goal_id: retry_claim.goal_id.clone(),
+            phase_id: retry_claim.phase_id.clone(),
+        };
+        assert!(super::fail_goal_phase_dispatch(&forged, "forged failure").is_err());
+        let (active_after_forged, state_after_forged): (Option<String>, String) = connection
+            .query_row(
+                "SELECT active_run_id, status FROM goal_phases WHERE goal_id='g-failure' AND id='p-failure'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("preserved other claim");
+        assert_eq!(active_after_forged.as_deref(), Some(retry_claim.run_id.as_str()));
+        assert_eq!(state_after_forged, "running");
+    }
+
+    #[test]
+    fn goal_phase_active_claim_is_publicly_additive_and_blocks_mutations() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("goal-claim-protection.sqlite3");
+        let phase = seed_pending_goal_phase(&db, "ws-protect", "g-protect", "room-protect", "p-protect");
+        let claim = super::claim_goal_phase_for_dispatch(
+            &db,
+            "ws-protect",
+            "g-protect",
+            "room-protect",
+            &phase,
+            "goal-implementer",
+            "commander",
+            "self-role",
+            false,
+        )
+        .expect("claim")
+        .expect("claim wins");
+        let goal = super::get_goal_sqlite(&db, "ws-protect", "g-protect").expect("goal");
+        let phase_json = serde_json::to_string(&goal.phases[0]).expect("phase json");
+        assert!(phase_json.contains(&claim.run_id));
+        assert!(!phase_json.contains("claim_token"));
+        assert!(!phase_json.contains("claim_owner"));
+        assert!(!phase_json.contains("lease_until"));
+
+        let plan_error = super::set_goal_plan_sqlite(
+            &db,
+            "ws-protect",
+            "g-protect",
+            super::GoalPlanRequest {
+                phases: vec![super::GoalPlanPhaseRequest {
+                    id: "p-protect".to_string(),
+                    title: "replacement".to_string(),
+                    assigned_role: Some("implementer".to_string()),
+                    depends_on: Vec::new(),
+                    skills_required: Vec::new(),
+                    output_artifacts: Vec::new(),
+                    verification: Some(json!({"type":"UserConfirm"})),
+                    requires_human_ack: false,
+                }],
+            },
+        )
+        .expect_err("active claim must block re-plan");
+        assert_eq!(plan_error.0, super::StatusCode::CONFLICT);
+        let resume_from_error = super::resume_goal_from_phase_sqlite(
+            &db,
+            "ws-protect",
+            "g-protect",
+            "p-protect",
+        )
+        .expect_err("active claim must block resume-from");
+        assert_eq!(resume_from_error.0, super::StatusCode::CONFLICT);
+        let connection = super::open_session_connection(&db).expect("open");
+        connection
+            .execute(
+                "UPDATE goals SET status='paused' WHERE id='g-protect'",
+                [],
+            )
+            .expect("pause goal");
+        let resume_error = super::resume_goal_sqlite(&db, "ws-protect", "g-protect")
+            .expect_err("active claim must block resume");
+        assert_eq!(resume_error.0, super::StatusCode::CONFLICT);
+        let mut store = super::SessionStore {
+            path: db.clone(),
+            legacy_json_path: tmp.path().join("sessions.json"),
+            capacity: super::SessionStoreCapacity::default(),
+            state: super::PersistedSessionState::default(),
+        };
+        let complete_error = store
+            .complete_goal_phase(
+                "ws-protect",
+                "g-protect",
+                "p-protect",
+                super::GoalPhaseCompleteRequest {
+                    evidence: None,
+                    verdict: None,
+                },
+            )
+            .expect_err("active claim must block manual complete");
+        assert_eq!(complete_error.0, super::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn resume_running_goal_with_active_claim_returns_conflict_without_mutation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("resume-running-claim.sqlite3");
+        let phase = seed_pending_goal_phase(
+            &db,
+            "ws-resume-running-claim",
+            "g-resume-running-claim",
+            "room-resume-running-claim",
+            "p-resume-running-claim",
+        );
+        let claim = super::claim_goal_phase_for_dispatch(
+            &db,
+            "ws-resume-running-claim",
+            "g-resume-running-claim",
+            "room-resume-running-claim",
+            &phase,
+            "goal-implementer",
+            "commander",
+            "resume-test",
+            false,
+        )
+        .expect("claim")
+        .expect("claim wins");
+        let connection = super::open_session_connection(&db).expect("open");
+        let before_runs: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_runs WHERE goal_id=?1 AND phase_id=?2",
+                rusqlite::params!["g-resume-running-claim", "p-resume-running-claim"],
+                |row| row.get(0),
+            )
+            .expect("runtime run count");
+        let before_run_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1",
+                rusqlite::params![&claim.run_id],
+                |row| row.get(0),
+            )
+            .expect("runtime event count");
+        let before_goal_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1",
+                rusqlite::params!["g-resume-running-claim"],
+                |row| row.get(0),
+            )
+            .expect("goal event count");
+        let before_handoffs: i64 = connection
+            .query_row("SELECT COUNT(*) FROM chat_handoffs", [], |row| row.get(0))
+            .expect("handoff count");
+        drop(connection);
+
+        let error = super::resume_goal_sqlite(
+            &db,
+            "ws-resume-running-claim",
+            "g-resume-running-claim",
+        )
+        .expect_err("running goal with active claim must conflict");
+        assert_eq!(error.0, super::StatusCode::CONFLICT);
+
+        let connection = super::open_session_connection(&db).expect("reopen");
+        let (goal_status, phase_status, active_run_id): (String, String, Option<String>) =
+            connection
+                .query_row(
+                    "SELECT g.status, p.status, p.active_run_id \
+                     FROM goals g JOIN goal_phases p ON p.goal_id=g.id \
+                     WHERE g.id=?1 AND p.id=?2",
+                    rusqlite::params!["g-resume-running-claim", "p-resume-running-claim"],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("goal phase state");
+        assert_eq!(goal_status, "running");
+        assert_eq!(phase_status, "running");
+        assert_eq!(active_run_id.as_deref(), Some(claim.run_id.as_str()));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_runs WHERE goal_id=?1 AND phase_id=?2",
+                    rusqlite::params!["g-resume-running-claim", "p-resume-running-claim"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("runtime run count after"),
+            before_runs
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1",
+                    rusqlite::params![&claim.run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("runtime event count after"),
+            before_run_events
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1",
+                    rusqlite::params!["g-resume-running-claim"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("goal event count after"),
+            before_goal_events
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM chat_handoffs", [], |row| row.get::<_, i64>(0))
+                .expect("handoff count after"),
+            before_handoffs
+        );
+    }
+
+    #[test]
+    fn resume_running_goal_without_claim_remains_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("resume-running-no-claim.sqlite3");
+        seed_pending_goal_phase(
+            &db,
+            "ws-resume-running-no-claim",
+            "g-resume-running-no-claim",
+            "room-resume-running-no-claim",
+            "p-resume-running-no-claim",
+        );
+        let connection = super::open_session_connection(&db).expect("open");
+        connection
+            .execute(
+                "UPDATE goals SET status='running' WHERE workspace_id=?1 AND id=?2",
+                rusqlite::params!["ws-resume-running-no-claim", "g-resume-running-no-claim"],
+            )
+            .expect("mark running");
+        let before_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1",
+                rusqlite::params!["g-resume-running-no-claim"],
+                |row| row.get(0),
+            )
+            .expect("event count");
+        drop(connection);
+
+        let status = super::resume_goal_sqlite(
+            &db,
+            "ws-resume-running-no-claim",
+            "g-resume-running-no-claim",
+        )
+        .expect("running goal without claim keeps idempotent success");
+        assert_eq!(status.goal.status, "running");
+        let connection = super::open_session_connection(&db).expect("reopen");
+        let after_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1",
+                rusqlite::params!["g-resume-running-no-claim"],
+                |row| row.get(0),
+            )
+            .expect("event count after");
+        assert_eq!(after_events, before_events);
+    }
+
+    #[test]
+    fn resume_paused_goal_with_active_claim_returns_conflict() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("resume-paused-claim.sqlite3");
+        let phase = seed_pending_goal_phase(
+            &db,
+            "ws-resume-paused-claim",
+            "g-resume-paused-claim",
+            "room-resume-paused-claim",
+            "p-resume-paused-claim",
+        );
+        let claim = super::claim_goal_phase_for_dispatch(
+            &db,
+            "ws-resume-paused-claim",
+            "g-resume-paused-claim",
+            "room-resume-paused-claim",
+            &phase,
+            "goal-implementer",
+            "commander",
+            "resume-test",
+            false,
+        )
+        .expect("claim")
+        .expect("claim wins");
+        let connection = super::open_session_connection(&db).expect("open");
+        connection
+            .execute(
+                "UPDATE goals SET status='paused' WHERE workspace_id=?1 AND id=?2",
+                rusqlite::params!["ws-resume-paused-claim", "g-resume-paused-claim"],
+            )
+            .expect("pause goal");
+        drop(connection);
+
+        let error = super::resume_goal_sqlite(
+            &db,
+            "ws-resume-paused-claim",
+            "g-resume-paused-claim",
+        )
+        .expect_err("paused goal with active claim must conflict");
+        assert_eq!(error.0, super::StatusCode::CONFLICT);
+        let connection = super::open_session_connection(&db).expect("reopen");
+        let (goal_status, active_run_id): (String, Option<String>) = connection
+            .query_row(
+                "SELECT g.status, p.active_run_id \
+                 FROM goals g JOIN goal_phases p ON p.goal_id=g.id \
+                 WHERE g.id=?1 AND p.id=?2",
+                rusqlite::params!["g-resume-paused-claim", "p-resume-paused-claim"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("state after conflict");
+        assert_eq!(goal_status, "paused");
+        assert_eq!(active_run_id.as_deref(), Some(claim.run_id.as_str()));
+    }
+
+    #[test]
+    fn resume_paused_goal_without_claim_updates_status_and_event() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("resume-paused-no-claim.sqlite3");
+        seed_pending_goal_phase(
+            &db,
+            "ws-resume-paused-no-claim",
+            "g-resume-paused-no-claim",
+            "room-resume-paused-no-claim",
+            "p-resume-paused-no-claim",
+        );
+        let connection = super::open_session_connection(&db).expect("open");
+        connection
+            .execute(
+                "UPDATE goals SET status='paused' WHERE workspace_id=?1 AND id=?2",
+                rusqlite::params!["ws-resume-paused-no-claim", "g-resume-paused-no-claim"],
+            )
+            .expect("pause goal");
+        drop(connection);
+
+        let status = super::resume_goal_sqlite(
+            &db,
+            "ws-resume-paused-no-claim",
+            "g-resume-paused-no-claim",
+        )
+        .expect("paused goal without claim resumes");
+        assert_eq!(status.goal.status, "planning");
+        assert_eq!(
+            status
+                .latest_event
+                .as_ref()
+                .map(|event| event.event_type.as_str()),
+            Some("goal-resumed")
+        );
+        let connection = super::open_session_connection(&db).expect("reopen");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1 AND event_type='goal-resumed'",
+                    rusqlite::params!["g-resume-paused-no-claim"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("resume event count"),
+            1
+        );
+    }
+
+    #[test]
+    fn goal_phase_claim_rechecks_goal_and_phase_versions_inside_transaction() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("goal-claim-race.sqlite3");
+        let phase = seed_pending_goal_phase(&db, "ws-race", "g-race", "room-race", "p-race");
+        let connection = super::open_session_connection(&db).expect("open");
+        connection
+            .execute(
+                "UPDATE goals SET status='cancelled' WHERE workspace_id='ws-race' AND id='g-race'",
+                [],
+            )
+            .expect("cancel goal");
+        assert!(super::claim_goal_phase_for_dispatch(
+            &db,
+            "ws-race",
+            "g-race",
+            "room-race",
+            &phase,
+            "goal-implementer",
+            "commander",
+            "handoff",
+            true,
+        )
+        .expect("cancelled goal claim")
+        .is_none());
+
+        connection
+            .execute(
+                "UPDATE goals SET status='planning' WHERE workspace_id='ws-race' AND id='g-race'",
+                [],
+            )
+            .expect("restore planning");
+        connection
+            .execute(
+                "UPDATE goal_phases SET assigned_role='planner', updated_at=2 WHERE goal_id='g-race' AND id='p-race'",
+                [],
+            )
+            .expect("replace phase version");
+        assert!(super::claim_goal_phase_for_dispatch(
+            &db,
+            "ws-race",
+            "g-race",
+            "room-race",
+            &phase,
+            "goal-implementer",
+            "commander",
+            "handoff",
+            true,
+        )
+        .expect("replaced phase claim")
+        .is_none());
+
+        let run_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_runs WHERE goal_id='g-race' AND phase_id='p-race'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("run count");
+        let dispatch_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE goal_id='g-race' AND event_type='goal-phase-dispatched'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("dispatch event count");
+        let handoff_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM chat_handoffs", [], |row| row.get(0))
+            .expect("handoff count");
+        assert_eq!(run_count, 0);
+        assert_eq!(dispatch_count, 0);
+        assert_eq!(handoff_count, 0);
+    }
+
+    #[test]
+    fn goal_phase_rejected_handoff_removes_only_exact_overlay_before_failing_claim() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("goal-dispatch.sqlite3");
+        let (mut store, goal) = goal_dispatch_fixture(&temp, "ws-rejected", "Rejected dispatch");
+        let second = goal
+            .phases
+            .iter()
+            .find(|phase| phase.id == "phase-two")
+            .expect("second phase")
+            .clone();
+        store
+            .install_goal_task_skill_overlay(
+                "goal-planner",
+                &goal,
+                &second,
+                "second",
+                "none",
+                "UserConfirm",
+            )
+            .expect("second overlay");
+        let now = super::unix_timestamp_millis();
+        super::insert_chat_handoff_sqlite(
+            &db,
+            &super::ChatHandoffRecord {
+                id: "existing-cycle".to_string(),
+                chat_room_id: "room-dispatch".to_string(),
+                from_agent_id: "base".to_string(),
+                to_agent_id: "goal-planner".to_string(),
+                intent: "already delivered".to_string(),
+                intent_hash: super::handoff_intent_hash("already delivered"),
+                attach: "none".to_string(),
+                attach_message_ids: Vec::new(),
+                originating_user_msg_id: "origin-1".to_string(),
+                depth: 0,
+                status: "delivered".to_string(),
+                rejected_reason: None,
+                contract: None,
+                created_at: now,
+                delivered_at: Some(now),
+                completed_at: None,
+            },
+        )
+        .expect("existing cycle handoff");
+
+        let result = store
+            .dispatch_ready_goal_phases("ws-rejected", &goal.id)
+            .expect("dispatch rejection should be reported");
+        assert!(result.dispatched.is_empty());
+        assert!(result
+            .skipped
+            .iter()
+            .any(|item| item.phase_id == "phase-one" && item.action == "handoff_rejected"));
+        let refreshed = super::get_goal_sqlite(&db, "ws-rejected", &goal.id).expect("goal");
+        assert_eq!(refreshed.status, "running");
+        let first_refreshed = refreshed
+            .phases
+            .iter()
+            .find(|phase| phase.id == "phase-one")
+            .expect("first refreshed phase");
+        assert_eq!(first_refreshed.status, "pending");
+        assert!(first_refreshed.active_run_id.is_none());
+        let failed_runs: i64 = super::open_session_connection(&db)
+            .expect("open")
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_runs WHERE goal_id=?1 AND phase_id='phase-one' AND state='failed'",
+                super::params![&goal.id],
+                |row| row.get(0),
+            )
+            .expect("failed run count");
+        assert_eq!(failed_runs, 1);
+        let planner = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == "goal-planner")
+            .expect("planner");
+        assert!(!planner
+            .memory_beads
+            .iter()
+            .any(|bead| bead.id == super::goal_task_skill_memory_id(&goal.id, "phase-one")));
+        assert!(planner
+            .memory_beads
+            .iter()
+            .any(|bead| bead.id == super::goal_task_skill_memory_id(&goal.id, "phase-two")));
+    }
+
+    #[test]
+    fn goal_phase_handoff_insert_error_keeps_inbound_claim_in_doubt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("goal-dispatch.sqlite3");
+        let (mut store, goal) = goal_dispatch_fixture(&temp, "ws-in-doubt", "In doubt dispatch");
+        let connection = super::open_session_connection(&db).expect("open");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_goal_handoff BEFORE INSERT ON chat_handoffs
+                 WHEN NEW.id LIKE 'handoff-%' BEGIN
+                   SELECT RAISE(ABORT, 'injected handoff insert failure');
+                 END;",
+            )
+            .expect("install handoff fault");
+        drop(connection);
+
+        let error = store
+            .dispatch_ready_goal_phases("ws-in-doubt", &goal.id)
+            .expect_err("handoff insert fault");
+        assert_eq!(error.0, super::StatusCode::INTERNAL_SERVER_ERROR);
+        let refreshed = super::get_goal_sqlite(&db, "ws-in-doubt", &goal.id).expect("goal");
+        let phase = refreshed
+            .phases
+            .iter()
+            .find(|phase| phase.id == "phase-one")
+            .expect("phase");
+        assert_eq!(phase.status, "running");
+        let run_id = phase.active_run_id.clone().expect("in-doubt run claim");
+        let run = super::query_runtime_run_sqlite(&db, &run_id)
+            .expect("run query")
+            .expect("run");
+        assert_eq!(run.state, "accepted");
+        assert!(run
+            .error_json
+            .as_deref()
+            .unwrap_or_default()
+            .contains("partially persisted"));
+        let events = super::query_runtime_run_events_sqlite(&db, &run_id, 0).expect("events");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "run.dispatch_in_doubt"));
+        let connection = super::open_session_connection(&db).expect("check db");
+        let inbound_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM chat_room_messages WHERE room_id='room-dispatch' AND kind='handoff-inbound'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inbound count");
+        let handoff_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM chat_handoffs", [], |row| row.get(0))
+            .expect("handoff count");
+        assert_eq!(inbound_count, 1);
+        assert_eq!(handoff_count, 0);
+
+        // active claim 阻止重派，即使再次调用 dispatch 也不能制造第二个执行指令。
+        let _ = store
+            .dispatch_ready_goal_phases("ws-in-doubt", &goal.id)
+            .expect("in-doubt dispatch is safely skipped");
+        let handoff_count_after_retry: i64 = connection
+            .query_row("SELECT COUNT(*) FROM chat_handoffs", [], |row| row.get(0))
+            .expect("retry handoff count");
+        assert_eq!(handoff_count_after_retry, 0);
+    }
+
+    #[test]
+    fn goal_phase_retry_context_save_failure_keeps_claim_in_doubt_without_re_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("goal-retry-in-doubt.sqlite3");
+        let phase = seed_pending_goal_phase(
+            &db,
+            "ws-retry-in-doubt",
+            "g-retry-in-doubt",
+            "room-retry-in-doubt",
+            "p-retry-in-doubt",
+        );
+        let claim = super::claim_goal_phase_for_dispatch(
+            &db,
+            "ws-retry-in-doubt",
+            "g-retry-in-doubt",
+            "room-retry-in-doubt",
+            &phase,
+            "goal-implementer",
+            "commander",
+            "self-role",
+            false,
+        )
+        .expect("claim")
+        .expect("claim wins");
+        let mut store = super::SessionStore {
+            path: db.clone(),
+            // SQLite save completes, while the legacy JSON write deterministically fails on a
+            // directory. This injects the one-save failure after both in-memory destinations.
+            legacy_json_path: temp.path().to_path_buf(),
+            capacity: super::SessionStoreCapacity::default(),
+            state: super::PersistedSessionState {
+                sessions: vec![super::seed_session()],
+                active_session_id: None,
+                active_vision_session_id: None,
+                chat_rooms: vec![super::PersistedChatRoom {
+                    id: "room-retry-in-doubt".to_string(),
+                    name: "Retry room".to_string(),
+                    created_at: 1,
+                    updated_at: 1,
+                    messages: Vec::new(),
+                }],
+                active_chat_room_id: Some("room-retry-in-doubt".to_string()),
+            },
+        };
+        store.state.sessions[0].id = "goal-implementer".to_string();
+        store.state.sessions[0].messages.clear();
+        let message = super::ChatMessageDto {
+            id: "retry-message".to_string(),
+            author: "Goal commander".to_string(),
+            role: "assistant".to_string(),
+            target: "Goal phase".to_string(),
+            content: "retry context".to_string(),
+            kind: "task-summary".to_string(),
+            attachments: Vec::new(),
+        };
+        let append_error = store
+            .append_goal_phase_retry_context("room-retry-in-doubt", "goal-implementer", message)
+            .expect_err("legacy JSON directory must fail after SQLite save");
+        super::mark_goal_phase_dispatch_in_doubt(&claim, "retry context atomic append failed")
+            .expect("keep in-doubt claim");
+        assert_eq!(append_error.0, super::StatusCode::INTERNAL_SERVER_ERROR);
+        let connection = super::open_session_connection(&db).expect("check db");
+        let (phase_status, active_run_id): (String, Option<String>) = connection
+            .query_row(
+                "SELECT status, active_run_id FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                super::params![&claim.goal_id, &claim.phase_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("claim remains");
+        assert_eq!(phase_status, "running");
+        assert_eq!(active_run_id.as_deref(), Some(claim.run_id.as_str()));
+        let run_state: String = connection
+            .query_row(
+                "SELECT state FROM runtime_runs WHERE id=?1",
+                super::params![&claim.run_id],
+                |row| row.get(0),
+            )
+            .expect("run");
+        assert_eq!(run_state, "accepted");
+        let in_doubt_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE run_id=?1 AND event_type='run.dispatch_in_doubt'",
+                super::params![&claim.run_id],
+                |row| row.get(0),
+            )
+            .expect("in-doubt event");
+        assert_eq!(in_doubt_events, 1);
+        let room_messages: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM chat_room_messages WHERE room_id='room-retry-in-doubt' AND id='retry-message'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("room message");
+        let session_messages: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE session_id='goal-implementer' AND id='retry-message'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("session message");
+        assert_eq!(room_messages, 1);
+        assert_eq!(session_messages, 1);
+    }
+
     #[test]
     fn migration_v13_adds_goal_phase_routing_columns() {
-        // GL-01：全新库初始化后应停在 v13，且 6 个回退路由列都在。
+        // GL-01：全新库初始化后应至少包含 v13 的 6 个回退路由列。
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = tmp.path().join("goal-routing.sqlite3");
         let connection = super::open_session_connection(&db).expect("open");
@@ -57515,7 +67676,7 @@ attach: last_assistant
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 15);
+        assert_eq!(version, 20);
 
         let columns: Vec<String> = connection
             .prepare("PRAGMA table_info(goal_phases)")
@@ -57639,7 +67800,1046 @@ attach: last_assistant
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 15);
+        assert_eq!(version, 20);
+    }
+
+    #[test]
+    fn runtime_run_v19_schema_is_complete_repairable_and_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("runtime-runs.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 20);
+
+        let object_names: Vec<String> = connection
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name IN \
+                 ('runtime_runs','runtime_run_events','idx_runtime_runs_legacy_turn',\
+                  'idx_runtime_runs_active_goal_phase','idx_runtime_runs_active_goal_loop',\
+                  'idx_runtime_runs_scope_created','idx_runtime_run_events_run_id')\n                 ORDER BY name",
+            )
+            .expect("objects pragma")
+            .query_map([], |row| row.get(0))
+            .expect("objects query")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            object_names,
+            vec![
+                "idx_runtime_run_events_run_id",
+                "idx_runtime_runs_active_goal_loop",
+                "idx_runtime_runs_active_goal_phase",
+                "idx_runtime_runs_legacy_turn",
+                "idx_runtime_runs_scope_created",
+                "runtime_run_events",
+                "runtime_runs",
+            ]
+        );
+
+        let run = sample_runtime_run("run-idempotent", "accepted");
+        super::insert_runtime_run_connection(&connection, &run).expect("insert run");
+        let transaction = connection
+            .unchecked_transaction()
+            .expect("transaction");
+        let event = super::append_runtime_run_event_deferred(
+            &transaction,
+            &run.id,
+            "run.accepted",
+            json!({"source":"test"}),
+        )
+        .expect("insert event");
+        transaction.commit().expect("commit event");
+        assert!(event.id > 0);
+
+        // 连续初始化不能删除既有 run/event 行。
+        super::initialize_session_schema(&connection).expect("second schema");
+        let run_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_runs", [], |row| row.get(0))
+            .expect("run count");
+        let event_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_run_events", [], |row| row.get(0))
+            .expect("event count");
+        assert_eq!(run_count, 1);
+        assert_eq!(event_count, 1);
+
+        // 模拟 user_version 已推进但 v19 表/索引尚未落盘的中断库；业务行必须保留。
+        let repair_db = tmp.path().join("runtime-runs-repair.sqlite3");
+        let repair = super::open_session_connection(&repair_db).expect("repair open");
+        super::initialize_session_schema(&repair).expect("repair initial schema");
+        repair
+            .execute(
+                "INSERT INTO sessions(id,name,provider,model,api_key_ref,created_at,updated_at) \
+                 VALUES ('s1','session','test','model','ref',1,1)",
+                [],
+            )
+            .expect("business row");
+        repair
+            .execute_batch(
+                "DROP TABLE runtime_run_events; DROP TABLE runtime_runs; PRAGMA user_version = 15;",
+            )
+            .expect("simulate interrupted v19");
+        super::initialize_session_schema(&repair).expect("repair schema");
+        let repaired_version: i64 = repair
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("repaired version");
+        let session_count: i64 = repair
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .expect("session count");
+        assert_eq!(repaired_version, 20);
+        assert_eq!(session_count, 1);
+        assert!(repair
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE name='runtime_run_events'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn runtime_run_events_are_append_only_and_after_cursor_is_ascending() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("runtime-events.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        let run = sample_runtime_run("run-events", "running");
+        super::insert_runtime_run_connection(&connection, &run).expect("run");
+
+        let transaction = connection
+            .unchecked_transaction()
+            .expect("transaction");
+        let first = super::append_runtime_run_event_deferred(
+            &transaction,
+            &run.id,
+            "run.started",
+            json!({"step":1}),
+        )
+        .expect("first event");
+        let second = super::append_runtime_run_event_deferred(
+            &transaction,
+            &run.id,
+            "run.completed",
+            json!({"step":2}),
+        )
+        .expect("second event");
+        transaction.commit().expect("commit");
+
+        assert!(second.id > first.id);
+        let all = super::query_runtime_run_events_sqlite(&db, &run.id, 0).expect("all events");
+        assert_eq!(all.iter().map(|event| event.id).collect::<Vec<_>>(), vec![first.id, second.id]);
+        let after_first =
+            super::query_runtime_run_events_sqlite(&db, &run.id, first.id).expect("after");
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_first[0].id, second.id);
+        assert_eq!(after_first[0].payload["step"], json!(2));
+    }
+
+    #[test]
+    fn runtime_run_interrupt_cas_is_idempotent_and_preserves_terminal_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("runtime-interrupt.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        let accepted = sample_runtime_run("run-interrupt", "accepted");
+        super::insert_runtime_run_connection(&connection, &accepted).expect("accepted");
+        let completed = sample_runtime_run("run-completed", "completed");
+        super::insert_runtime_run_connection(&connection, &completed).expect("completed");
+        drop(connection);
+
+        let first = super::interrupt_runtime_run_sqlite(&db, &accepted.id, Some("  user stop  "))
+            .expect("first interrupt");
+        assert_eq!(first.state, "stop_requested");
+        assert_eq!(first.outcome, "interrupt_requested");
+        assert!(!first.idempotent);
+
+        let second = super::interrupt_runtime_run_sqlite(&db, &accepted.id, Some("ignored"))
+            .expect("second interrupt");
+        assert_eq!(second.state, "stop_requested");
+        assert_eq!(second.outcome, "interrupt_requested");
+        assert!(second.idempotent);
+
+        let terminal = super::interrupt_runtime_run_sqlite(&db, &completed.id, Some("overwrite"))
+            .expect("terminal interrupt");
+        assert_eq!(terminal.state, "completed");
+        assert_eq!(terminal.outcome, "already_finished");
+        assert!(terminal.idempotent);
+
+        let check = super::open_session_connection(&db).expect("reopen");
+        let (state, reason): (String, Option<String>) = check
+            .query_row(
+                "SELECT state, stop_reason FROM runtime_runs WHERE id='run-interrupt'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("interrupt row");
+        assert_eq!(state, "stop_requested");
+        assert_eq!(reason.as_deref(), Some("user stop"));
+        let completed_reason: Option<String> = check
+            .query_row(
+                "SELECT stop_reason FROM runtime_runs WHERE id='run-completed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("terminal reason");
+        assert!(completed_reason.is_none());
+        let event_count: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE run_id='run-interrupt'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("interrupt event count");
+        assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn runtime_run_recovery_orphans_active_rows_idempotently() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("runtime-recovery.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        for (id, state) in [
+            ("run-accepted", "accepted"),
+            ("run-running", "running"),
+            ("run-stop", "stop_requested"),
+            ("run-done", "completed"),
+        ] {
+            let run = sample_runtime_run(id, state);
+            super::insert_runtime_run_connection(&connection, &run).expect("run");
+        }
+        let mut tool_run = sample_runtime_run("run-tool", "running");
+        tool_run.kind = "goal_loop".to_string();
+        tool_run.goal_id = None;
+        tool_run.phase_id = None;
+        tool_run.legacy_turn_id = None;
+        super::insert_runtime_run_connection(&connection, &tool_run).expect("tool run");
+        drop(connection);
+
+        assert_eq!(
+            super::recover_incomplete_runtime_runs(&db).expect("recovery"),
+            4
+        );
+        let check = super::open_session_connection(&db).expect("reopen");
+        for id in ["run-accepted", "run-running", "run-stop", "run-tool"] {
+            let (state, reason, finished): (String, Option<String>, Option<i64>) = check
+                .query_row(
+                    "SELECT state, stop_reason, finished_at FROM runtime_runs WHERE id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("orphan row");
+            assert_eq!(state, "orphaned");
+            assert_eq!(reason.as_deref(), Some("process_restart"));
+            assert!(finished.is_some());
+        }
+        let completed_state: String = check
+            .query_row(
+                "SELECT state FROM runtime_runs WHERE id='run-done'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("completed row");
+        assert_eq!(completed_state, "completed");
+        let event_count: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE event_type='run.orphaned'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("orphan event count");
+        assert_eq!(event_count, 4);
+        drop(check);
+        assert_eq!(
+            super::recover_incomplete_runtime_runs(&db).expect("second recovery"),
+            0
+        );
+        let check_again = super::open_session_connection(&db).expect("reopen again");
+        let event_count_again: i64 = check_again
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE event_type='run.orphaned'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("orphan event count again");
+        assert_eq!(event_count_again, 4);
+    }
+
+    #[test]
+    fn runtime_run_recovery_rolls_back_when_event_append_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("runtime-recovery-rollback.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        let run = sample_runtime_run("run-rollback", "running");
+        super::insert_runtime_run_connection(&connection, &run).expect("run");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TRIGGER deny_runtime_run_events
+                BEFORE INSERT ON runtime_run_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'blocked by test');
+                END;
+                "#,
+            )
+            .expect("trigger");
+        drop(connection);
+
+        assert!(super::recover_incomplete_runtime_runs(&db).is_err());
+        let check = super::open_session_connection(&db).expect("reopen");
+        let state: String = check
+            .query_row(
+                "SELECT state FROM runtime_runs WHERE id='run-rollback'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("state after rollback");
+        let event_count: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE run_id='run-rollback'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("event count after rollback");
+        assert_eq!(state, "running");
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn runtime_run_recovery_converges_matching_goal_phase_claims_and_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("runtime-recovery-goal.sqlite3");
+        let cases = [
+            ("accepted", "planning", "run-recovery-accepted"),
+            ("running", "running", "run-recovery-running"),
+            ("stop_requested", "planning", "run-recovery-stop"),
+        ];
+        let runs = cases
+            .iter()
+            .map(|(run_state, goal_status, run_id)| {
+                seed_recovery_goal_phase_claim(
+                    &db,
+                    "ws-recovery",
+                    &format!("goal-{run_id}"),
+                    &format!("phase-{run_id}"),
+                    run_id,
+                    run_state,
+                    goal_status,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            super::recover_incomplete_runtime_runs(&db).expect("goal recovery"),
+            cases.len()
+        );
+        let connection = super::open_session_connection(&db).expect("reopen recovery db");
+        for ((_, goal_status, _), run) in cases.iter().zip(&runs) {
+            let (state, stop_reason, finished_at): (String, Option<String>, Option<i64>) = connection
+                .query_row(
+                    "SELECT state, stop_reason, finished_at FROM runtime_runs WHERE id=?1",
+                    super::params![&run.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("recovered runtime");
+            assert_eq!(state, "orphaned");
+            assert_eq!(stop_reason.as_deref(), Some("process_restart"));
+            assert!(finished_at.is_some());
+
+            let (phase_status, route_hint, active_run_id, claim_token, claim_owner, claimed_at, lease_until):
+                (String, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>) =
+                connection
+                    .query_row(
+                        "SELECT status, route_hint, active_run_id, claim_token, claim_owner, claimed_at, lease_until
+                         FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                        super::params![run.goal_id.as_deref().expect("goal"), run.phase_id.as_deref().expect("phase")],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                            ))
+                        },
+                    )
+                    .expect("recovered phase");
+            assert_eq!(phase_status, "pending");
+            assert_eq!(route_hint.as_deref(), Some("manual_reconcile"));
+            assert!(active_run_id.is_none());
+            assert!(claim_token.is_none() && claim_owner.is_none());
+            assert!(claimed_at.is_none() && lease_until.is_none());
+
+            let persisted_goal_status: String = connection
+                .query_row(
+                    "SELECT status FROM goals WHERE id=?1 AND workspace_id=?2",
+                    super::params![run.goal_id.as_deref().expect("goal"), &run.workspace_id],
+                    |row| row.get(0),
+                )
+                .expect("recovered goal");
+            assert_eq!(persisted_goal_status, "paused");
+
+            let runtime_events = super::query_runtime_run_events_connection(&connection, &run.id, 0)
+                .expect("runtime events");
+            assert_eq!(runtime_events.len(), 1);
+            assert_eq!(runtime_events[0].event_type, "run.orphaned");
+            assert_eq!(runtime_events[0].payload["reason"], json!("process_restart"));
+            assert_eq!(runtime_events[0].payload["previous_state"], json!(run.state));
+
+            let goal_events = super::query_goal_events_connection(
+                &connection,
+                run.goal_id.as_deref().expect("goal"),
+                100,
+            )
+            .expect("goal events");
+            let reviews = goal_events
+                .iter()
+                .filter(|event| event.event_type == "run-interrupted-needs-review")
+                .collect::<Vec<_>>();
+            assert_eq!(reviews.len(), 1);
+            let review = reviews[0];
+            assert_eq!(review.payload["caller"], json!("startup-recovery"));
+            assert_eq!(review.payload["reason"], json!("process_restart"));
+            assert_eq!(review.payload["run_id"], json!(run.id));
+            assert_eq!(review.payload["phase_id"], json!(run.phase_id));
+            assert_eq!(review.payload["previous_state"], json!(run.state));
+            assert_eq!(review.payload["goal_status"], json!(goal_status));
+            let public_payload = format!("{}{}", runtime_events[0].payload, review.payload);
+            for internal in ["claim_token", "claim_owner", "claimed_at", "lease_until", "error_json"] {
+                assert!(!public_payload.contains(internal), "payload leaked {internal}");
+            }
+        }
+        drop(connection);
+
+        assert_eq!(
+            super::recover_incomplete_runtime_runs(&db).expect("idempotent recovery"),
+            0
+        );
+        let connection = super::open_session_connection(&db).expect("reopen after idempotence");
+        let orphaned_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE event_type='run.orphaned'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("orphaned count");
+        let review_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE event_type='run-interrupted-needs-review'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("review count");
+        assert_eq!(orphaned_events, cases.len() as i64);
+        assert_eq!(review_events, cases.len() as i64);
+    }
+
+    #[test]
+    fn runtime_run_recovery_preserves_goal_terminal_status_differences() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("runtime-recovery-goal-terminal.sqlite3");
+        let cases = [
+            ("cancelled", "cancelled", None),
+            ("paused", "pending", Some("manual_reconcile")),
+            ("completed", "pending", Some("manual_reconcile")),
+        ];
+        let runs = cases
+            .iter()
+            .map(|(goal_status, expected_phase_status, expected_route_hint)| {
+                let run_id = format!("run-recovery-{goal_status}");
+                let run = seed_recovery_goal_phase_claim(
+                    &db,
+                    "ws-recovery-terminal",
+                    &format!("goal-{goal_status}"),
+                    &format!("phase-{goal_status}"),
+                    &run_id,
+                    "running",
+                    goal_status,
+                );
+                (run, *expected_phase_status, *expected_route_hint)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            super::recover_incomplete_runtime_runs(&db).expect("terminal recovery"),
+            cases.len()
+        );
+        let connection = super::open_session_connection(&db).expect("terminal recovery db");
+        for (run, expected_phase_status, expected_route_hint) in &runs {
+            let (goal_status, phase_status, route_hint): (String, String, Option<String>) = connection
+                .query_row(
+                    "SELECT g.status, p.status, p.route_hint
+                     FROM goals g JOIN goal_phases p ON p.goal_id=g.id
+                     WHERE g.id=?1 AND p.id=?2",
+                    super::params![run.goal_id.as_deref().expect("goal"), run.phase_id.as_deref().expect("phase")],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("terminal state");
+            assert_eq!(goal_status, run.goal_id.as_deref().unwrap().strip_prefix("goal-").unwrap());
+            assert_eq!(&phase_status, expected_phase_status);
+            assert_eq!(route_hint.as_deref(), *expected_route_hint);
+            let review_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1 AND event_type='run-interrupted-needs-review'",
+                    super::params![run.goal_id.as_deref().expect("goal")],
+                    |row| row.get(0),
+                )
+                .expect("review event");
+            assert_eq!(review_count, 1);
+        }
+    }
+
+    #[test]
+    fn runtime_run_recovery_preserves_matching_claim_when_phase_is_not_running() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("runtime-recovery-nonrunning-phase.sqlite3");
+        let stale = seed_recovery_goal_phase_claim(
+            &db,
+            "ws-recovery-nonrunning",
+            "goal-stale-phase",
+            "phase-stale-phase",
+            "run-stale-phase",
+            "accepted",
+            "running",
+        );
+        let normal = seed_recovery_goal_phase_claim(
+            &db,
+            "ws-recovery-nonrunning",
+            "goal-normal-phase",
+            "phase-normal-phase",
+            "run-normal-phase",
+            "running",
+            "planning",
+        );
+        let connection = super::open_session_connection(&db).expect("open non-running phase db");
+        connection
+            .execute(
+                "UPDATE goal_phases SET status='cancelled', route_hint='preexisting-route' WHERE goal_id=?1 AND id=?2",
+                super::params![stale.goal_id.as_deref().expect("stale goal"), stale.phase_id.as_deref().expect("stale phase")],
+            )
+            .expect("make phase terminal with stale claim");
+        drop(connection);
+
+        assert_eq!(
+            super::recover_incomplete_runtime_runs(&db).expect("non-running phase recovery"),
+            2
+        );
+        let connection = super::open_session_connection(&db).expect("reopen non-running phase db");
+        let stale_state: String = connection
+            .query_row(
+                "SELECT state FROM runtime_runs WHERE id=?1",
+                super::params![&stale.id],
+                |row| row.get(0),
+            )
+            .expect("stale runtime state");
+        assert_eq!(stale_state, "orphaned");
+        let (stale_phase_status, stale_route_hint, stale_active_run_id, stale_claim_token, stale_claim_owner, stale_claimed_at, stale_lease_until):
+            (String, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>) = connection
+            .query_row(
+                "SELECT status, route_hint, active_run_id, claim_token, claim_owner, claimed_at, lease_until
+                 FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                super::params![stale.goal_id.as_deref().expect("stale goal"), stale.phase_id.as_deref().expect("stale phase")],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("stale phase state");
+        assert_eq!(stale_phase_status, "cancelled");
+        assert_eq!(stale_route_hint.as_deref(), Some("preexisting-route"));
+        assert_eq!(stale_active_run_id.as_deref(), Some(stale.id.as_str()));
+        assert_eq!(stale_claim_token.as_deref(), Some(stale.claim_token.as_str()));
+        assert_eq!(stale_claim_owner.as_deref(), Some("recovery-owner"));
+        assert_eq!(stale_claimed_at, Some(3));
+        assert_eq!(stale_lease_until, Some(4));
+        let stale_goal_status: String = connection
+            .query_row(
+                "SELECT status FROM goals WHERE id=?1",
+                super::params![stale.goal_id.as_deref().expect("stale goal")],
+                |row| row.get(0),
+            )
+            .expect("stale goal state");
+        assert_eq!(stale_goal_status, "running");
+        let stale_review_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1 AND event_type='run-interrupted-needs-review'",
+                super::params![stale.goal_id.as_deref().expect("stale goal")],
+                |row| row.get(0),
+            )
+            .expect("stale review count");
+        assert_eq!(stale_review_count, 0);
+
+        let normal_state: String = connection
+            .query_row(
+                "SELECT state FROM runtime_runs WHERE id=?1",
+                super::params![&normal.id],
+                |row| row.get(0),
+            )
+            .expect("normal runtime state");
+        assert_eq!(normal_state, "orphaned");
+        let (normal_phase_status, normal_route_hint, normal_active_run_id):
+            (String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT status, route_hint, active_run_id FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                super::params![normal.goal_id.as_deref().expect("normal goal"), normal.phase_id.as_deref().expect("normal phase")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("normal phase state");
+        assert_eq!(normal_phase_status, "pending");
+        assert_eq!(normal_route_hint.as_deref(), Some("manual_reconcile"));
+        assert!(normal_active_run_id.is_none());
+        let normal_goal_status: String = connection
+            .query_row(
+                "SELECT status FROM goals WHERE id=?1",
+                super::params![normal.goal_id.as_deref().expect("normal goal")],
+                |row| row.get(0),
+            )
+            .expect("normal goal state");
+        assert_eq!(normal_goal_status, "paused");
+        let normal_review_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1 AND event_type='run-interrupted-needs-review'",
+                super::params![normal.goal_id.as_deref().expect("normal goal")],
+                |row| row.get(0),
+            )
+            .expect("normal review count");
+        assert_eq!(normal_review_count, 1);
+        drop(connection);
+
+        assert_eq!(
+            super::recover_incomplete_runtime_runs(&db).expect("second non-running recovery"),
+            0
+        );
+        let connection = super::open_session_connection(&db).expect("reopen after non-running idempotence");
+        let orphaned_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE event_type='run.orphaned'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("orphaned count");
+        let review_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_events WHERE event_type='run-interrupted-needs-review'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("review count");
+        assert_eq!(orphaned_count, 2);
+        assert_eq!(review_count, 1);
+    }
+
+    #[test]
+    fn runtime_run_recovery_keeps_mismatched_goal_claims_for_manual_reconcile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("runtime-recovery-goal-mismatch.sqlite3");
+        let token_run = seed_recovery_goal_phase_claim_with_scope(
+            &db,
+            "ws-mismatch",
+            "goal-token",
+            "phase-token",
+            "run-token",
+            "accepted",
+            "running",
+            "ws-mismatch",
+            "phase-token",
+            "run-token-value",
+            "phase-token-value",
+        );
+        let workspace_run = seed_recovery_goal_phase_claim_with_scope(
+            &db,
+            "ws-mismatch",
+            "goal-workspace",
+            "phase-workspace",
+            "run-workspace",
+            "running",
+            "running",
+            "wrong-workspace",
+            "phase-workspace",
+            "claim-run-workspace",
+            "claim-run-workspace",
+        );
+        let phase_run = seed_recovery_goal_phase_claim_with_scope(
+            &db,
+            "ws-mismatch",
+            "goal-phase",
+            "phase-phase",
+            "run-phase",
+            "stop_requested",
+            "running",
+            "ws-mismatch",
+            "missing-phase",
+            "claim-run-phase",
+            "claim-run-phase",
+        );
+        let runs = [token_run, workspace_run, phase_run];
+
+        assert_eq!(
+            super::recover_incomplete_runtime_runs(&db).expect("mismatch recovery"),
+            runs.len()
+        );
+        let connection = super::open_session_connection(&db).expect("mismatch recovery db");
+        for run in &runs {
+            let state: String = connection
+                .query_row(
+                    "SELECT state FROM runtime_runs WHERE id=?1",
+                    super::params![&run.id],
+                    |row| row.get(0),
+                )
+                .expect("mismatch runtime");
+            assert_eq!(state, "orphaned");
+            let phase_id = run
+                .id
+                .strip_prefix("run-")
+                .map(|suffix| format!("phase-{suffix}"))
+                .expect("phase id");
+            let (phase_status, active_run_id, claim_token): (String, Option<String>, Option<String>) = connection
+                .query_row(
+                    "SELECT status, active_run_id, claim_token FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                    super::params![run.goal_id.as_deref().expect("goal"), phase_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("mismatch phase");
+            assert_eq!(phase_status, "running");
+            assert_eq!(active_run_id.as_deref(), Some(run.id.as_str()));
+            assert!(claim_token.is_some());
+            let goal_status: String = connection
+                .query_row(
+                    "SELECT status FROM goals WHERE id=?1",
+                    super::params![run.goal_id.as_deref().expect("goal")],
+                    |row| row.get(0),
+                )
+                .expect("mismatch goal");
+            assert_eq!(goal_status, "running");
+            let review_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM goal_events WHERE goal_id=?1",
+                    super::params![run.goal_id.as_deref().expect("goal")],
+                    |row| row.get(0),
+                )
+                .expect("mismatch review count");
+            assert_eq!(review_count, 0);
+        }
+    }
+
+    #[test]
+    fn runtime_run_recovery_rolls_back_runtime_and_goal_rows_when_runtime_event_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("runtime-recovery-runtime-event-failure.sqlite3");
+        let run = seed_recovery_goal_phase_claim(
+            &db,
+            "ws-recovery-failure",
+            "goal-runtime-event-failure",
+            "phase-runtime-event-failure",
+            "run-runtime-event-failure",
+            "running",
+            "running",
+        );
+        let connection = super::open_session_connection(&db).expect("open runtime failure db");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER deny_recovery_runtime_event BEFORE INSERT ON runtime_run_events
+                 BEGIN SELECT RAISE(ABORT, 'blocked startup runtime event'); END;",
+            )
+            .expect("runtime event trigger");
+        drop(connection);
+
+        assert!(super::recover_incomplete_runtime_runs(&db).is_err());
+        let connection = super::open_session_connection(&db).expect("runtime rollback db");
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM runtime_runs WHERE id=?1",
+                super::params![&run.id],
+                |row| row.get(0),
+            )
+            .expect("runtime rollback state");
+        assert_eq!(state, "running");
+        let (phase_status, active_run_id, claim_token): (String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT status, active_run_id, claim_token FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                super::params![run.goal_id.as_deref().expect("goal"), run.phase_id.as_deref().expect("phase")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("phase rollback state");
+        assert_eq!(phase_status, "running");
+        assert_eq!(active_run_id.as_deref(), Some(run.id.as_str()));
+        assert_eq!(claim_token.as_deref(), Some(run.claim_token.as_str()));
+        let goal_status: String = connection
+            .query_row(
+                "SELECT status FROM goals WHERE id=?1",
+                super::params![run.goal_id.as_deref().expect("goal")],
+                |row| row.get(0),
+            )
+            .expect("goal rollback state");
+        assert_eq!(goal_status, "running");
+        assert_eq!(super::query_runtime_run_events_connection(&connection, &run.id, 0).unwrap().len(), 0);
+        assert_eq!(super::query_goal_events_connection(&connection, run.goal_id.as_deref().unwrap(), 100).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn runtime_run_recovery_rolls_back_runtime_and_goal_rows_when_goal_event_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("runtime-recovery-goal-event-failure.sqlite3");
+        let run = seed_recovery_goal_phase_claim(
+            &db,
+            "ws-recovery-failure",
+            "goal-goal-event-failure",
+            "phase-goal-event-failure",
+            "run-goal-event-failure",
+            "accepted",
+            "planning",
+        );
+        let connection = super::open_session_connection(&db).expect("open goal failure db");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER deny_recovery_goal_event BEFORE INSERT ON goal_events
+                 BEGIN SELECT RAISE(ABORT, 'blocked startup goal event'); END;",
+            )
+            .expect("goal event trigger");
+        drop(connection);
+
+        assert!(super::recover_incomplete_runtime_runs(&db).is_err());
+        let connection = super::open_session_connection(&db).expect("goal rollback db");
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM runtime_runs WHERE id=?1",
+                super::params![&run.id],
+                |row| row.get(0),
+            )
+            .expect("goal runtime rollback state");
+        assert_eq!(state, "accepted");
+        let (phase_status, active_run_id, claim_token): (String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT status, active_run_id, claim_token FROM goal_phases WHERE goal_id=?1 AND id=?2",
+                super::params![run.goal_id.as_deref().expect("goal"), run.phase_id.as_deref().expect("phase")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("goal phase rollback state");
+        assert_eq!(phase_status, "running");
+        assert_eq!(active_run_id.as_deref(), Some(run.id.as_str()));
+        assert_eq!(claim_token.as_deref(), Some(run.claim_token.as_str()));
+        let goal_status: String = connection
+            .query_row(
+                "SELECT status FROM goals WHERE id=?1",
+                super::params![run.goal_id.as_deref().expect("goal")],
+                |row| row.get(0),
+            )
+            .expect("goal status rollback");
+        assert_eq!(goal_status, "planning");
+        assert_eq!(super::query_runtime_run_events_connection(&connection, &run.id, 0).unwrap().len(), 0);
+        assert_eq!(super::query_goal_events_connection(&connection, run.goal_id.as_deref().unwrap(), 100).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn startup_recovery_remains_fail_closed_without_auto_restart() {
+        let source = WEB_MAIN_RS;
+        let recovery_start = source
+            .find("match recover_incomplete_runtime_runs(&runtime_run_db_path)")
+            .expect("startup recovery call");
+        let startup_tail = &source[recovery_start..];
+        let bind_start = startup_tail.find("let bind_addr").expect("bind boundary");
+        let startup_recovery = &startup_tail[..bind_start];
+        assert!(startup_recovery.contains("return Err(Box::new(error)"));
+        assert!(!startup_recovery.contains("run_goal_loop_background"));
+        assert!(!startup_recovery.contains("cancel_goal_sqlite"));
+
+        let function_start = source
+            .find("fn recover_incomplete_runtime_runs(")
+            .expect("recovery function");
+        let recovery_body = &source[function_start..]
+            .split_once("\nfn normalize_run_interrupt_reason")
+            .map(|(body, _)| body)
+            .expect("recovery function boundary");
+        assert!(!recovery_body.contains("run_goal_loop_background"));
+        assert!(!recovery_body.contains("cancel_goal_sqlite"));
+    }
+
+    #[tokio::test]
+    async fn runtime_run_http_endpoints_support_status_interrupt_and_sse_replay() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use futures_util::StreamExt;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        async fn read_sse_prefix(response: axum::response::Response<Body>) -> String {
+            let mut chunks = response.into_body().into_data_stream();
+            let mut output = String::new();
+            for _ in 0..4 {
+                let next = tokio::time::timeout(std::time::Duration::from_secs(2), chunks.next()).await;
+                let Ok(Some(Ok(bytes))) = next else {
+                    break;
+                };
+                output.push_str(std::str::from_utf8(&bytes).unwrap_or_default());
+                if output.contains("run.stop_requested") {
+                    break;
+                }
+            }
+            output
+        }
+
+        let _config_guard = config_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _db_guard = scoped_session_db_env(tmp.path());
+        let db = tmp.path().join("web-sessions.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        let run = sample_runtime_run("run-http", "running");
+        super::insert_runtime_run_connection(&connection, &run).expect("run");
+        drop(connection);
+        let first_event = super::append_runtime_run_event(
+            &db,
+            &run.id,
+            "run.started",
+            json!({"source":"http-test"}),
+        )
+        .expect("first event");
+
+        let response = super::app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/runs/run-http")
+                    .body(Body::empty())
+                    .expect("status request"),
+            )
+            .await
+            .expect("status response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let status_body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("status body")
+            .to_bytes();
+        let status_json: JsonValue = serde_json::from_slice(&status_body).expect("status json");
+        assert_eq!(status_json["run_id"], json!("run-http"));
+        assert_eq!(status_json["state"], json!("running"));
+        assert_eq!(status_json["turn_id"], json!("legacy-run-http"));
+        assert!(status_json.get("claim_token").is_none());
+        assert!(status_json.get("owner_id").is_none());
+        assert!(status_json.get("error_json").is_none());
+
+        let response = super::app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/runs/missing-run")
+                    .body(Body::empty())
+                    .expect("missing request"),
+            )
+            .await
+            .expect("missing response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = super::app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/runs/run-http/interrupt")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reason":"  http stop  "}"#))
+                    .expect("interrupt request"),
+            )
+            .await
+            .expect("interrupt response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let interrupt_body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("interrupt body")
+            .to_bytes();
+        let interrupt_json: JsonValue =
+            serde_json::from_slice(&interrupt_body).expect("interrupt json");
+        assert_eq!(interrupt_json["state"], json!("stop_requested"));
+        assert_eq!(interrupt_json["outcome"], json!("interrupt_requested"));
+        assert_eq!(interrupt_json["idempotent"], json!(false));
+
+        let response = super::app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/runs/run-http/interrupt")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reason":"ignored"}"#))
+                    .expect("repeat interrupt request"),
+            )
+            .await
+            .expect("repeat interrupt response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let repeat_body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("repeat body")
+            .to_bytes();
+        let repeat_json: JsonValue = serde_json::from_slice(&repeat_body).expect("repeat json");
+        assert_eq!(repeat_json["state"], json!("stop_requested"));
+        assert_eq!(repeat_json["idempotent"], json!(true));
+
+        let check = super::open_session_connection(&db).expect("check db");
+        let event_count: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_run_events WHERE run_id='run-http'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("event count");
+        assert_eq!(event_count, 2);
+        drop(check);
+
+        let response = super::app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/runs/run-http/events?after={}", first_event.id))
+                    .body(Body::empty())
+                    .expect("events request"),
+            )
+            .await
+            .expect("events response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.starts_with("text/event-stream")),
+            Some(true)
+        );
+        let sse_body = read_sse_prefix(response).await;
+        assert!(sse_body.contains("event: hello"));
+        assert!(sse_body.contains("id: 2"));
+        assert!(sse_body.contains("event: run.stop_requested"));
+
+        let response = super::app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/runs/run-http/events")
+                    .header("last-event-id", first_event.id.to_string())
+                    .body(Body::empty())
+                    .expect("header replay request"),
+            )
+            .await
+            .expect("header replay response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let header_sse_body = read_sse_prefix(response).await;
+        assert!(header_sse_body.contains("event: run.stop_requested"));
+        assert!(header_sse_body.contains("id: 2"));
     }
 
     /// GL-02：读路径把 v13 的 6 列反序列化进 GoalPhaseDto，并能正确序列化给前端。
@@ -58285,6 +69485,7 @@ attach: last_assistant
             assigned_session_display_name: None,
             assigned_session_available: true,
             status: "running".to_string(),
+            active_run_id: None,
             depends_on: Vec::new(),
             skills_required: Vec::new(),
             output_artifacts: Vec::new(),
@@ -58754,11 +69955,11 @@ attach: last_assistant
         let db = tmp.path().join("handoff.sqlite3");
         let connection = super::open_session_connection(&db).expect("open");
         super::initialize_session_schema(&connection).expect("schema");
-        // 迁移后 user_version=14，contract_json 列存在。
+        // 迁移后 user_version=20，contract_json 列存在。
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version");
-        assert_eq!(version, 15);
+        assert_eq!(version, 20);
         let cols: Vec<String> = connection
             .prepare("PRAGMA table_info(chat_handoffs)")
             .expect("pragma")
@@ -59286,6 +70487,369 @@ attach: last_assistant
         // 覆盖式写入：再次写空集应清空旧边。
         assert_eq!(super::save_session_edges(&db, "s1", &[]), 0);
         assert!(super::load_edge_neighbors(&db, "s1", &seed).is_empty());
+    }
+
+    #[test]
+    fn memory_job_lifecycle_is_persistent_and_retryable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("memory-jobs.sqlite3");
+        let connection = super::open_session_connection(&db).expect("open");
+        super::initialize_session_schema(&connection).expect("schema");
+        connection
+            .execute(
+                "INSERT INTO sessions(id, name, provider, model, api_key_ref, created_at, updated_at) \
+                 VALUES ('s1','S1','p','m','none',0,0)",
+                [],
+            )
+            .expect("seed session");
+        drop(connection);
+
+        let (queued, reused) =
+            super::create_memory_job_sqlite(&db, "s1", super::MEMORY_JOB_EDGES, false)
+                .expect("create queued job");
+        assert!(!reused);
+        assert_eq!(queued.status, "queued");
+        assert_eq!(queued.progress, 0);
+
+        let (same, reused) =
+            super::create_memory_job_sqlite(&db, "s1", super::MEMORY_JOB_EDGES, false)
+                .expect("reuse active job");
+        assert!(reused);
+        assert_eq!(same.id, queued.id);
+
+        let running = super::update_memory_job_sqlite(&db, &queued.id, "running", 10, None, None)
+            .expect("running");
+        assert_eq!(running.status, "running");
+        assert_eq!(running.progress, 10);
+        assert!(running.started_at.is_some());
+
+        let done =
+            super::update_memory_job_sqlite(&db, &queued.id, "succeeded", 100, Some(3), None)
+                .expect("succeeded");
+        assert_eq!(done.status, "succeeded");
+        assert_eq!(done.result_count, Some(3));
+        assert!(done.completed_at.is_some());
+
+        let (failed, reused) =
+            super::create_memory_job_sqlite(&db, "s1", super::MEMORY_JOB_EDGES, false)
+                .expect("create second job");
+        assert!(!reused);
+        super::update_memory_job_sqlite(
+            &db,
+            &failed.id,
+            "failed",
+            100,
+            None,
+            Some("embedding backend unavailable"),
+        )
+        .expect("failed");
+        let failed_loaded = super::get_memory_job_sqlite(&db, "s1", &failed.id)
+            .expect("read failed")
+            .expect("failed job row");
+        assert_eq!(failed_loaded.status, "failed");
+        assert_eq!(
+            failed_loaded.error.as_deref(),
+            Some("embedding backend unavailable")
+        );
+
+        let (retry, reused) =
+            super::create_memory_job_sqlite(&db, "s1", super::MEMORY_JOB_EDGES, true)
+                .expect("retry failed job");
+        assert!(!reused);
+        assert_ne!(retry.id, failed.id);
+        let listed = super::list_memory_jobs_sqlite(&db, "s1", 10).expect("list jobs");
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].id, retry.id);
+    }
+
+    #[test]
+    fn session_history_exposes_turns_items_and_typed_compaction_cursor() {
+        let mut session = super::seed_session();
+        session.id = "history-test".to_string();
+        session.messages = vec![
+            persisted_role_message("u1", "user", "请检查工程", 10),
+            persisted_role_message("a1", "assistant", "已检查完成", 20),
+            persisted_role_message("u2", "user", "再总结一次", 30),
+        ];
+        session.memory_beads = vec![super::MemoryBeadDto {
+            id: "compaction-1".to_string(),
+            kind: "compaction".to_string(),
+            layer: "L2".to_string(),
+            summary: "[自动上下文压缩摘要] 旧对话已压缩".to_string(),
+            source: "context:auto-compact".to_string(),
+            token_count: Some(12),
+            created_at: 40,
+            ..super::MemoryBeadDto::default()
+        }];
+
+        let latest = super::session_history_response(
+            &session,
+            true,
+            super::SessionHistoryQuery {
+                limit: Some(1),
+                before: None,
+            },
+        );
+        assert_eq!(latest.turns.len(), 1);
+        assert_eq!(latest.turns[0].status, "compacted");
+        assert_eq!(latest.items.len(), 1);
+        assert_eq!(latest.items[0].kind, "compaction");
+        assert!(latest.has_more);
+        let cursor = latest.next_before.clone().expect("history cursor");
+
+        let previous = super::session_history_response(
+            &session,
+            true,
+            super::SessionHistoryQuery {
+                limit: Some(2),
+                before: Some(cursor),
+            },
+        );
+        assert_eq!(previous.turns.len(), 2);
+        assert!(previous
+            .items
+            .iter()
+            .any(|item| item.kind == "user_message"));
+        assert!(previous.turns.iter().all(|turn| turn
+            .item_ids
+            .iter()
+            .all(|id| previous.items.iter().any(|item| &item.id == id))));
+    }
+
+    #[test]
+    fn session_resume_fork_and_rollback_round_trip_history_cursor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut source = super::seed_session();
+        source.id = "lifecycle-source".to_string();
+        source.name = "生命周期源会话".to_string();
+        source.messages = vec![
+            persisted_role_message("u1", "user", "第一轮", 10),
+            persisted_role_message("a1", "assistant", "第一轮完成", 20),
+            persisted_role_message("u2", "user", "第二轮", 30),
+            persisted_role_message("a2", "assistant", "第二轮完成", 40),
+        ];
+        source.memory_beads = vec![super::MemoryBeadDto {
+            id: "compact-after-second".to_string(),
+            kind: "compaction".to_string(),
+            layer: "L2".to_string(),
+            source: "context:auto-compact".to_string(),
+            summary: "第二轮之后的摘要".to_string(),
+            created_at: 50,
+            ..super::MemoryBeadDto::default()
+        }];
+        let mut store = super::SessionStore {
+            path: tmp.path().join("lifecycle.sqlite3"),
+            legacy_json_path: tmp.path().join("lifecycle.json"),
+            capacity: super::SessionStoreCapacity::default(),
+            state: super::PersistedSessionState {
+                sessions: vec![source],
+                active_session_id: Some("lifecycle-source".to_string()),
+                active_vision_session_id: None,
+                chat_rooms: Vec::new(),
+                active_chat_room_id: None,
+            },
+        };
+
+        let resumed = store.resume_session("lifecycle-source").expect("resume");
+        assert!(!resumed.resumed, "已活动会话恢复应是幂等操作");
+        assert_eq!(resumed.history.turns.len(), 3);
+
+        let first_turn = super::history_turn_id("lifecycle-source", "u1");
+        let fork = store
+            .fork_session(
+                "lifecycle-source",
+                super::SessionForkRequest {
+                    before: Some(first_turn.clone()),
+                    name: Some("第一轮分支".to_string()),
+                },
+            )
+            .expect("fork");
+        assert_eq!(fork.copied_messages, 2);
+        assert_eq!(fork.copied_memory_beads, 0);
+        let forked = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == fork.session.id)
+            .expect("forked session");
+        assert_eq!(forked.messages.len(), 2);
+        assert_eq!(
+            store.state.active_session_id.as_deref(),
+            Some(fork.session.id.as_str())
+        );
+
+        let rolled = store
+            .rollback_session(
+                "lifecycle-source",
+                super::SessionRollbackRequest {
+                    before: first_turn,
+                    reason: Some("测试回滚".to_string()),
+                },
+            )
+            .expect("rollback");
+        assert_eq!(rolled.kept_messages, 2);
+        assert_eq!(rolled.removed_messages, 2);
+        assert_eq!(rolled.removed_memory_beads, 1);
+        let source_after = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == "lifecycle-source")
+            .expect("source after rollback");
+        assert_eq!(source_after.messages.len(), 2);
+        assert_eq!(source_after.context_reset_at, 20);
+        assert!(source_after.memory_beads.is_empty());
+    }
+
+    #[test]
+    fn session_agent_events_jsonl_is_stable_and_typed() {
+        let mut session = super::seed_session();
+        session.id = "events-test".to_string();
+        session.updated_at = 99;
+        session.messages = vec![
+            persisted_role_message("u1", "user", "事件第一轮", 10),
+            super::PersistedChatMessage {
+                id: "a1".to_string(),
+                author: "COOLZHU AGENT".to_string(),
+                role: "assistant".to_string(),
+                target: "聊天".to_string(),
+                content: "已完成\n\n---\nContext usage: 1.0% (100/10000 input tokens; source=remote). Local estimate: 80 tokens; local prompt budget: 9000 tokens; history truncated: false.\nContext turn: turn-runtime-events; Context snapshot: ctx-events; history source: chat_room.messages; history loaded: 1; memory revision: mem-events".to_string(),
+                kind: "assistant-reply".to_string(),
+                attachments: Vec::new(),
+                created_at: 20,
+            },
+        ];
+        session.memory_beads = vec![super::MemoryBeadDto {
+            id: "event-compaction".to_string(),
+            kind: "compaction".to_string(),
+            layer: "L2".to_string(),
+            source: "context:auto-compact".to_string(),
+            summary: "事件压缩摘要".to_string(),
+            created_at: 30,
+            ..super::MemoryBeadDto::default()
+        }];
+        let history = super::session_history_response(
+            &session,
+            true,
+            super::SessionHistoryQuery {
+                limit: Some(20),
+                before: None,
+            },
+        );
+        let first = super::session_agent_events_jsonl(&history);
+        let second = super::session_agent_events_jsonl(&history);
+        assert_eq!(first, second, "同一 history 重放必须生成稳定 JSONL");
+        let events = first
+            .lines()
+            .map(|line| serde_json::from_str::<super::JsonValue>(line).expect("valid JSONL"))
+            .collect::<Vec<_>>();
+        assert!(events.len() >= 5);
+        assert_eq!(events[0]["schema"], "coolzhu.agent.event.v1");
+        assert_eq!(events[0]["event_type"], "thread.snapshot");
+        assert!(events
+            .iter()
+            .any(|event| event["event_type"] == "item.completed"));
+        assert!(events
+            .iter()
+            .any(|event| event["payload"]["kind"] == "compaction"));
+        assert!(events.windows(2).all(|pair| {
+            pair[1]["sequence"].as_u64() == Some(pair[0]["sequence"].as_u64().unwrap() + 1)
+        }));
+        assert!(events.iter().all(
+            |event| event["thread_id"] == "events-test" && event["event_id"].as_str().is_some()
+        ));
+        let context_item = events
+            .iter()
+            .find(|event| event["payload"]["id"] == "a1")
+            .expect("assistant item with context snapshot");
+        assert_eq!(context_item["context_snapshot_id"], "ctx-events");
+        assert_eq!(context_item["payload"]["context_snapshot_id"], "ctx-events");
+        assert_eq!(context_item["context_turn_id"], "turn-runtime-events");
+        assert_eq!(
+            context_item["payload"]["context_turn_id"],
+            "turn-runtime-events"
+        );
+    }
+
+    #[test]
+    fn session_agent_events_preserve_tool_call_and_result_contract() {
+        let mut session = super::seed_session();
+        session.id = "tool-events-test".to_string();
+        session.messages = vec![
+            persisted_role_message("u1", "user", "读取配置", 10),
+            super::PersistedChatMessage {
+                id: "reasoning-item-1".to_string(),
+                author: "模型思考摘要".to_string(),
+                role: "assistant".to_string(),
+                target: "推理卡片".to_string(),
+                content: "先检查配置文件，再调用读取工具。".to_string(),
+                kind: "reasoning".to_string(),
+                attachments: Vec::new(),
+                created_at: 15,
+            },
+            super::PersistedChatMessage {
+                id: "call-item-1".to_string(),
+                author: "系统工具执行 Agent".to_string(),
+                role: "assistant".to_string(),
+                target: "mario-demo".to_string(),
+                content: "tool_name: read_file\nroute: runtime-executed\nstatus: ok".to_string(),
+                kind: "tool-summary".to_string(),
+                attachments: Vec::new(),
+                created_at: 20,
+            },
+            super::PersistedChatMessage {
+                id: "result-item-1".to_string(),
+                author: "工具审批执行".to_string(),
+                role: "assistant".to_string(),
+                target: "mario-demo".to_string(),
+                content: "tool_call_id: call-1\ntool_name: read_file\nroute: runtime-executed\nstatus: ok\n结果: 已读取".to_string(),
+                kind: "tool-result".to_string(),
+                attachments: Vec::new(),
+                created_at: 30,
+            },
+        ];
+        let history = super::session_history_response(
+            &session,
+            true,
+            super::SessionHistoryQuery {
+                limit: Some(20),
+                before: None,
+            },
+        );
+        assert_eq!(
+            history
+                .items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user_message", "reasoning", "tool_call", "tool_result"]
+        );
+        let jsonl = super::session_agent_events_jsonl(&history);
+        let events = jsonl
+            .lines()
+            .map(|line| serde_json::from_str::<super::JsonValue>(line).expect("valid JSONL"))
+            .collect::<Vec<_>>();
+        let call = events
+            .iter()
+            .find(|event| event["event_type"] == "tool.call")
+            .expect("tool.call");
+        assert_eq!(call["payload"]["tool_call"]["name"], "read_file");
+        assert_eq!(call["payload"]["tool_call"]["status"], "ok");
+        let reasoning = events
+            .iter()
+            .find(|event| event["event_type"] == "reasoning.completed")
+            .expect("reasoning.completed");
+        assert_eq!(reasoning["payload"]["reasoning"]["visibility"], "summary");
+        assert_eq!(
+            reasoning["payload"]["item"]["content"],
+            "先检查配置文件，再调用读取工具。"
+        );
+        let result = events
+            .iter()
+            .find(|event| event["event_type"] == "tool.result")
+            .expect("tool.result");
+        assert_eq!(result["payload"]["tool_call"]["id"], "call-1");
+        assert_eq!(result["payload"]["item"]["kind"], "tool_result");
     }
 
     #[test]
@@ -60940,6 +72504,8 @@ attach: last_assistant
         let _ = rt.block_on(super::api_tools_reject(Json(super::RejectRequest {
             call_id,
             reason: Some("cleanup".into()),
+            session_id: Some("ses-evt".into()),
+            ..Default::default()
         })));
     }
 
@@ -61057,6 +72623,8 @@ attach: last_assistant
                 call_id: call_id.clone(),
                 scope: Some("session".into()),
                 confirmed_twice: true,
+                session_id: Some("ses-ar".into()),
+                ..Default::default()
             })))
             .expect("approve ok");
 
@@ -61085,6 +72653,8 @@ attach: last_assistant
             .block_on(super::api_tools_reject(Json(super::RejectRequest {
                 call_id: reject_call_id.clone(),
                 reason: Some("test-reject".into()),
+                session_id: Some("ses-ar".into()),
+                ..Default::default()
             })))
             .expect("reject ok");
 
@@ -61289,6 +72859,8 @@ attach: last_assistant
             .block_on(super::api_tools_reject(Json(super::RejectRequest {
                 call_id: call_id.clone(),
                 reason: Some("cleanup".into()),
+                session_id: Some("ses-1".into()),
+                ..Default::default()
             })))
             .expect("cleanup reject");
     }
@@ -61376,6 +72948,8 @@ attach: last_assistant
             call_id: call_id.clone(),
             scope: Some("once".into()),
             confirmed_twice: false,
+            session_id: Some("ses-1".into()),
+            ..Default::default()
         };
         let Json(resp) = rt
             .block_on(super::api_tools_approve(Json(approve)))
@@ -61422,6 +72996,8 @@ attach: last_assistant
                 call_id: call_id.clone(),
                 scope: Some("once".into()),
                 confirmed_twice: false,
+                session_id: Some("ses-confirm".into()),
+                ..Default::default()
             })))
             .expect_err("二次确认缺失时必须拒绝审批");
         assert_eq!(error.0, super::StatusCode::BAD_REQUEST);
@@ -61435,6 +73011,8 @@ attach: last_assistant
             .block_on(super::api_tools_reject(Json(super::RejectRequest {
                 call_id,
                 reason: Some("cleanup".into()),
+                session_id: Some("ses-confirm".into()),
+                ..Default::default()
             })))
             .expect("cleanup reject");
     }
@@ -61488,6 +73066,9 @@ attach: last_assistant
             .block_on(super::api_tools_reject(Json(super::RejectRequest {
                 call_id,
                 reason: Some("用户拒绝测试".into()),
+                session_id: Some("ses-tool-terminal".into()),
+                chat_room_id: Some(room_id.into()),
+                ..Default::default()
             })))
             .expect("reject");
 
@@ -61568,6 +73149,8 @@ attach: last_assistant
                 call_id: call_id.clone(),
                 scope: Some("once".into()),
                 confirmed_twice: false,
+                session_id: Some("ses-approval-exec".into()),
+                ..Default::default()
             })))
             .expect("approve ok");
 
@@ -61621,6 +73204,8 @@ attach: last_assistant
             call_id: call_id.clone(),
             scope: Some("session".into()),
             confirmed_twice: false,
+            session_id: Some("ses-9-unique".into()),
+            ..Default::default()
         };
         let Json(resp) = rt
             .block_on(super::api_tools_approve(Json(req)))
@@ -61646,6 +73231,75 @@ attach: last_assistant
             !super::session_grant_view_for("ws-X-unique", Some("ses-9-unique"), "bash")
                 .session_authorized
         );
+    }
+
+    #[test]
+    fn pending_approval_cannot_be_consumed_outside_session_or_room_scope() {
+        super::clear_pending_approvals_for_test();
+        let call_id = "call-scope-isolation-unique-ddd".to_string();
+        let room_id = "room-scope-a";
+        let invoke = super::ToolInvoke {
+            call_id: call_id.clone(),
+            tool_name: "write_file".into(),
+            input: serde_json::json!({"path": "scope-a.txt", "content": "scope-a"}),
+            caller: super::ToolCaller::Llm,
+            workspace_id: "ws-scope-a".into(),
+            session_id: Some("session-scope-a".into()),
+            user_authorized: false,
+            user_confirmed_twice: false,
+        };
+        let gate = runtime::PermissionGateReport {
+            required: super::PermissionMode::WorkspaceWrite,
+            decision: super::PermissionDecision::RequireApproval,
+            reason: "scope isolation test".into(),
+            protected_match: None,
+            workspace_relative: true,
+            affected_paths: vec!["scope-a.txt".into()],
+        };
+        super::enqueue_pending_approval_for_room(&call_id, &invoke, &gate, Some(room_id));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let wrong_session = rt
+            .block_on(super::api_tools_reject(Json(super::RejectRequest {
+                call_id: call_id.clone(),
+                reason: Some("wrong session".into()),
+                session_id: Some("session-scope-b".into()),
+                chat_room_id: Some(room_id.into()),
+            })))
+            .expect_err("不同 session 不得消费 pending");
+        assert_eq!(wrong_session.0, super::StatusCode::NOT_FOUND);
+
+        let wrong_room = rt
+            .block_on(super::api_tools_approve(Json(super::ApproveRequest {
+                call_id: call_id.clone(),
+                scope: Some("once".into()),
+                confirmed_twice: false,
+                session_id: Some("session-scope-a".into()),
+                chat_room_id: Some("room-scope-b".into()),
+            })))
+            .expect_err("不同 room 不得消费 pending");
+        assert_eq!(wrong_room.0, super::StatusCode::NOT_FOUND);
+
+        let Json(filtered) = rt.block_on(super::api_tools_pending_for_scope(
+            super::PendingApprovalsQuery {
+                session_id: Some("session-scope-a".into()),
+                chat_room_id: Some(room_id.into()),
+            },
+        ));
+        assert!(filtered.pending.iter().any(|record| record.call_id == call_id));
+
+        let Json(_) = rt
+            .block_on(super::api_tools_reject(Json(super::RejectRequest {
+                call_id,
+                reason: Some("cleanup".into()),
+                session_id: Some("session-scope-a".into()),
+                chat_room_id: Some(room_id.into()),
+            })))
+            .expect("正确 session/room 应可消费 pending");
+        super::clear_pending_approvals_for_test();
     }
 
     #[test]
@@ -62157,6 +73811,8 @@ attach: last_assistant
         let req = super::RejectRequest {
             call_id: call_id.clone(),
             reason: Some("user-denied".into()),
+            session_id: Some("ses-r-unique".into()),
+            ..Default::default()
         };
         let Json(resp) = rt
             .block_on(super::api_tools_reject(Json(req)))
@@ -62186,6 +73842,7 @@ attach: last_assistant
             call_id: "ghost-no-one-writes-this-key-123".into(),
             scope: Some("once".into()),
             confirmed_twice: false,
+            ..Default::default()
         };
         let err = rt
             .block_on(super::api_tools_approve(Json(req)))
@@ -62602,6 +74259,41 @@ attach: last_assistant
     }
 
     #[test]
+    fn diagnostics_webview2_candidates_find_versioned_executable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let application_root = temp.path().join("Application");
+        let version_dir = application_root.join("151.0.0.0");
+        std::fs::create_dir_all(&version_dir).expect("create version directory");
+        let executable = version_dir.join("msedgewebview2.exe");
+        std::fs::write(&executable, b"webview2-test").expect("write runtime marker");
+
+        let candidates = super::webview2_runtime_candidates_for_roots(&[application_root]);
+        assert!(candidates.iter().any(|path| path == &executable));
+        let check = super::webview2_runtime_check_for(&candidates);
+        assert_eq!(check.status, "ok");
+        assert!(check.detail.contains("msedgewebview2.exe"));
+    }
+
+    #[test]
+    fn diagnostics_webview2_candidates_report_missing_versioned_executable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let application_root = temp.path().join("Application");
+        std::fs::create_dir_all(application_root.join("152.0.0.0"))
+            .expect("create version directory");
+
+        let candidates = super::webview2_runtime_candidates_for_roots(&[application_root]);
+        let check = super::webview2_runtime_check_for(&candidates);
+        assert_eq!(check.status, "warn");
+    }
+
+    #[test]
+    fn diagnostics_webview2_check_does_not_treat_directory_as_runtime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let check = super::webview2_runtime_check_for(&[temp.path().to_path_buf()]);
+        assert_eq!(check.status, "warn");
+    }
+
+    #[test]
     fn diagnostics_llm_repair_suggestions_include_base_url_override() {
         let diagnostics = super::build_agent_diagnostics(
             "agent-test".to_string(),
@@ -62752,9 +74444,190 @@ attach: last_assistant
     }
 
     #[test]
+    fn reasoning_capability_catalog_is_adapter_sourced_and_uses_auto_default() {
+        let catalog = api::reasoning_capability_catalog();
+        assert!(catalog.iter().any(|item| {
+            item.provider_id == "clawapi" && item.model_id == "claude-opus-4-6"
+        }));
+        assert!(catalog
+            .iter()
+            .any(|item| item.provider_id == "xai" && item.model_id == "grok-4.6"));
+        assert!(!catalog
+            .iter()
+            .any(|item| item.model_id.to_ascii_lowercase().contains("kimi")));
+        assert!(catalog
+            .iter()
+            .all(|item| item.default_reasoning == api::ReasoningEffort::Auto));
+        let haiku = catalog
+            .iter()
+            .find(|item| item.model_label == "Claude Haiku 4.5")
+            .expect("Claude Haiku 4.5 capability");
+        assert_eq!(haiku.model_id, "claude-haiku-4-5-20251001");
+        assert_eq!(
+            api::reasoning_model_aliases(&haiku.provider_id, &haiku.model_id),
+            vec!["claude-haiku-4-5-20251213"]
+        );
+        let deepseek = catalog
+            .iter()
+            .find(|item| item.model_id == "deepseek-v4-pro")
+            .expect("DeepSeek V4 capability");
+        assert!(super::capability_supports_reasoning(deepseek));
+        let gpt = catalog
+            .iter()
+            .find(|item| item.provider_id == "openai" && item.model_id == "gpt-4.1")
+            .expect("GPT-4.1 capability");
+        assert!(!super::capability_supports_reasoning(gpt));
+        let dto = super::model_reasoning_capability_dto(deepseek);
+        assert_eq!(dto.default_reasoning, "auto");
+        assert!(!dto.options.is_empty());
+        assert!(!dto.strategy.is_empty());
+        assert!(!dto.protocol.is_empty());
+        assert!(!dto.status.is_empty());
+        assert_eq!(dto.options.len(), 8);
+        assert!(dto.options.iter().all(|option| {
+            !option.value.is_empty()
+                && !option.label.is_empty()
+                && !option.effective.is_empty()
+                && !option.status.is_empty()
+        }));
+    }
+
+    #[test]
+    fn reasoning_preflight_options_follow_adapter_resolution_without_frontend_matrix() {
+        let catalog = api::reasoning_capability_catalog();
+        let deepseek = catalog
+            .iter()
+            .find(|item| item.provider_id == "deepseek" && item.model_id == "deepseek-v4-pro")
+            .expect("DeepSeek V4 capability");
+        let deepseek_options = super::model_reasoning_capability_dto(deepseek).options;
+        let medium = deepseek_options
+            .iter()
+            .find(|option| option.value == "medium")
+            .expect("DeepSeek medium preflight");
+        assert_eq!(medium.effective, "high");
+        assert_eq!(medium.status, "downgraded");
+        assert!(medium.selectable);
+        let deepseek_xhigh = deepseek_options
+            .iter()
+            .find(|option| option.value == "xhigh")
+            .expect("DeepSeek xhigh preflight");
+        assert_eq!(deepseek_xhigh.effective, "high");
+        assert_eq!(deepseek_xhigh.status, "downgraded");
+        assert!(deepseek_xhigh.selectable);
+        let glm = catalog
+            .iter()
+            .find(|item| item.provider_id == "zhipuai" && item.model_id == "glm-5.2")
+            .map(super::model_reasoning_capability_dto)
+            .expect("GLM-5.2 capability")
+            .options;
+        for (requested, effective, status) in [
+            ("minimal", "none", "downgraded"),
+            ("low", "high", "downgraded"),
+            ("medium", "high", "downgraded"),
+            ("xhigh", "max", "downgraded"),
+        ] {
+            let option = glm
+                .iter()
+                .find(|option| option.value == requested)
+                .expect("GLM-5.2 preflight option");
+            assert_eq!(option.effective, effective);
+            assert_eq!(option.status, status);
+            assert!(option.selectable);
+        }
+        let xhigh = catalog
+            .iter()
+            .find(|item| item.provider_id == "xai" && item.model_id == "grok-4.5")
+            .map(super::model_reasoning_capability_dto)
+            .expect("Grok 4.5 capability")
+            .options
+            .into_iter()
+            .find(|option| option.value == "xhigh")
+            .expect("Grok xhigh preflight");
+        assert_eq!(xhigh.effective, "high");
+        assert_eq!(xhigh.status, "downgraded");
+        assert!(xhigh.selectable);
+        let custom = catalog
+            .iter()
+            .find(|item| item.provider_id == "custom" && item.model_id == "custom-model")
+            .map(super::model_reasoning_capability_dto)
+            .expect("Custom capability")
+            .options
+            .into_iter()
+            .find(|option| option.value == "high")
+            .expect("Custom high preflight");
+        assert_eq!(custom.status, "unsupported");
+        assert!(!custom.selectable);
+    }
+
+    #[test]
+    fn strict_reasoning_validation_returns_bad_request_without_medium_fallback() {
+        let error = super::validate_reasoning_effort(Some("future-level")).expect_err("invalid value");
+        assert_eq!(error.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(super::default_reasoning_effort(), "auto");
+    }
+
+    #[test]
+    fn legacy_reasoning_keeps_raw_storage_and_exposes_resolution() {
+        let session = PersistedSession {
+            id: "legacy-reasoning".to_string(),
+            name: "legacy".to_string(),
+            provider: "DeepSeek".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            avatar: None,
+            base_url: None,
+            endpoint: None,
+            reasoning_effort: "future-level".to_string(),
+            model_type: "text".to_string(),
+            api_key_ref: String::new(),
+            memory_beads: Vec::new(),
+            created_at: 1,
+            updated_at: 1,
+            context_reset_at: 0,
+            messages: Vec::new(),
+        };
+        let summary = session.summary(true);
+        assert_eq!(session.reasoning_effort, "future-level");
+        assert_eq!(summary.reasoning_effort, "auto");
+        assert_eq!(summary.reasoning_resolution.requested, "auto");
+        assert_eq!(summary.reasoning_resolution.status, "legacy_fallback");
+    }
+
+    #[test]
+    fn agent_dto_legacy_reasoning_serializes_canonical_requested_and_status() {
+        let mut agent = super::default_agent_sessions()
+            .into_iter()
+            .next()
+            .expect("default agent");
+        agent.provider = "DeepSeek".to_string();
+        agent.model = "deepseek-v4-pro".to_string();
+        agent.reasoning_effort = "future-level".to_string();
+
+        let json = serde_json::to_value(&agent).expect("serialize agent DTO");
+        assert_eq!(json["reasoning_effort"], "auto");
+        assert_eq!(json["reasoning_resolution"]["requested"], "auto");
+        assert_eq!(json["reasoning_resolution"]["status"], "legacy_fallback");
+    }
+
+    #[test]
+    fn summary_resolution_keeps_requested_value_when_provider_downgrades_effective() {
+        let resolution = super::reasoning_resolution_for_session(
+            "deepseek",
+            "deepseek-v4-pro",
+            Some("medium"),
+        );
+        assert_eq!(resolution.requested, api::ReasoningEffort::Medium);
+        assert_eq!(resolution.effective, api::ReasoningEffort::High);
+        assert_eq!(
+            resolution.status,
+            api::ReasoningResolutionStatus::Downgraded
+        );
+        assert!(!resolution.reason.to_ascii_lowercase().contains("wire"));
+    }
+
+    #[test]
     fn web_frontend_exposes_custom_openai_compatible_session_fields() {
         assert!(WEB_INDEX_HTML.contains("session-reasoning-effort"));
-        assert!(WEB_INDEX_HTML.contains("<option>Custom</option>"));
+        assert!(WEB_INDEX_HTML.contains("session-reasoning-hint"));
         assert!(WEB_INDEX_HTML.contains("session-custom-model"));
         assert!(WEB_INDEX_HTML.contains("session-base-url"));
         assert!(WEB_INDEX_HTML.contains("session-endpoint"));
@@ -62763,7 +74636,62 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("payload.base_url"));
         assert!(WEB_APP_JS.contains("payload.endpoint"));
         assert!(WEB_APP_JS.contains("reasoning_effort"));
-        assert!(WEB_APP_JS.contains("REASONING_EFFORT_MATRIX"));
+        assert!(WEB_APP_JS.contains("/api/models/capabilities"));
+        assert!(!WEB_APP_JS.contains("PROVIDER_MODELS"));
+        assert!(!WEB_APP_JS.contains("REASONING_EFFORT_MATRIX"));
+        assert!(!WEB_INDEX_HTML.contains("Moonshot"));
+        assert!(WEB_APP_JS.contains("providerLabels"));
+        assert!(WEB_APP_JS.contains("entry.provider_label"));
+        assert!(WEB_APP_JS.contains("byAlias"));
+        assert!(WEB_APP_JS.contains("entry.aliases"));
+        assert!(WEB_MAIN_RS.contains("reasoning_model_aliases"));
+        assert!(WEB_MAIN_RS.contains("aliases: Vec<String>"));
+        assert!(WEB_APP_JS.contains("visibleDetails"));
+        assert!(WEB_APP_JS.contains("renderSessionReasoningHint();"));
+        assert!(!WEB_INDEX_HTML.contains("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn web_frontend_p6e4e_preserves_custom_reasoning_and_desktop_rail_layout() {
+        let reasoning_start = WEB_APP_JS
+            .find("function reasoningOptionDetailsForForm()")
+            .expect("reasoning form lookup must exist");
+        let reasoning_tail = &WEB_APP_JS[reasoning_start..];
+        let reasoning_end = reasoning_tail
+            .find("\nfunction reasoningLabel")
+            .expect("reasoning form lookup must end before labels");
+        let reasoning_source = &reasoning_tail[..reasoning_end];
+        assert!(reasoning_source.contains(
+            "modelCapabilityFor(provider, CUSTOM_PROVIDER_MODEL_FALLBACK)"
+        ));
+        assert!(
+            !reasoning_source.contains("MODEL_TYPE_MAP"),
+            "Custom reasoning fallback must not override model type inference"
+        );
+        assert!(WEB_APP_JS.contains(
+            "const CHAT_LAYOUT_COMPACT_MEDIA = \"(max-width: 980px)\";"
+        ));
+        assert!(WEB_APP_JS.contains("window.innerWidth <= 980"));
+
+        for token in [
+            ".chat-tool-host-content > .settings-workbench-window .settings-layout {",
+            "grid-template-rows: none;",
+            "grid-auto-rows: max-content;",
+            "align-content: start;",
+            ".settings-layout > .settings-section {",
+            "min-height: max-content;",
+            "overflow: visible;",
+            ".window-dock-more:not([open]) > .window-dock-secondary",
+            ".window-dock-more[open]",
+        ] {
+            assert!(WEB_STYLES_CSS.contains(token), "P6-E.4e CSS 契约缺失：{token}");
+        }
+        assert!(WEB_STYLES_CSS.contains(
+            "/* 真正窄屏才把右栏转成覆盖式抽屉；1280 桌面仍保留独立网格列。 */\n@media (max-width: 980px)"
+        ));
+        assert!(WEB_STYLES_CSS.contains(
+            "@media (max-width: 980px) {\n  body.ui-3d .workbench-window[data-window-theme=\"communication-bay\"] .chat-window-panel > .chat-right-rail.has-tool-view"
+        ));
     }
 
     #[test]
@@ -62814,9 +74742,10 @@ attach: last_assistant
     }
 
     #[test]
-    fn web_frontend_keeps_handoff_state_internal_to_the_slim_chat_sidebar() {
+    fn web_frontend_exposes_handoff_in_the_collaboration_rail() {
         assert!(!WEB_INDEX_HTML.contains("chat-handoff-toggle"));
-        assert!(!WEB_INDEX_HTML.contains("chat-handoff-manual"));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"chat-handoff-manual\""));
+        assert!(WEB_INDEX_HTML.contains("assets/icons-wuxia/branch.svg"));
         assert!(WEB_INDEX_HTML.contains("data-role=\"chat-roster\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"handoff-drawer\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"handoff-list\""));
@@ -62913,11 +74842,12 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("async function saveChatRoomPermission"));
         assert!(WEB_APP_JS.contains("function setChatWorkspacePath"));
         assert!(WEB_APP_JS.contains("beginWorkspaceEdit('[data-role=\"chat-workspace-path\"]')"));
-        assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"channel-models\" hidden"));
+        assert!(WEB_INDEX_HTML.contains("id=\"chat-right-rail\""));
+        assert!(WEB_INDEX_HTML.contains("data-sidebar-group=\"channel-models\""));
+        assert!(!WEB_INDEX_HTML.contains("data-sidebar-group=\"channel-models\" hidden"));
         for removed_action in [
             "chat-room-diagnostics",
             "chat-handoff-toggle",
-            "chat-handoff-manual",
             "message-load-older",
             "message-delete-selected",
         ] {
@@ -62954,9 +74884,1142 @@ attach: last_assistant
             "chat sidebar must keep room management, recipients, permission and workspace order"
         );
         assert!(!WEB_STYLES_CSS.contains(".chat-compact-actions {\n  margin-top: auto;"));
-        assert!(WEB_STYLES_CSS.contains("--top-region-ratio: 12%"));
-        assert!(WEB_STYLES_CSS.contains("--top-side-column: 26%"));
-        assert!(WEB_STYLES_CSS.contains("--top-center-column: 48%"));
+        assert!(WEB_STYLES_CSS.contains("--top-region-height: 48px"));
+        assert!(WEB_STYLES_CSS.contains("--quick-rail-width: clamp(52px, 3.75vw, 60px)"));
+        assert!(WEB_STYLES_CSS.contains(
+            "grid-template-columns: var(--quick-rail-width) minmax(0, 1fr);"
+        ));
+    }
+
+    #[test]
+    fn web_frontend_chat_uses_resizable_asymmetric_three_column_layout() {
+        let left_rail = WEB_INDEX_HTML
+            .find("<aside id=\"chat-left-rail\"")
+            .expect("聊天左栏必须存在");
+        let left_resizer = WEB_INDEX_HTML
+            .find("data-role=\"chat-left-rail-resizer\"")
+            .expect("聊天左分隔条必须存在");
+        let main_column = WEB_INDEX_HTML
+            .find("<div class=\"chat-main-column\"")
+            .expect("聊天主栏必须存在");
+        let right_resizer = WEB_INDEX_HTML
+            .find("data-role=\"chat-right-rail-resizer\"")
+            .expect("聊天右分隔条必须存在");
+        let right_rail = WEB_INDEX_HTML
+            .find("<aside id=\"chat-right-rail\"")
+            .expect("聊天右栏必须存在");
+        assert!(left_rail < left_resizer);
+        assert!(left_resizer < main_column);
+        assert!(main_column < right_resizer);
+        assert!(right_resizer < right_rail);
+
+        for action in [
+            "chat-left-rail-toggle",
+            "chat-right-rail-toggle",
+            "chat-focus-layout",
+            "chat-handoff-manual",
+            "chat-task-chain",
+        ] {
+            assert!(
+                WEB_INDEX_HTML.contains(&format!("data-action=\"{action}\"")),
+                "缺少聊天布局动作：{action}"
+            );
+        }
+        assert!(WEB_INDEX_HTML
+            .contains("class=\"chat-rail-overlay-close chat-left-overlay-close\""));
+        assert!(WEB_INDEX_HTML
+            .contains("class=\"chat-rail-overlay-close chat-right-overlay-close\""));
+        for (rail, label, min, max, value) in [
+            ("chat-left-rail", "聊天导航侧栏", "190", "360", "285"),
+            ("chat-right-rail", "协作与任务链侧栏", "240", "760", "480"),
+        ] {
+            assert!(
+                WEB_INDEX_HTML.contains(&format!("aria-controls=\"{rail}\"")),
+                "聊天布局控件必须关联侧栏：{rail}"
+            );
+            assert!(
+                WEB_INDEX_HTML.contains(&format!("aria-label=\"调整{label}宽度\"")),
+                "聊天分隔条必须有可读标签：{rail}"
+            );
+            assert!(
+                WEB_INDEX_HTML.contains(&format!(
+                    "role=\"separator\" aria-label=\"调整{label}宽度\" aria-controls=\"{rail}\" aria-orientation=\"vertical\" aria-valuemin=\"{min}\" aria-valuemax=\"{max}\" aria-valuenow=\"{value}\""
+                )),
+                "聊天分隔条必须声明方向与宽度范围：{rail}"
+            );
+        }
+        for asset in [
+            "chevron.svg",
+            "plus.svg",
+            "rename.svg",
+            "delete.svg",
+            "check.svg",
+            "settings.svg",
+            "lock.svg",
+            "refresh.svg",
+            "folder.svg",
+            "shield.svg",
+            "unlock.svg",
+            "branch.svg",
+            "chat.svg",
+            "upload.svg",
+            "send.svg",
+            "microphone.svg",
+        ] {
+            assert!(
+                WEB_INDEX_HTML.contains(&format!("assets/icons-wuxia/{asset}")),
+                "聊天控件缺少武侠 SVG 图标引用：{asset}"
+            );
+        }
+        for asset in [
+            "assets/icons-wuxia/chat.svg",
+            "assets/icons-wuxia/branch.svg",
+            "assets/icons-wuxia/tasks.svg",
+            "assets/icons-wuxia/check.svg",
+            "assets/icons-wuxia/delete.svg",
+            "assets/avatars/wuxia-v3/bamboo-swordsman.png",
+        ] {
+            assert!(
+                WEB_INDEX_HTML.contains(asset) || WEB_APP_JS.contains(asset),
+                "聊天默认/条件态资源必须来自已批准武侠资源：{asset}"
+            );
+        }
+        for token in [
+            "p2-c-chat-icon-boundaries",
+            ".chat-right-collaboration-panel .chat-roster-chip > img",
+            ".chat-permission-controls .mini-button > img",
+            ".chat-workspace-control .mini-button > img",
+            ".chat-session-auth .mini-button > img",
+            "min-width: 30px;\n  max-width: 30px;\n  min-height: 30px;\n  max-height: 30px;",
+            "min-width: 14px;\n  max-width: 14px;\n  min-height: 14px;\n  max-height: 14px;",
+        ] {
+            assert!(WEB_STYLES_CSS.contains(token), "P2-C 聊天图标边界契约缺失：{token}");
+        }
+
+        assert!(WEB_STYLES_CSS.contains("--chat-left-width: clamp(236px, 18%, 285px)"));
+        assert!(WEB_STYLES_CSS.contains("--chat-right-width: clamp(328px, 30%, 480px)"));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"chat-room-search\""));
+        assert!(WEB_APP_JS.contains("option.className = \"session-option chat-room-nav-item\""));
+        assert!(WEB_INDEX_HTML.contains("assets/icons-wuxia/rename.svg"));
+        assert!(!WEB_INDEX_HTML.contains("chat-room-trigger"));
+        assert!(!WEB_STYLES_CSS.contains("chat-room-trigger"));
+        assert!(WEB_STYLES_CSS.contains(
+            "grid-template-columns: 32px minmax(0, 1fr) var(--right-rail-status-slot);"
+        ));
+        assert!(WEB_STYLES_CSS.contains("grid-column: 3;"));
+        assert!(WEB_STYLES_CSS.contains("grid-column: 1;"));
+        assert!(WEB_STYLES_CSS.contains("grid-column: 2;"));
+        assert!(WEB_STYLES_CSS.contains("grid-column: 3;"));
+        assert!(WEB_STYLES_CSS.contains("grid-column: 4;"));
+        assert!(WEB_STYLES_CSS.contains("grid-column: 5;"));
+        assert!(WEB_STYLES_CSS.contains("@media (max-width: 1439px)"));
+        assert!(WEB_STYLES_CSS.contains("@media (max-width: 980px)"));
+        assert!(WEB_STYLES_CSS.matches("grid-column: auto;").count() >= 2);
+        assert!(WEB_STYLES_CSS.contains(".chat-window-panel > .chat-right-rail"));
+        assert!(WEB_STYLES_CSS.contains(".chat-window-panel > .chat-left-rail"));
+        assert!(WEB_STYLES_CSS.contains("position: absolute;"));
+        assert!(WEB_STYLES_CSS.contains(".chat-window-panel.is-right-overlay-open"));
+        assert!(WEB_STYLES_CSS.contains(".chat-window-panel.is-left-overlay-open"));
+        assert!(WEB_STYLES_CSS.contains("pointer-events: none;"));
+        assert!(WEB_STYLES_CSS.contains("chat-atmosphere-bamboo"));
+        assert!(WEB_STYLES_CSS.contains("chat-atmosphere-jade"));
+        assert!(WEB_STYLES_CSS.contains("chatLanternSway"));
+        assert!(WEB_STYLES_CSS.contains("chat-top-status-lantern"));
+        assert!(WEB_STYLES_CSS.contains(
+            "chat-backgrounds/wuxia-bamboo-moonlit-chat-stage-v2.png"
+        ));
+
+        assert!(WEB_APP_JS.contains("const CHAT_LAYOUT_STORAGE_PREFIX"));
+        assert!(WEB_APP_JS.contains("function normalizeChatLayoutWidth"));
+        assert!(WEB_APP_JS.contains("function beginChatLayoutSeparatorDrag"));
+        assert!(WEB_APP_JS.contains("const separatorAvailable = open"));
+        assert!(WEB_APP_JS.contains("function setChatLayoutInert"));
+        assert!(WEB_APP_JS.contains("node.inert = inert"));
+        assert!(WEB_APP_JS.contains("rail.setAttribute(\"aria-hidden\", String(!open))"));
+        assert!(WEB_APP_JS.contains("separator.setAttribute(\"aria-disabled\", String(!separatorAvailable))"));
+        assert!(WEB_APP_JS.contains("chatLayoutState.narrowOpen"));
+        assert!(WEB_APP_JS.contains("if (side === \"left\") {\n    return false;"));
+        assert!(WEB_APP_JS.contains(
+            "if (side === \"right\" && chatLayoutIsCompact()) {\n    return false;"
+        ));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"chat-quick-layout-controls\""));
+        assert!(!WEB_INDEX_HTML.contains(
+            "data-role=\"chat-quick-layout-controls\" aria-label=\"聊天室布局控制\" hidden"
+        ));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"agent-trigger\""));
+        assert!(WEB_APP_JS.contains("agentTrigger?.addEventListener(\"keydown\""));
+        assert!(WEB_APP_JS.contains("event.key !== \"Enter\" && event.key !== \" \""));
+        assert!(WEB_APP_JS.contains("agentTrigger.click();"));
+        assert!(WEB_APP_JS.contains("function closeTaskChainModal"));
+        assert!(WEB_APP_JS.contains(
+            "中止当前回复；服务端将停止后续模型轮次、工具派发与后续写回"
+        ));
+        assert!(!WEB_INDEX_HTML.contains("naturalWidth"));
+        for placeholder in [
+            "No goals",
+            "No phases yet",
+            "G1 stores the contract first",
+            "full-streaming gates",
+            "Full streaming readiness gates",
+            "Success Rate",
+            "Prompt preview failed",
+            "Context preview failed",
+            "Please enter a PowerShell command.",
+            "PowerShell failed:",
+            "No execution yet.",
+            "Diff: ",
+        ] {
+            assert!(
+                !WEB_INDEX_HTML.contains(placeholder) && !WEB_APP_JS.contains(placeholder),
+                "用户可见开发占位文案不得回归：{placeholder}"
+            );
+        }
+        assert!(!WEB_STYLES_CSS.contains("naturalWidth"));
+        assert!(!WEB_APP_JS.contains("naturalWidth"));
+        for unsupported in [
+            "chat-queue",
+            "chat-steer",
+            "chat-interrupt",
+            "chat-checkpoint",
+            "chat-worktree",
+        ] {
+            assert!(
+                !WEB_INDEX_HTML.contains(&format!("data-action=\"{unsupported}\"")),
+                "未实现的 Turn 能力不得显示为可用控件：{unsupported}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_frontend_right_rail_uses_real_aria_tabs_and_state_panels() {
+        let rail_start = WEB_INDEX_HTML
+            .find("<aside id=\"chat-right-rail\"")
+            .expect("右栏必须存在");
+        let footer_marker = WEB_INDEX_HTML[rail_start..]
+            .find("data-role=\"chat-right-rail-footer\"")
+            .map(|offset| rail_start + offset)
+            .expect("右栏 footer 必须存在");
+        let rail_end = WEB_INDEX_HTML[footer_marker..]
+            .find("</aside>")
+            .map(|offset| footer_marker + offset)
+            .expect("右栏必须闭合");
+        let rail = &WEB_INDEX_HTML[rail_start..rail_end];
+        assert_eq!(rail.matches("role=\"tab\"").count(), 4);
+        assert_eq!(rail.matches("role=\"tabpanel\"").count(), 4);
+        assert_eq!(rail.matches("aria-selected=\"true\"").count(), 1);
+        for tab in ["collaboration", "tasks", "status", "tools"] {
+            assert!(rail.contains(&format!("data-right-tab=\"{tab}\"")));
+            assert!(rail.contains(&format!("data-right-panel=\"{tab}\"")));
+            assert!(rail.contains(&format!("aria-controls=\"chat-right-panel-{tab}\"")));
+        }
+        assert!(rail.contains("data-role=\"chat-right-tabs\""));
+        assert!(rail.contains("data-role=\"chat-right-panels\""));
+        assert!(rail.contains("data-right-panel=\"tasks\""));
+        assert!(rail.contains("data-right-panel=\"status\""));
+        assert!(rail.contains("data-role=\"chat-tool-host\""));
+        assert!(rail.contains("data-action=\"chat-tool-back\""));
+        assert!(rail.contains("data-action=\"chat-tool-close\""));
+        assert!(rail.contains("chat-right-panel-tasks\" class=\"chat-right-panel") && rail.contains("tabindex=\"0\" hidden"));
+        assert!(rail.contains("chat-right-panel-status\" class=\"chat-right-panel") && rail.contains("tabindex=\"0\" hidden"));
+        let footer_start = rail
+            .find("data-role=\"chat-right-rail-footer\"")
+            .expect("右栏 footer 必须存在");
+        let footer = &rail[footer_start..];
+        assert!(footer.contains("data-action=\"chat-task-chain\""));
+        assert!(footer.contains("data-action=\"chat-right-rail-toggle\""));
+        for asset in ["branch.svg", "tasks.svg", "shield.svg", "chat.svg", "folder.svg", "model-scroll.svg", "chevron.svg", "mcp-tools.svg"] {
+            assert!(rail.contains(&format!("assets/icons-wuxia/{asset}")), "右栏缺少武侠 SVG：{asset}");
+        }
+        for forbidden in ["state=", "mode=", "->", "🙂", "😀"] {
+            assert!(!rail.contains(forbidden), "右栏不得暴露内部枚举、字符箭头或 emoji：{forbidden}");
+        }
+        for token in [
+            "function initializeChatRightRailTabs",
+            "function setChatRightRailTab",
+            "ArrowLeft",
+            "ArrowRight",
+            "event.key === \"Home\"",
+            "event.key === \"End\"",
+            "function updateChatRightRailBadge",
+            "function renderChatRightRailStatus",
+            "chatRightRailPermissionLabel",
+            "chatTaskStatusLabel(status)",
+        ] {
+            assert!(WEB_APP_JS.contains(token), "右栏 tab/状态同步契约缺失：{token}");
+        }
+        for token in [
+            "grid-template-rows: 52px 42px minmax(0, 1fr) 52px;",
+            ".chat-right-tabs",
+            ".chat-right-tab > img",
+            ".chat-right-footer-action > img",
+            ":not(.chat-right-tab):not(.chat-right-footer-action) > img",
+            "height: 42px;",
+            "min-height: 46px;",
+            "min-height: 44px;",
+            "min-height: 36px;",
+            ".chat-right-tab-badge[hidden]",
+            ".chat-right-footer-badge[hidden]",
+            "display: none;",
+            ".chat-right-rail-footer",
+        ] {
+            assert!(WEB_STYLES_CSS.contains(token), "右栏坐标/尺寸契约缺失：{token}");
+        }
+        let status_start = WEB_APP_JS
+            .find("function renderChatRightRailStatus")
+            .expect("右栏状态渲染函数必须存在");
+        let status_end = WEB_APP_JS[status_start..]
+            .find("function renderChatRoster")
+            .map(|offset| status_start + offset)
+            .expect("右栏状态渲染函数必须有边界");
+        let status_source = &WEB_APP_JS[status_start..status_end];
+        assert!(status_source.contains("const session = sessionById(activeSessionId);"));
+        assert!(status_source.contains("const activeRegistryAgent = agentRegistry?.agents?.find"));
+        assert!(status_source.contains("const activeAgent = session || sessionAgent || activeRegistryAgent;"));
+        assert!(status_source.contains("const modelName = session?.model"));
+        assert!(status_source.contains("|| sessionAgent?.model"));
+        assert!(status_source.contains("|| activeRegistryAgent?.model"));
+        assert!(status_source.contains("const taskSnapshot = chatRightRailActiveTaskSnapshot();"));
+        assert!(status_source.contains("const taskState = chatRightRailLanternState(taskSnapshot);"));
+        assert!(status_source.contains("lantern.dataset.state = state;"));
+        assert!(!status_source.contains("mergedRuntimeTaskItems().length > 0"));
+
+        let active_runtime_start = WEB_APP_JS
+            .find("function chatRightRailActiveRuntimeTasks")
+            .expect("右栏必须有运行任务活动状态过滤");
+        let active_runtime_end = WEB_APP_JS[active_runtime_start..]
+            .find("function chatRightRailActiveTaskSnapshot")
+            .map(|offset| active_runtime_start + offset)
+            .expect("运行任务活动状态过滤必须有边界");
+        let active_runtime_source = &WEB_APP_JS[active_runtime_start..active_runtime_end];
+        for token in [
+            "runtimeTaskTodoStatus(task)",
+            "[\"pending\", \"running\", \"blocked\"].includes(status)",
+            "\"completed\"",
+            "\"succeeded\"",
+            "\"failed\"",
+            "\"rejected\"",
+            "\"cancelled\"",
+            "\"canceled\"",
+            "\"skipped\"",
+        ] {
+            assert!(active_runtime_source.contains(token), "活动运行任务契约缺失：{token}");
+        }
+        assert!(active_runtime_source.contains("terminalStatuses.has(rawStatus)"));
+        assert!(WEB_APP_JS.contains(
+            "updateChatRightRailBadge(\"chat-right-task-count\", taskSnapshot.items.length);"
+        ));
+        for token in [
+            "function chatTaskRuntimeDisplayTitle",
+            "chatTaskRuntimeDisplayTitle(runtimeTask)",
+            "chatTaskRuntimeDisplayTitle(failedRuntimeTask)",
+            "function runtimeModelProbeTaskChainDetails",
+        ] {
+            assert!(WEB_APP_JS.contains(token), "runtime 展示标题契约缺失：{token}");
+        }
+        let handoff_start = WEB_APP_JS
+            .find("function renderHandoffList")
+            .expect("交接列表渲染函数必须存在");
+        let handoff_end = WEB_APP_JS[handoff_start..]
+            .find("function toggleHandoffDrawer")
+            .map(|offset| handoff_start + offset)
+            .expect("交接列表渲染函数必须有边界");
+        let handoff_source = &WEB_APP_JS[handoff_start..handoff_end];
+        assert!(!handoff_source.contains("chat-right-task-count"));
+        let roster_start = WEB_APP_JS
+            .find("function renderChatRoster")
+            .expect("协作 Agent 列表渲染函数必须存在");
+        let roster_end = WEB_APP_JS[roster_start..]
+            .find("function renderHandoffList")
+            .map(|offset| roster_start + offset)
+            .expect("协作 Agent 列表渲染函数必须有明确边界");
+        let roster_source = &WEB_APP_JS[roster_start..roster_end];
+        for token in [
+            "icon.src = \"./assets/icons-wuxia/branch.svg\";",
+            "icon.setAttribute(\"aria-hidden\", \"true\");",
+            "暂无可转交 Agent",
+            "启动或连接 Agent 后可在此转交",
+            "chat-roster-empty-copy",
+        ] {
+            assert!(roster_source.contains(token), "协作空态契约缺失：{token}");
+        }
+        assert!(!roster_source.contains("empty.textContent = \"无可转交 Agent\";"));
+        for token in [
+            "icon.src = \"./assets/icons-wuxia/tasks.svg\";",
+            "icon.setAttribute(\"aria-hidden\", \"true\");",
+            "暂无任务链",
+            "任务转交记录会显示在这里",
+            "handoff-empty-copy",
+        ] {
+            assert!(handoff_source.contains(token), "任务链空态契约缺失：{token}");
+        }
+        assert!(!handoff_source.contains("empty.textContent = \"暂无任务链\";"));
+        for token in [
+            "p2-b-sidebar-density",
+            "min-height: 100px;",
+            "grid-template-columns: 28px minmax(0, 1fr);",
+            ".chat-roster-empty-copy",
+            ".handoff-empty-copy",
+        ] {
+            assert!(WEB_STYLES_CSS.contains(token), "右栏空态视觉契约缺失：{token}");
+        }
+    }
+
+    #[test]
+    fn web_frontend_p6c1_keeps_chat_primary_and_mounts_real_tool_windows() {
+        let window_ids = [
+            "chat",
+            "project",
+            "tasks",
+            "terminal",
+            "browser",
+            "settings",
+            "clawbot",
+            "memory",
+            "vision",
+        ];
+        for window_id in window_ids {
+            let window_marker = format!("data-window-id=\"{window_id}\"");
+            let target_marker = format!("data-window-target=\"{window_id}\"");
+            assert_eq!(
+                WEB_INDEX_HTML.matches(&window_marker).count(),
+                1,
+                "真实窗口必须唯一：{window_id}"
+            );
+            assert_eq!(
+                WEB_INDEX_HTML.matches(&target_marker).count(),
+                1,
+                "窗口入口必须唯一：{window_id}"
+            );
+            assert!(
+                WEB_INDEX_HTML.contains(&format!("{target_marker} data-window-icon=")),
+                "窗口入口必须保留图标映射：{window_id}"
+            );
+        }
+        let dock_start = WEB_INDEX_HTML
+            .find("class=\"window-dock\"")
+            .expect("窗口快捷栏必须存在");
+        let dock_end = dock_start
+            + WEB_INDEX_HTML[dock_start..]
+                .find("</nav>")
+                .expect("窗口快捷栏必须闭合");
+        let dock = &WEB_INDEX_HTML[dock_start..dock_end];
+        assert_eq!(dock.matches("data-window-target=\"").count(), 9);
+        assert!(WEB_INDEX_HTML.contains("data-active-window=\"chat\""));
+        assert!(WEB_INDEX_HTML.contains("class=\"chat-main-column\""));
+        assert_eq!(WEB_INDEX_HTML.matches("data-right-tab=\"tools\"").count(), 1);
+        assert_eq!(WEB_INDEX_HTML.matches("data-role=\"chat-tool-host\"").count(), 1);
+        assert_eq!(
+            WEB_INDEX_HTML
+                .matches("data-role=\"chat-tool-host-content\"")
+                .count(),
+            1
+        );
+        assert!(WEB_INDEX_HTML.contains("data-right-panel=\"tools\" role=\"tabpanel\""));
+        assert!(WEB_INDEX_HTML.contains(
+            "chat-right-panel-tools\" class=\"chat-right-panel chat-right-tool-panel\""
+        ));
+        assert!(WEB_INDEX_HTML.contains(
+            "chat-right-panel-tools\" class=\"chat-right-panel chat-right-tool-panel\" data-right-panel=\"tools\" role=\"tabpanel\" aria-labelledby=\"chat-right-tab-tools\" tabindex=\"0\" hidden"
+        ));
+        assert!(WEB_INDEX_HTML.contains("class=\"window-dock-more\""));
+        assert!(WEB_INDEX_HTML.contains("<summary class=\"window-tab window-dock-more-toggle\""));
+
+        let dom_start = WEB_APP_JS
+            .find("document.addEventListener(\"DOMContentLoaded\"")
+            .expect("DOMContentLoaded 初始化入口必须存在");
+        let dom_source = &WEB_APP_JS[dom_start..];
+        let workbench_init = dom_source
+            .find("initializeWorkbenchWindows();")
+            .expect("工作窗口初始化必须存在");
+        let chat_layout_init = dom_source
+            .find("initializeChatLayout();")
+            .expect("聊天布局初始化必须存在");
+        assert!(
+            workbench_init < chat_layout_init,
+            "必须先完成工作窗口初始化，再初始化聊天布局"
+        );
+
+        for window_id in [
+            "project",
+            "tasks",
+            "terminal",
+            "browser",
+            "settings",
+            "clawbot",
+            "memory",
+            "vision",
+        ] {
+            assert!(
+                WEB_APP_JS.contains(&format!("{window_id}: Object.freeze(")),
+                "工具元数据必须覆盖入口：{window_id}"
+            );
+        }
+        for token in [
+            "const CHAT_TOOL_WINDOW_META",
+            "const CHAT_TOOL_WINDOW_IDS",
+            "const CHAT_RIGHT_RAIL_TABS = Object.freeze([\"collaboration\", \"tasks\", \"status\", \"tools\"])",
+            "function openChatToolWindow",
+            "function closeChatToolWindow",
+            "function focusChatToolWindow",
+            "function restoreChatToolWindowNode",
+            "document.createComment(`chat-tool-window:${windowId}`)",
+            "content.append(node);",
+            "workbench.dataset.activeWindow = \"chat\"",
+            "chatLayoutState.right = \"open\"",
+            "chatLayoutState.narrowOpen = chatLayoutIsNarrow() ? \"right\" : null",
+            "requestedToolWindow = validWindows.has(requestedWindow)",
+            "function queueChatToolWindowRequest",
+            "function flushPendingChatToolWindowRequest",
+            "pendingChatToolWindowRequest = windowId",
+            "queueChatToolWindowRequest(requestedToolWindow);",
+            "new URLSearchParams(location.search).get(\"window\")",
+            "panel.hidden = !active",
+            "button.setAttribute(\"aria-selected\", String(active));",
+            "tab.addEventListener(\"click\"",
+            "more.open = false",
+        ] {
+            assert!(WEB_APP_JS.contains(token), "P6-C.1 工具宿主/聊天常驻契约缺失：{token}");
+        }
+        let open_start = WEB_APP_JS
+            .find("function openChatToolWindow")
+            .expect("工具打开函数必须存在");
+        let open_end = open_start
+            + WEB_APP_JS[open_start..]
+                .find("function closeChatToolWindow")
+                .expect("工具关闭函数必须存在");
+        let open_source = &WEB_APP_JS[open_start..open_end];
+        for token in [
+            "chatToolWindowOrigin =",
+            "originMarker",
+            "content.append(node);",
+            "workbench.dataset.activeWindow = \"chat\"",
+            "setChatRightRailTab(\"tools\", { internal: true })",
+            "restoreLayout: false",
+            "focusChatToolWindow();",
+        ] {
+            assert!(open_source.contains(token), "工具打开/切换契约缺失：{token}");
+        }
+        let close_start = open_end;
+        let close_end = close_start
+            + WEB_APP_JS[close_start..]
+                .find("function setChatRightRailTab")
+                .expect("右栏 tab 函数必须存在");
+        let close_source = &WEB_APP_JS[close_start..close_end];
+        for token in [
+            "restoreChatToolWindowNode(node);",
+            "workbench.dataset.activeWindow = \"chat\"",
+            "updateWorkbenchToolDock(\"chat\");",
+            "restoreChatToolLayoutSnapshot();",
+            "focusReturnTab",
+        ] {
+            assert!(close_source.contains(token), "工具关闭/恢复契约缺失：{token}");
+        }
+        let tab_start = WEB_APP_JS
+            .find("function setChatRightRailTab")
+            .expect("右栏 tab 函数必须存在");
+        let tab_source = &WEB_APP_JS[tab_start..];
+        for token in [
+            "options.fromUser && selected !== \"tools\" && chatToolWindowId",
+            "restoreLayout: false",
+            "discardLayoutSnapshot: true",
+        ] {
+            assert!(tab_source.contains(token), "用户切 tab 快照清理契约缺失：{token}");
+        }
+        let escape_start = WEB_APP_JS
+            .find("function chatLayoutHandleEscape")
+            .expect("Escape 处理函数必须存在");
+        let escape_source = &WEB_APP_JS[escape_start..];
+        assert!(escape_source.contains("if (chatToolWindowId)"));
+        assert!(escape_source.contains("closeChatToolWindow({ focusChat: true, restoreTab: true });"));
+        assert!(!WEB_APP_JS.contains("dataset.activeWindow = activeWindow"));
+        assert!(!WEB_APP_JS.contains("workbench.dataset.activeWindow = windowId"));
+        assert!(WEB_INDEX_HTML.contains("aria-valuemin=\"240\" aria-valuemax=\"760\""));
+        for token in [
+            "--chat-tool-preferred-width: clamp(420px, 42vw, 760px);",
+            "width: min(var(--chat-tool-width), calc(100% - 58px));",
+            "transform: none !important;",
+            "animation: none !important;",
+            ".chat-tool-host-content > .workbench-window.is-active",
+            ".project-workbench-window .project-layout",
+            ".project-workbench-window .project-layout > .project-command-rail",
+            ".settings-workbench-window .settings-layout",
+            ".tasks-workbench-window .task-permission-layout",
+            ".task-permission-layout > .task-permission-column",
+            ".tasks-workbench-window .module-selfcheck-row",
+            ".browser-workbench-window .browser-window-toolbar",
+            ".terminal-workbench-window .terminal-window-command",
+            ".memory-workbench-window .memory-window-filters",
+            ".memory-workbench-window .memory-window-insights",
+            ".memory-workbench-window .memory-window-layout",
+            ".memory-workbench-window .memory-window-list-pane",
+            ".memory-workbench-window .memory-window-jobs",
+            ".memory-workbench-window .memory-window-history",
+            ".vision-workbench-window .vision-window-layout",
+            ".clawbot-workbench-window .clawbot-window-panel",
+            ".layout-top-region > .top-chat-context",
+            ".chat-right-rail-heading-copy",
+            "inset-inline: 0;",
+            "max-width: 100%;",
+            "grid-template-columns: minmax(0, 1fr) minmax(128px, 176px) minmax(0, 1fr);",
+            "max-width: 176px;",
+            "grid-template-rows: minmax(23px, 1fr) 16px;",
+            "justify-content: center;",
+            "position: absolute;",
+            "grid-template-columns: minmax(0, 1fr);",
+        ] {
+            assert!(WEB_STYLES_CSS.contains(token), "P6-C.1 宿主/响应式 CSS 契约缺失：{token}");
+        }
+        let host_rules_start = WEB_STYLES_CSS
+            .find("/* P6-C.1：工具宿主压缩真实窗口的内部轨道")
+            .expect("P6-C.1 工具宿主组合规则必须存在");
+        let host_rules = &WEB_STYLES_CSS[host_rules_start..];
+        assert!(host_rules.contains(
+            "body.ui-3d .chat-tool-host-content > .tasks-workbench-window .task-permission-layout"
+        ));
+        assert!(host_rules.contains(
+            "body.ui-3d .chat-tool-host-content > .memory-workbench-window .memory-window-filters"
+        ));
+        assert!(host_rules.contains("grid-template-columns: repeat(auto-fit, minmax(136px, 1fr));"));
+        assert!(host_rules.contains("grid-template-columns: repeat(2, minmax(0, 1fr));"));
+        assert!(host_rules.contains("grid-template-rows: none;"));
+        assert!(!host_rules.contains(".task-window-grid"));
+        assert!(!host_rules.contains(".task-window-auth-grid"));
+        let p6d_rules_start = WEB_STYLES_CSS
+            .find("* P6-C.1d：宿主窄栏的最终边界校正")
+            .expect("P6-C.1d 宿主边界校正规则必须存在");
+        let p6d_rules = &WEB_STYLES_CSS[p6d_rules_start..];
+        for token in [
+            ".layout-top-region > .top-chat-context > .top-chat-room-slot",
+            ".chat-tool-host-content > .tasks-workbench-window .task-window-section-head.compact",
+            ".chat-tool-host-content > .project-workbench-window .ide-preview-body",
+            ".chat-tool-host-content > .browser-workbench-window .browser-bridge-diagnostic-body",
+            ".chat-tool-host-content > .terminal-workbench-window .terminal-console-shell",
+            ".chat-tool-host-content > .clawbot-workbench-window .clawbot-private-operations",
+            ".chat-tool-host-content > .clawbot-workbench-window .clawbot-binding-form",
+            ".chat-tool-host-content > .vision-workbench-window .vision-window-layout",
+            ".chat-tool-host-content > .vision-workbench-window .vision-window-summary",
+            ".chat-tool-host-content > .vision-workbench-window .vision-window-details",
+            "grid-template-rows: minmax(0, 1fr) minmax(64px, 140px);",
+        ] {
+            assert!(p6d_rules.contains(token), "P6-C.1d 宿主边界契约缺失：{token}");
+        }
+        assert!(!p6d_rules.contains("width: min(calc(100% - 104px), 260px);"));
+        assert!(WEB_STYLES_CSS[..p6d_rules_start].contains("body.ui-3d .project-layout"));
+        assert!(WEB_STYLES_CSS[..p6d_rules_start].contains("body.ui-3d .vision-window-layout"));
+        let p6f_rules_start = WEB_STYLES_CSS
+            .find("* P6-C.1f：工程命令栏宿主内恢复目录树可用高度")
+            .expect("P6-C.1f 工程命令栏宿主修复规则必须存在");
+        assert!(
+            p6f_rules_start > p6d_rules_start,
+            "P6-C.1f 必须追加在 P6-C.1d 之后"
+        );
+        let p6f_rules = &WEB_STYLES_CSS[p6f_rules_start..];
+        for token in [
+            ".chat-tool-host-content > .project-workbench-window .project-layout > .project-command-rail",
+            ".chat-tool-host-content > .project-workbench-window .project-layout > .project-command-rail > .project-tree",
+            "width: 100%;",
+            "max-width: 100%;",
+            "min-width: 0;",
+            "box-sizing: border-box;",
+            "grid-template-columns: minmax(0, 1fr);",
+            "grid-template-rows: repeat(6, auto) minmax(120px, 1fr);",
+            "min-height: 120px;",
+            "height: auto;",
+            "overflow-x: hidden;",
+            "overflow-y: auto;",
+        ] {
+            assert!(p6f_rules.contains(token), "P6-C.1f 工程树宿主契约缺失：{token}");
+        }
+        assert!(
+            p6f_rules.contains(".project-layout > .project-command-rail > .project-tree")
+        );
+        assert!(
+            !p6f_rules.contains("browser-workbench-window"),
+            "P6-C.1f 不得扩大到浏览器宿主"
+        );
+        assert!(
+            WEB_STYLES_CSS[..p6f_rules_start].contains("body.ui-3d .project-layout"),
+            "独立工程工作台的全局布局规则必须保留"
+        );
+        let p6g_rules_start = WEB_STYLES_CSS
+            .find("* P6-C.1g：工程目录工具宿主首屏顺序与可用高度校正")
+            .expect("P6-C.1g 工程目录首屏规则必须存在");
+        assert!(
+            p6g_rules_start > p6f_rules_start,
+            "P6-C.1g 必须追加在 P6-C.1f 之后"
+        );
+        let p6g_rules = &WEB_STYLES_CSS[p6g_rules_start..];
+        for selector in [
+            "body.ui-3d .chat-tool-host-content > .project-workbench-window .project-layout > .project-command-rail",
+            "body.ui-3d .chat-tool-host-content > .project-workbench-window .project-layout > .project-command-rail > .ide-toolbar",
+            "body.ui-3d .chat-tool-host-content > .project-workbench-window .project-layout > .project-command-rail > .ide-toolbar > .mini-button",
+            "body.ui-3d .chat-tool-host-content > .project-workbench-window .project-layout > .project-command-rail > .ide-toolbar > .ide-omni-search",
+            "body.ui-3d .chat-tool-host-content > .project-workbench-window .project-layout > .project-command-rail > .ide-diff-paths",
+            "body.ui-3d .chat-tool-host-content > .project-workbench-window .project-layout > .project-command-rail > .ide-omni-host",
+            "body.ui-3d .chat-tool-host-content > .project-workbench-window .project-layout > .project-command-rail > .path",
+            "body.ui-3d .chat-tool-host-content > .project-workbench-window .project-layout > .project-command-rail > .project-tree",
+            "body.ui-3d .chat-tool-host-content > .project-workbench-window .project-layout > .project-command-rail > .ide-index-status",
+            "body.ui-3d .chat-tool-host-content > .project-workbench-window .project-layout > .project-command-rail > .ide-operation-status",
+        ] {
+            assert!(p6g_rules.contains(selector), "P6-C.1g 宿主选择器契约缺失：{selector}");
+        }
+        for token in [
+            "display: flex;",
+            "flex-direction: column;",
+            "gap: 4px;",
+            "grid-template-rows: none;",
+            "overflow-x: hidden;",
+            "overflow-y: auto;",
+            "grid-template-columns: repeat(3, minmax(0, 1fr));",
+            "min-height: 24px;",
+            "height: 24px;",
+            "padding: 2px 4px;",
+            "font-size: 10px;",
+            "white-space: nowrap;",
+            "text-overflow: ellipsis;",
+            "width: 13px;",
+            "height: 13px;",
+            "grid-column: 1 / -1;",
+            "padding: 2px 6px;",
+            "order: 0;",
+            "order: 1;",
+            "order: 2;",
+            "order: 3;",
+            "order: 4;",
+            "flex: 0 0 122px;",
+            "min-height: 122px;",
+            "height: 122px;",
+        ] {
+            assert!(p6g_rules.contains(token), "P6-C.1g 首屏布局契约缺失：{token}");
+        }
+        assert!(
+            !p6g_rules.contains("browser-workbench-window"),
+            "P6-C.1g 不得扩大到浏览器宿主"
+        );
+        assert!(
+            !p6g_rules.contains("body.ui-3d .project-layout > .project-command-rail"),
+            "P6-C.1g 不得改写独立工程工作台选择器"
+        );
+        assert!(
+            WEB_STYLES_CSS[..p6g_rules_start].contains("body.ui-3d .project-layout"),
+            "独立工程工作台的全局布局规则必须保留"
+        );
+        let p6h_rules_start = WEB_STYLES_CSS
+            .find("* P6-C.1h：宿主内仅在非 diff 模式隐藏对比路径栏")
+            .expect("P6-C.1h 对比路径隐藏规则必须存在");
+        assert!(
+            p6h_rules_start > p6g_rules_start,
+            "P6-C.1h 必须追加在 P6-C.1g 之后"
+        );
+        let p6h_rules = &WEB_STYLES_CSS[p6h_rules_start..];
+        assert!(p6h_rules.contains(
+            "body.ui-3d .chat-tool-host-content > .project-workbench-window .project-layout > .project-command-rail > .ide-diff-paths[hidden]"
+        ));
+        assert!(p6h_rules.contains("[hidden]"));
+        assert!(p6h_rules.contains("display: none;"));
+        assert!(
+            !p6h_rules.contains("browser-workbench-window"),
+            "P6-C.1h 不得扩大到浏览器宿主"
+        );
+        assert!(
+            !p6h_rules.contains("body.ui-3d .project-layout > .project-command-rail"),
+            "P6-C.1h 不得改写独立工程工作台选择器"
+        );
+        assert!(
+            !p6h_rules.contains("ide-omni"),
+            "P6-C.1h 不得改写搜索宿主或结果浮层"
+        );
+        assert!(
+            WEB_STYLES_CSS[..p6h_rules_start].contains(".ide-omni-results {"),
+            "P6-C.1h 前必须保留搜索结果浮层规则"
+        );
+        let omni_results_start = WEB_STYLES_CSS[..p6h_rules_start]
+            .find(".ide-omni-results {")
+            .expect("搜索结果浮层规则必须存在");
+        let omni_results_source = &WEB_STYLES_CSS[omni_results_start..p6h_rules_start];
+        assert!(
+            omni_results_source.contains("position: absolute;"),
+            "搜索结果浮层必须继续使用绝对定位"
+        );
+        assert!(
+            WEB_APP_JS.contains("if (paths) paths.hidden = false;"),
+            "进入 diff 模式必须继续显示对比路径栏"
+        );
+        assert!(
+            WEB_APP_JS.contains("if (paths) paths.hidden = true;"),
+            "退出 diff 模式必须继续隐藏对比路径栏"
+        );
+        // 旧主题仍保留自己的通用规则；禁止的是把死选择器重新带进宿主组合规则。
+        assert!(WEB_STYLES_CSS.contains(".task-window-grid {"));
+        assert!(WEB_STYLES_CSS.contains(".task-window-auth-grid {"));
+        assert!(WEB_APP_JS.contains("windowDockMoreSummary?.addEventListener(\"keydown\""));
+        assert!(WEB_APP_JS.contains("event.key !== \"Tab\" || event.shiftKey || !windowDockMore.open"));
+        assert!(WEB_APP_JS.contains("firstMenuButton.focus({ preventScroll: true });"));
+        assert!(WEB_INDEX_HTML.contains(
+            "window-dock-more-toggle\" aria-label=\"更多窗口\" title=\"更多窗口\" tabindex=\"0\""
+        ));
+        assert!(!WEB_STYLES_CSS.contains(
+            "chat-tool-host-content > .project-workbench-window .project-layout > .project-browser"
+        ));
+        assert!(!WEB_STYLES_CSS.contains("right: calc(100% + 6px)"));
+    }
+
+    #[test]
+    fn web_frontend_p6d_keeps_real_icons_empty_goal_state_and_seal_states() {
+        let toolbar_start = WEB_INDEX_HTML
+            .find("<div class=\"ide-toolbar\">")
+            .expect("工程工具栏必须存在");
+        let toolbar_end = toolbar_start
+            + WEB_INDEX_HTML[toolbar_start..]
+                .find("<p class=\"ide-index-status\"")
+                .expect("工程工具栏必须有明确边界");
+        let toolbar = &WEB_INDEX_HTML[toolbar_start..toolbar_end];
+        for (action, icon, label) in [
+            ("project-mode-toggle", "diff", "对比"),
+            ("project-save", "save", "保存"),
+            ("project-new-file", "file", "文件"),
+            ("project-new-dir", "folder", "目录"),
+            ("project-rename", "rename", "重命名"),
+            ("project-delete", "delete", "删除"),
+            ("project-refresh", "refresh", "刷新"),
+            ("project-symbol-index", "search", "索引"),
+        ] {
+            let action_marker = format!("data-action=\"{action}\"");
+            assert_eq!(
+                toolbar.matches(action_marker.as_str()).count(),
+                1,
+                "工程工具栏动作必须唯一：{action}"
+            );
+            let action_start = toolbar
+                .find(action_marker.as_str())
+                .expect("工程工具栏动作必须存在");
+            let action_source = &toolbar[action_start..];
+            let button_end = action_source
+                .find("</button>")
+                .expect("工程工具栏按钮必须闭合");
+            let button = &action_source[..button_end];
+            assert!(
+                button.contains(&format!("src=\"./assets/icons-wuxia/{icon}.svg\"")),
+                "工程工具栏图标必须使用武侠 SVG：{action}"
+            );
+            assert!(
+                button.contains("alt=\"\" aria-hidden=\"true\""),
+                "工程工具栏装饰图标必须隐藏于辅助技术：{action}"
+            );
+            assert!(button.contains(label), "工程工具栏中文标签必须保留：{action}");
+        }
+        assert!(!toolbar.contains("+文件"));
+        assert!(!toolbar.contains("+目录"));
+        assert!(toolbar.contains("title=\"切换查看 / 对比模式\""));
+        assert!(toolbar.contains("title=\"保存当前文件 (Ctrl+S)\""));
+        assert!(toolbar.contains("title=\"重命名当前文件或目录\""));
+        assert!(toolbar.contains("title=\"删除当前文件或目录\""));
+        assert!(toolbar.contains("title=\"增量构建符号索引\""));
+
+        let allow_start = WEB_APP_JS
+            .find("const WUXIA_ICON_ALLOW_LIST = new Set([")
+            .expect("动态武侠图标白名单必须存在");
+        let icon_function_start = WEB_APP_JS[allow_start..]
+            .find("function wuxiaIconElement")
+            .map(|offset| allow_start + offset)
+            .expect("动态武侠图标函数必须存在");
+        let allow_source = &WEB_APP_JS[allow_start..icon_function_start];
+        for name in ["alert-triangle", "chat", "chevron", "delete", "stop"] {
+            assert!(
+                allow_source.contains(&format!("\"{name}\"")),
+                "动态武侠图标白名单缺少当前调用：{name}"
+            );
+        }
+        for call in [
+            "wuxiaIconElement(\"chat\"",
+            "wuxiaIconElement(\"chevron\"",
+            "wuxiaIconElement(\"alert-triangle\"",
+            "wuxiaIconElement(\"stop\"",
+            "setWuxiaIconOnly(button, \"delete\"",
+            "setWuxiaIconOnly(remove, \"stop\"",
+            "setWuxiaIconOnly(clear, \"stop\"",
+            "setWuxiaIconOnly(close, \"stop\"",
+        ] {
+            assert!(WEB_APP_JS.contains(call), "动态武侠图标调用缺少覆盖：{call}");
+        }
+        let icon_function_end = icon_function_start
+            + WEB_APP_JS[icon_function_start..]
+                .find("function setWuxiaIconOnly")
+                .expect("动态武侠图标函数必须有明确边界");
+        let icon_function = &WEB_APP_JS[icon_function_start..icon_function_end];
+        for token in [
+            "const requested = String(name || \"\").trim();",
+            "const safeName = WUXIA_ICON_ALLOW_LIST.has(requested) ? requested : \"alert-triangle\";",
+            "image.src = `./assets/icons-wuxia/${safeName}.svg`;",
+        ] {
+            assert!(icon_function.contains(token), "动态武侠图标安全契约缺失：{token}");
+        }
+        assert!(!icon_function.contains("${name}.svg"));
+
+        let goal_start = WEB_APP_JS
+            .find("function taskRenderGoalPlaceholder()")
+            .expect("目标任务空态函数必须存在");
+        let goal_end = goal_start
+            + WEB_APP_JS[goal_start..]
+                .find("function taskRenderHandoffSummary")
+                .expect("目标任务空态函数必须有明确边界");
+        let goal_source = &WEB_APP_JS[goal_start..goal_end];
+        assert!(goal_source.contains("暂无目标任务，可在任务中心创建目标后查看阶段进度"));
+        assert!(goal_source.contains("empty.className = \"task-window-empty\";"));
+        assert!(goal_source.contains("host.append(empty);"));
+        assert!(!goal_source.contains("REQ-GOAL-"));
+        assert!(!goal_source.contains("暂未接入"));
+
+        let seal_start = WEB_INDEX_HTML
+            .find("<div class=\"chat-atmosphere-seal\"")
+            .expect("朱红印记必须使用装饰容器");
+        let seal_end = seal_start
+            + WEB_INDEX_HTML[seal_start..]
+                .find("</div>")
+                .expect("朱红印记容器必须闭合")
+            + "</div>".len();
+        let seal_markup = &WEB_INDEX_HTML[seal_start..seal_end];
+        for token in [
+            "data-role=\"chat-seal-stamp\"",
+            "data-state=\"idle\"",
+            "aria-hidden=\"true\"",
+            "vermilion-seal-blank-v1.png",
+            "data-role=\"chat-seal-glyph\"",
+            "class=\"chat-atmosphere-seal-glyph\"",
+        ] {
+            assert!(seal_markup.contains(token), "朱印容器契约缺失：{token}");
+        }
+        for asset in [
+            "assets/ui-redesign/p5/chat-watermark-jade-sword-v1.png",
+            "assets/ui-redesign/three-column/jade-success-sweep-v1.png",
+            "assets/ui-redesign/three-column/rail-lantern-gold-v1.png",
+            "assets/ui-redesign/three-column/vermilion-seal-blank-v1.png",
+        ] {
+            assert!(
+                WEB_INDEX_HTML.contains(&format!("src=\"./{asset}\" alt=\"\" aria-hidden=\"true\"")),
+                "P5/P6 装饰图必须显式 aria-hidden：{asset}"
+            );
+        }
+        assert!(!WEB_INDEX_HTML.contains("<img class=\"chat-atmosphere-seal\""));
+
+        let seal_fn_start = WEB_APP_JS
+            .find("function playChatSealStamp(kind = \"approval\")")
+            .expect("朱印状态函数必须接收状态类型");
+        let seal_fn_end = seal_fn_start
+            + WEB_APP_JS[seal_fn_start..]
+                .find("window.playChatSealStamp = playChatSealStamp;")
+                .expect("朱印状态函数必须导出")
+            + "window.playChatSealStamp = playChatSealStamp;".len();
+        let seal_fn = &WEB_APP_JS[seal_fn_start..seal_fn_end];
+        for token in [
+            "const state = kind === \"error\" ? \"error\" : \"approval\";",
+            "glyph.textContent = state === \"error\" ? \"错\" : \"批\";",
+            "glyph.dataset.state = state;",
+            "seal.dataset.state = state;",
+            "seal.classList.remove(\"is-stamping\", \"is-stamped\");",
+            "seal.classList.add(\"is-stamping\");",
+            "seal.classList.add(\"is-stamped\");",
+            "}, 250);",
+        ] {
+            assert!(seal_fn.contains(token), "朱印状态动画契约缺失：{token}");
+        }
+        let feedback_start = WEB_APP_JS
+            .find("function syncChatTaskFeedback(")
+            .expect("聊天任务反馈函数必须存在");
+        let feedback_end = feedback_start
+            + WEB_APP_JS[feedback_start..]
+                .find("function renderTaskStatusSummary")
+                .expect("聊天任务反馈函数必须有明确边界");
+        let feedback = &WEB_APP_JS[feedback_start..feedback_end];
+        let error_branch = feedback
+            .find("if (failedGrew) {")
+            .expect("失败反馈必须优先触发朱印");
+        let approval_branch = feedback
+            .find("else if (pendingApprovalsGrew) {")
+            .expect("待审批反馈必须有朱印分支");
+        assert!(error_branch < approval_branch);
+        assert!(feedback.contains("playChatSealStamp(\"error\");"));
+        assert!(feedback.contains("playChatSealStamp(\"approval\");"));
+
+        let seal_css_start = WEB_STYLES_CSS
+            .find("body.ui-3d .chat-atmosphere-seal {\n")
+            .expect("朱印容器样式必须存在");
+        let seal_css_end = seal_css_start
+            + WEB_STYLES_CSS[seal_css_start..]
+                .find("@keyframes chatJadeBreath")
+                .expect("朱印容器样式必须有明确边界");
+        let seal_css = &WEB_STYLES_CSS[seal_css_start..seal_css_end];
+        for token in [
+            "right: 2.2%;\n  bottom: clamp(82px, 14%, 108px);",
+            "display: grid;",
+            "pointer-events: none;",
+            ".chat-atmosphere-seal > img",
+            ".chat-atmosphere-seal-glyph",
+            "data-state=\"approval\"",
+            "data-state=\"error\"",
+            "transition: opacity 120ms ease, transform 120ms ease;",
+        ] {
+            assert!(seal_css.contains(token), "朱印视觉层样式契约缺失：{token}");
+        }
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .workbench-window[data-window-theme=\"communication-bay\"] .chat-atmosphere-seal.is-stamping {\n  animation: chatSealStamp 250ms"
+        ));
+        assert!(WEB_STYLES_CSS.contains("body.ui-3d .chat-atmosphere-seal-glyph {\n    transition: none !important;"));
+    }
+
+    #[test]
+    fn web_frontend_left_chat_rail_uses_workspace_navigation_and_search() {
+        let summary = WEB_INDEX_HTML
+            .find("class=\"chat-workspace-summary\"")
+            .expect("左栏必须有工作区摘要卡");
+        let actions = WEB_INDEX_HTML
+            .find("data-sidebar-group=\"chat-actions\"")
+            .expect("左栏必须保留聊天室操作");
+        let rooms = WEB_INDEX_HTML
+            .find("data-sidebar-group=\"conversation-list\"")
+            .expect("左栏必须有常驻会话导航");
+        let advanced = WEB_INDEX_HTML
+            .find("data-sidebar-group=\"advanced-config\"")
+            .expect("左栏必须有高级配置收纳区");
+        assert!(summary < actions && actions < rooms && rooms < advanced);
+        for token in [
+            "data-role=\"chat-workspace-summary-path\"",
+            "data-role=\"chat-room-summary-name\"",
+            "data-role=\"chat-room-summary-status\"",
+            "aria-label=\"新建聊天室\"",
+            "aria-label=\"重命名聊天室\"",
+            "aria-label=\"删除聊天室\"",
+            "assets/icons-wuxia/rename.svg",
+            "<span>新建</span>",
+            "<span>重命名</span>",
+            "<span>删除</span>",
+            "data-role=\"chat-room-search\"",
+            "class=\"chat-room-dropdown\" data-role=\"chat-room-list\"",
+            "class=\"chat-sidebar-advanced-body\"",
+            "data-role=\"agent-trigger\"",
+            "data-role=\"chat-permission-select\"",
+            "data-role=\"chat-workspace-path\"",
+            "data-role=\"authorization-selected-room\"",
+        ] {
+            assert!(WEB_INDEX_HTML.contains(token), "左栏真实控件契约缺失：{token}");
+        }
+        for token in [
+            "let chatRoomSearchQuery = \"\";",
+            "chatRoomSearchQuery = String(event.target.value || \"\").trim().toLocaleLowerCase();",
+            "const filteredRooms = query",
+            "className = \"session-option chat-room-nav-item\"",
+            "function setChatWorkspacePath(workspace)",
+            "function workspaceLeafName(workspace)",
+            "const display = full || \"未设置\";",
+            "data-role=\"chat-workspace-summary-path\"",
+            "document.querySelector('[data-role=\"chat-room-list\"]')?.addEventListener(\"keydown\"",
+            "event.target.closest(\"button[data-room-id]\")",
+            "event.key !== \"Enter\" && event.key !== \" \"",
+            "event.preventDefault();\n    option.click();",
+        ] {
+            assert!(WEB_APP_JS.contains(token), "左栏前端导航契约缺失：{token}");
+        }
+        assert!(WEB_APP_JS.contains(
+            "setSystemInfoText(\"system-workspace\", workspaceLeafName(info.workspace) || \"未配置\", info.workspace)"
+        ));
+        assert!(WEB_APP_JS.contains(
+            "workspace && workspace !== \"—\" ? workspaceLeafName(workspace) : \"未配置\""
+        ));
+        assert!(WEB_APP_JS.contains("node.textContent = display;"));
+        let room_render_start = WEB_APP_JS
+            .find("function renderChatRoomList")
+            .expect("聊天室列表渲染函数必须存在");
+        let room_render_end = WEB_APP_JS[room_render_start..]
+            .find("async function openSelectedChatRoom")
+            .map(|offset| room_render_start + offset)
+            .expect("聊天室列表渲染函数必须有明确边界");
+        let room_render_source = &WEB_APP_JS[room_render_start..room_render_end];
+        for token in [
+            "icon.src = \"./assets/icons-wuxia/chat.svg\";",
+            "icon.setAttribute(\"aria-hidden\", \"true\");",
+            "const label = document.createElement(\"span\");",
+            "label.textContent = room.name || room.id;",
+            "option.append(icon, label);",
+        ] {
+            assert!(room_render_source.contains(token), "会话导航图标/文字结构契约缺失：{token}");
+        }
+        assert!(!room_render_source.contains("option.textContent = room.name || room.id;"));
+        assert!(room_render_source.contains("option.append(icon, label);"));
+        for role in [
+            "chat-room-list",
+            "chat-room-search",
+            "chat-workspace-summary-path",
+            "chat-room-summary-name",
+            "chat-room-summary-status",
+            "agent-trigger",
+            "chat-permission-select",
+            "chat-workspace-path",
+        ] {
+            assert_eq!(
+                WEB_INDEX_HTML.matches(&format!("data-role=\"{role}\"")).count(),
+                1,
+                "左栏 data-role 必须唯一：{role}"
+            );
+        }
+        for removed in ["chat-room-trigger", "chat-room-trigger-chevron"] {
+            assert!(!WEB_INDEX_HTML.contains(removed), "旧聊天室下拉控件不得回归：{removed}");
+            assert!(!WEB_APP_JS.contains(removed), "旧聊天室下拉逻辑不得回归：{removed}");
+            assert!(!WEB_STYLES_CSS.contains(removed), "旧聊天室下拉样式不得回归：{removed}");
+        }
+        for token in [
+            "p1-a-chat-left-navigation",
+            "body.ui-3d .chat-left-rail > .chat-workspace-summary",
+            "body.ui-3d .chat-left-rail > .chat-room-selector",
+            "body.ui-3d .chat-left-rail .chat-room-dropdown .chat-room-nav-item",
+            "body.ui-3d .chat-left-rail > .chat-sidebar-advanced",
+            "height: 36px;\n  min-height: 36px;",
+            "height: 34px;\n  min-height: 34px;",
+            "max-height: min(46vh, 400px);",
+            "p2-b-sidebar-density",
+            "width: 100%;\n  align-items: stretch;\n  box-sizing: border-box;",
+            "grid-template-columns: 16px minmax(0, 1fr);\n  align-items: center;\n  gap: 8px;",
+            "width: 16px;\n  height: 16px;\n  flex: 0 0 16px;",
+            "max-width: 16px;\n  max-height: 16px;",
+        ] {
+            assert!(WEB_STYLES_CSS.contains(token), "左栏视觉/响应式契约缺失：{token}");
+        }
+    }
+
+    #[test]
+    fn web_frontend_chat_layout_migrates_only_legacy_default_geometry() {
+        for token in [
+            "const CHAT_LAYOUT_GEOMETRY_VERSION = 2;",
+            "function migrateChatLayoutGeometry(stored)",
+            "if (stored.geometryVersion != null)",
+            "Number(stored.leftWidth) === 280",
+            "Number(stored.rightWidth) === 470",
+            "geometryVersion: CHAT_LAYOUT_GEOMETRY_VERSION",
+            "narrowOpen: preservedNarrowOpen",
+        ] {
+            assert!(WEB_APP_JS.contains(token), "缺少聊天几何迁移契约：{token}");
+        }
+        assert!(WEB_APP_JS.contains("leftWidth: CHAT_LAYOUT_DEFAULT_WIDTHS.left"));
+        assert!(WEB_APP_JS.contains("rightWidth: CHAT_LAYOUT_DEFAULT_WIDTHS.right"));
+        assert!(WEB_STYLES_CSS.contains("--chat-desktop-horizontal-inset: 1px;"));
+        assert!(WEB_STYLES_CSS.contains(
+            "padding-inline: var(--chat-desktop-horizontal-inset);"
+        ));
+        assert!(WEB_STYLES_CSS.contains("@media (min-width: 1440px)"));
+        assert!(WEB_STYLES_CSS.contains(
+            "--chat-left-divider-track: 7px;\n  --chat-right-divider-track: 7px;"
+        ));
+    }
+
+    #[test]
+    fn new_install_seed_keeps_compatibility_id_but_starts_as_main_agent() {
+        let session = super::seed_session();
+        assert_eq!(session.id, "mario-demo");
+        assert_eq!(session.name, "主 Agent");
+        assert!(session.messages.is_empty());
+
+        let room = super::seed_chat_room();
+        assert_eq!(room.id, DEFAULT_CHAT_ROOM_ID);
+        assert!(room.messages.is_empty());
     }
 
     #[test]
@@ -63015,7 +76078,7 @@ attach: last_assistant
                 "missing batch-2 layout contract: {required_html}"
             );
         }
-        assert!(WEB_STYLES_CSS.contains("--top-region-ratio: 12%"));
+        assert!(WEB_STYLES_CSS.contains("--top-region-height: 48px"));
         assert!(WEB_STYLES_CSS.contains("--composer-region-ratio: 10%"));
         assert!(
             WEB_STYLES_CSS.contains(".chat-workbench-window .composer::before {\n  content: none;")
@@ -63051,7 +76114,7 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("function migrateLegacyAvatarPath"));
         assert!(WEB_APP_JS.contains("[\"bot vision\", \"vision\"]"));
         let generic_icon_rule = WEB_STYLES_CSS
-            .find("body.ui-3d .ui-redesign button:not(.avatar-select-trigger):not(.avatar-choice) > img")
+            .find("body.ui-3d .ui-redesign button:not(.avatar-select-trigger):not(.avatar-choice)")
             .expect("missing shared button icon rule");
         let avatar_size_override = WEB_STYLES_CSS
             .rfind("body.ui-3d .ui-redesign .avatar-select-trigger > img")
@@ -63250,8 +76313,1087 @@ attach: last_assistant
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .overview-card .overview-mascot"));
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .overview-card .overview-mascot img"));
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .overview-compact-lines"));
-        assert!(WEB_STYLES_CSS.contains("grid-template-rows: repeat(2, minmax(0, 1fr));"));
+        assert!(WEB_STYLES_CSS.contains(
+            "grid-template-columns: repeat(2, minmax(0, 1fr));"
+        ));
         assert!(!WEB_INDEX_HTML.contains("data-role=\"overview-mascot-avatar\" src=\"./assets/ui-redesign/overview-jade-vortex.png\""));
+    }
+
+    #[test]
+    fn web_frontend_round3_pixel_repair_keeps_compact_top_and_chat_visual_contract() {
+        assert!(WEB_STYLES_CSS.contains("round3-pixel-repair"));
+        assert!(WEB_STYLES_CSS.contains("round3-final-point-correction"));
+        assert!(WEB_APP_JS.contains(
+            "const CHAT_LAYOUT_DEFAULT_WIDTHS = Object.freeze({ left: 285, right: 480 });"
+        ));
+        assert!(WEB_STYLES_CSS.contains("--window-tab-frame-size: 20px"));
+        assert!(WEB_STYLES_CSS.contains("height: 34px;\n  min-height: 34px;\n  max-height: 34px;"));
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .chat-left-rail .chat-room-search-field > input"
+        ));
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .workbench-window[data-window-theme=\"communication-bay\"] .chat-main-action > img"
+        ));
+        assert!(WEB_STYLES_CSS.contains("body.ui-3d .chat-quick-layout-controls img"));
+        assert!(WEB_STYLES_CSS.contains("body.ui-3d .chat-rail-overlay-close > img"));
+        assert!(WEB_STYLES_CSS.contains(
+            "grid-template-columns: repeat(4, minmax(0, 1fr));"
+        ));
+        assert!(WEB_STYLES_CSS.contains("padding: 2px 7px 1px;\n  overflow: hidden;"));
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .layout-top-region .overview-card {\n  overflow: visible;"
+        ));
+        let chat_main = WEB_INDEX_HTML
+            .find("<div class=\"chat-main-column\">")
+            .expect("聊天主列必须存在");
+        let atmosphere = WEB_INDEX_HTML
+            .find("<div class=\"chat-atmosphere\"")
+            .expect("聊天氛围层必须存在");
+        let composer = WEB_INDEX_HTML
+            .find("<footer class=\"composer\">")
+            .expect("Composer 必须存在");
+        assert!(chat_main < atmosphere && atmosphere < composer);
+        assert_eq!(
+            WEB_INDEX_HTML.matches("chat-main-toolbar").count(),
+            0,
+            "旧聊天室工具栏不得残留在 DOM"
+        );
+        assert_eq!(
+            WEB_STYLES_CSS.matches("chat-main-toolbar").count(),
+            0,
+            "旧聊天室工具栏不得残留在 CSS"
+        );
+        assert_eq!(
+            WEB_INDEX_HTML.matches("chat-atmosphere-figure").count(),
+            0,
+            "重复的人物氛围层不得残留在 DOM"
+        );
+        assert_eq!(
+            WEB_STYLES_CSS.matches("chat-atmosphere-figure").count(),
+            0,
+            "重复的人物氛围层不得残留在 CSS"
+        );
+        assert!(WEB_INDEX_HTML.contains("data-bind=\"chat.current\""));
+        assert!(!WEB_INDEX_HTML.contains("data-role=\"chat-main-workspace-path\""));
+        assert_eq!(WEB_INDEX_HTML.matches("class=\"chat-atmosphere\"").count(), 1);
+        assert!(!WEB_STYLES_CSS.contains(".chat-window-panel > .chat-atmosphere"));
+        assert!(WEB_STYLES_CSS.contains(
+            ".chat-main-column > .chat-atmosphere {\n  position: absolute;\n  inset: 0;\n  z-index: 0;"
+        ));
+        assert!(WEB_STYLES_CSS.contains(
+            "position: relative;\n  z-index: 3;\n  isolation: isolate;"
+        ));
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .workbench-window[data-window-theme=\"communication-bay\"] .chat-main-column > .chat-panel"
+        ));
+        assert!(WEB_STYLES_CSS.contains("--chat-composer-reserve: clamp("));
+        assert!(WEB_STYLES_CSS.contains("--chat-overlay-composer-gap: 5px;"));
+        assert!(WEB_STYLES_CSS.contains(
+            "bottom: calc(var(--chat-composer-reserve) + var(--chat-overlay-composer-gap));"
+        ));
+        assert!(WEB_STYLES_CSS.contains(
+            "max-height: calc(100% - var(--chat-composer-reserve) - var(--chat-overlay-composer-gap));"
+        ));
+        assert_eq!(
+            WEB_STYLES_CSS
+                .matches("bottom: calc(var(--chat-composer-reserve) + var(--chat-overlay-composer-gap));")
+                .count(),
+            2,
+            "左右 overlay 必须复用同一 Composer 安全间隙"
+        );
+        assert_eq!(
+            WEB_STYLES_CSS
+                .matches("max-height: calc(100% - var(--chat-composer-reserve) - var(--chat-overlay-composer-gap));")
+                .count(),
+            2,
+            "左右 overlay 高度必须同步扣除安全间隙"
+        );
+        assert!(WEB_STYLES_CSS.contains("grid-template-rows: 17px 18px;"));
+        assert!(WEB_STYLES_CSS.contains("height: 16px;\n  min-height: 16px;\n  padding-top: 0;"));
+        assert!(WEB_STYLES_CSS.contains("rgba(3, 14, 17, 0.18);"));
+        assert!(WEB_STYLES_CSS.contains("rgba(2, 13, 16, 0.22);"));
+        assert!(!WEB_STYLES_CSS.contains("rgba(2, 13, 16, 0.56);"));
+        assert!(WEB_STYLES_CSS.contains("opacity: 0.2;"));
+        assert!(WEB_STYLES_CSS.contains("opacity: 0.26;"));
+        assert!(!WEB_STYLES_CSS.contains("width: 24px !important;"));
+        assert!(WEB_STYLES_CSS.contains("--chat-left-width: clamp(236px, 18%, 285px)"));
+        assert!(WEB_STYLES_CSS.contains("--chat-right-width: clamp(328px, 30%, 480px)"));
+        let p2 = WEB_STYLES_CSS
+            .split_once("/* p2-a-central-chat-visual-alignment")
+            .map(|(_, tail)| tail)
+            .expect("P2-A 中央聊天视觉覆盖块必须存在");
+        for token in [
+            ".chat-atmosphere-bamboo {",
+            "opacity: 0.72;",
+            ".chat-atmosphere-logo {",
+            "left: 50%;",
+            "top: 50%;",
+            "right: auto;",
+            "bottom: auto;",
+            "width: min(42%, 420px);",
+            "opacity: 0.26;",
+            "transform: translate(-50%, -50%);",
+            ".chat-atmosphere-jade {",
+            "rgba(91, 223, 151, 0.16)",
+            "rgba(3, 14, 17, 0.16);",
+            "rgba(2, 13, 16, 0.20);",
+            "--message-theme: #8fd3b1;",
+            "border: 1px solid rgba(143, 211, 177, 0.42);",
+            ".message.user {",
+            "--message-theme: #d9bb70;",
+            ".message.is-streaming::after {",
+            "height: 1px;",
+            ".chat-quick-layout-controls .chat-main-action",
+            "width: 32px;\n  height: 32px;\n  flex: 0 0 32px;",
+        ] {
+            assert!(p2.contains(token), "P2-A 中央聊天视觉契约缺失：{token}");
+        }
+        assert!(!p2.contains("chat-task-context"));
+        assert!(!WEB_STYLES_CSS.contains("chatTaskProgressSweep"));
+        assert!(
+            !p2.contains("repeating-linear-gradient"),
+            "P2-A 消息卡覆盖不得恢复蓝灰重复扫描纹理"
+        );
+    }
+
+    #[test]
+    fn web_frontend_chat_main_task_context_uses_real_state_without_duplicate_bindings() {
+        let panel = WEB_INDEX_HTML
+            .find("<section class=\"chat-panel\">")
+            .expect("主聊天面板必须存在");
+        let messages = WEB_INDEX_HTML
+            .find("<div class=\"message-list\"")
+            .expect("主聊天消息流必须存在");
+        let composer = WEB_INDEX_HTML
+            .find("<footer class=\"composer\">")
+            .expect("Composer 必须存在");
+        assert!(panel < messages && messages < composer);
+        assert!(!WEB_INDEX_HTML.contains("chat-main-brand"));
+        assert!(!WEB_STYLES_CSS.contains("chat-main-brand"));
+        assert!(!WEB_INDEX_HTML.contains("data-role=\"chat-main-workspace-path\""));
+        assert!(!WEB_INDEX_HTML.contains("chat-task-context"));
+        assert!(!WEB_STYLES_CSS.contains("chat-task-context"));
+        assert!(!WEB_STYLES_CSS.contains("chatTaskProgressSweep"));
+        assert!(!WEB_APP_JS.contains("function syncChatTaskContext"));
+        assert!(!WEB_APP_JS.contains("syncChatTaskContext("));
+        assert!(!WEB_APP_JS.contains("chat-context-approval-"));
+        assert!(!WEB_INDEX_HTML.contains("task-card-chain-button"));
+        assert!(!WEB_STYLES_CSS.contains("task-card-chain-button"));
+        assert!(!WEB_APP_JS.contains("task-card-chain"));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"tool-approval-panel\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"chat-task-chain\""));
+        assert!(WEB_APP_JS.contains("bindChatLayoutAction(\"chat-task-chain\", openCurrentTaskChain)"));
+        for token in [
+            "data-role=\"chat-right-task-summary\"",
+            "data-bind=\"task.currentTitle\"",
+            "data-bind=\"task.currentProgress\"",
+            "data-role=\"task-card-progress-bar\"",
+            "data-role=\"handoff-drawer\"",
+            "function syncTaskCardFromGoals",
+            "function renderChatRightRailStatus",
+        ] {
+            assert!(
+                WEB_INDEX_HTML.contains(token)
+                    || WEB_APP_JS.contains(token),
+                "右栏任务状态同步契约缺失：{token}"
+            );
+        }
+        assert!(WEB_STYLES_CSS.contains(".ui-redesign .chat-panel"));
+        assert!(WEB_STYLES_CSS.contains("grid-template-rows: minmax(0, 1fr);"));
+        assert!(WEB_STYLES_CSS.contains("--chat-overlay-composer-gap: 5px;"));
+        for token in [
+            "function chatTaskRuntimeSummary",
+            "if (raw.includes(\"=\"))",
+            "const priorityKeys = [\"error\", \"reason\", \"message\"];",
+            "const prioritizedDetails = priorityKeys",
+            "...prioritizedDetails",
+            "reserved: \"待启动\"",
+            "warming: \"准备中\"",
+            "half_duplex_guarded: \"受控半双工\"",
+            "full_streaming: \"全流式\"",
+            "error: \"错误\"",
+            "state: \"状态\"",
+            "mode: \"模式\"",
+            "action: \"动作\"",
+            "blocked: \"受阻\"",
+            "awaiting: \"待确认\"",
+            "item?.human_ack === \"awaiting\"",
+            "respondToApproval(\"approve\", \"once\")",
+            "respondToApproval(\"reject\")",
+        ] {
+            assert!(WEB_APP_JS.contains(token), "任务状态同步契约缺失：{token}");
+        }
+        let runtime_summary_start = WEB_APP_JS
+            .find("function chatTaskRuntimeSummary")
+            .expect("运行时任务摘要函数必须存在");
+        let runtime_summary_end = WEB_APP_JS[runtime_summary_start..]
+            .find("function taskRenderProtectedRules")
+            .map(|offset| runtime_summary_start + offset)
+            .expect("运行时任务摘要函数必须有明确结束边界");
+        let runtime_summary = &WEB_APP_JS[runtime_summary_start..runtime_summary_end];
+        let priority_offset = runtime_summary
+            .find("const priorityKeys = [\"error\", \"reason\", \"message\"];")
+            .expect("错误详情优先级必须显式声明");
+        let limit_offset = runtime_summary
+            .find(".slice(0, 3)")
+            .expect("任务摘要必须限制为最多三条");
+        assert!(
+            priority_offset < limit_offset,
+            "error/reason/message 必须在三条摘要截断前优先选入，不能先 slice 后丢弃错误证据"
+        );
+        assert!(!WEB_STYLES_CSS.contains("p1-b-chat-task-context"));
+    }
+
+    #[test]
+    fn web_frontend_p3b_background_and_generated_controls_are_wired() {
+        let background_rel = "assets/ui-redesign/chat-backgrounds/wuxia-bamboo-moonlit-chat-stage-v2.png";
+        let background_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(background_rel);
+        let background_size = std::fs::metadata(&background_path)
+            .expect("P3-B 聊天背景资源必须存在")
+            .len();
+        assert!(background_size > 0, "P3-B 聊天背景资源不得为空");
+        assert!(WEB_STYLES_CSS.contains("chat-backgrounds/wuxia-bamboo-moonlit-chat-stage-v2.png"));
+        assert_eq!(
+            WEB_STYLES_CSS.matches("chat-backgrounds/wuxia-bamboo-moonlit-chat-stage-v2.png").count(),
+            1,
+            "P3-B 聊天背景运行时引用应唯一"
+        );
+
+        assert_eq!(WEB_INDEX_HTML.matches("class=\"window-dock\"").count(), 1);
+        let workbench = WEB_INDEX_HTML
+            .find("<section class=\"layout-workbench\"")
+            .expect("工作台必须存在");
+        let dock = WEB_INDEX_HTML
+            .find("<nav class=\"window-dock\"")
+            .expect("快捷窗口 dock 必须存在");
+        assert!(workbench < dock, "唯一 window-dock 必须位于工作台内");
+        for target in ["chat", "project", "tasks", "terminal", "browser"] {
+            assert_eq!(
+                WEB_INDEX_HTML
+                    .matches(&format!("data-window-target=\"{target}\""))
+                    .count(),
+                1,
+                "高频窗口必须常驻且唯一：{target}"
+            );
+        }
+        let more = WEB_INDEX_HTML
+            .find("data-role=\"window-dock-more\"")
+            .expect("低频窗口必须有更多入口");
+        for target in ["settings", "clawbot", "memory", "vision"] {
+            let marker = format!("data-window-target=\"{target}\"");
+            let target_offset = WEB_INDEX_HTML
+                .find(&marker)
+                .expect("所有窗口功能必须可达");
+            assert!(target_offset > more, "低频窗口必须位于更多入口内：{target}");
+        }
+
+        assert_eq!(WEB_INDEX_HTML.matches("chat-main-toolbar").count(), 0);
+        assert_eq!(WEB_STYLES_CSS.matches("chat-main-toolbar").count(), 0);
+        assert_eq!(WEB_INDEX_HTML.matches("chat-atmosphere-figure").count(), 0);
+        assert_eq!(WEB_STYLES_CSS.matches("chat-atmosphere-figure").count(), 0);
+        let p5_styles_start = WEB_STYLES_CSS
+            .find("/* P5：顶栏三槽与聊天视觉最终契约")
+            .expect("P5 最终视觉样式必须存在");
+        let logo_start = p5_styles_start
+            + WEB_STYLES_CSS[p5_styles_start..]
+                .find("body.ui-3d .workbench-window[data-window-theme=\"communication-bay\"] .chat-atmosphere-logo {")
+                .expect("聊天中心 Logo 样式必须存在");
+        let logo_rule = &WEB_STYLES_CSS[logo_start..]
+            [..WEB_STYLES_CSS[logo_start..].find('}').expect("Logo 样式必须闭合")];
+        for token in [
+            "left: 50%;",
+            "top: 50%;",
+            "right: auto;",
+            "bottom: auto;",
+            "width: min(44%, 460px);",
+            "opacity: 0.26;",
+            "transform: translate(-50%, -50%);",
+            "animation: chatLogoLacquerBreath 9s ease-in-out infinite;",
+        ] {
+            assert!(logo_rule.contains(token), "中心 Logo 几何契约缺失：{token}");
+        }
+        let logo_motion_start = WEB_STYLES_CSS
+            .find("@keyframes chatLogoLacquerBreath {")
+            .expect("中心 Logo 漆光动画必须存在");
+        let logo_motion_end = WEB_STYLES_CSS[logo_motion_start..]
+            .find("}\n\nbody.ui-3d .workbench-window[data-window-theme=\"communication-bay\"] .chat-success-sweep")
+            .map(|offset| logo_motion_start + offset)
+            .expect("中心 Logo 漆光动画必须有明确边界");
+        let logo_motion = &WEB_STYLES_CSS[logo_motion_start..logo_motion_end];
+        assert!(logo_motion.contains("opacity:"));
+        assert!(logo_motion.contains("filter:"));
+        assert!(!logo_motion.contains("transform:"), "Logo 漆光动画不得改变位移或缩放");
+
+        let jade_sweep_rel = "assets/ui-redesign/three-column/jade-success-sweep-v1.png";
+        let jade_sweep_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(jade_sweep_rel);
+        assert!(
+            std::fs::metadata(&jade_sweep_path)
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false),
+            "P3-C 玉光扫光资源必须存在且非空"
+        );
+        assert_eq!(
+            WEB_INDEX_HTML.matches("data-role=\"chat-success-sweep\"").count(),
+            1,
+            "聊天成功扫光节点必须唯一"
+        );
+        assert!(WEB_INDEX_HTML.contains(jade_sweep_rel));
+        for token in [
+            "function playChatJadeSuccessSweep()",
+            "function playChatSealStamp(kind = \"approval\")",
+            "window.playChatJadeSuccessSweep = playChatJadeSuccessSweep;",
+            "window.playChatSealStamp = playChatSealStamp;",
+            "function syncChatTaskFeedback({",
+            "if (taskStatusFeedbackBaseline == null)",
+            "const completedGrew = compareTaskCounts && completed > taskStatusFeedbackBaseline.completed;",
+            "const pendingApprovalsGrew = pendingApprovalCount > taskStatusFeedbackBaseline.pendingApprovalCount;",
+            "const failedGrew = compareTaskCounts && failed > taskStatusFeedbackBaseline.failed;",
+            "if (completedGrew)",
+            "if (failedGrew)",
+            "else if (pendingApprovalsGrew)",
+            "const statusPriority = [\"approval\", \"error\", \"running\", \"active\", \"idle\"];",
+            "const hasPendingApprovals = taskPendingApprovals.length > 0;",
+            "const hasTaskOrHandoffError",
+            "const hasTaskOrHandoffRunning",
+            "const hasQueuedOrPendingWork",
+            "lantern.dataset.state = state;",
+            "chat-atmosphere-logo",
+            "chat-success-sweep",
+            "chat-atmosphere-seal",
+            "chat-atmosphere-lantern",
+            "chat-top-status-lantern",
+            "prefers-reduced-motion: reduce",
+            "animation: none !important;",
+            "min-width: 36px;",
+            "min-height: 36px;",
+            ":focus-visible",
+        ] {
+            assert!(
+                WEB_APP_JS.contains(token) || WEB_STYLES_CSS.contains(token),
+                "P3-C 前端契约缺失：{token}"
+            );
+        }
+        for state in ["approval", "error", "running", "active", "idle"] {
+            assert!(
+                WEB_STYLES_CSS.contains(&format!("data-state=\"{state}\"")),
+                "P3-C 灯笼状态样式缺失：{state}"
+            );
+        }
+        let reduced_motion_start = WEB_STYLES_CSS
+            .rfind("@media (prefers-reduced-motion: reduce)")
+            .expect("P3-C reduced-motion 覆盖必须存在");
+        let reduced_motion_end = WEB_STYLES_CSS[reduced_motion_start..]
+            .find("@media (forced-colors: active)")
+            .map(|offset| reduced_motion_start + offset)
+            .expect("reduced-motion 覆盖必须有明确边界");
+        let reduced_motion = &WEB_STYLES_CSS[reduced_motion_start..reduced_motion_end];
+        for token in [
+            ".chat-atmosphere-logo",
+            ".chat-success-sweep",
+            ".chat-atmosphere-seal",
+            ".chat-atmosphere-lantern",
+            ".chat-top-status-lantern",
+            "animation: none !important;",
+        ] {
+            assert!(reduced_motion.contains(token), "P3-C reduced-motion 覆盖缺失：{token}");
+        }
+        assert!(WEB_STYLES_CSS.contains(
+            "animation: chatJadeSuccessSweep 320ms cubic-bezier(0.22, 0.72, 0.32, 1) 1 both;"
+        ));
+        assert!(WEB_STYLES_CSS.contains(
+            "animation: chatSealStamp 250ms cubic-bezier(0.22, 0.72, 0.32, 1) 1 both;"
+        ));
+        for animation in ["chatJadeSuccessSweep", "chatSealStamp"] {
+            let declaration_start = WEB_STYLES_CSS
+                .find(&format!("animation: {animation}"))
+                .expect("P3-C 一次性反馈动画必须有声明");
+            let declaration_end = WEB_STYLES_CSS[declaration_start..]
+                .find(';')
+                .map(|offset| declaration_start + offset);
+            let declaration = &WEB_STYLES_CSS[declaration_start..declaration_end.expect("动画声明必须闭合")];
+            assert!(!declaration.contains("infinite"), "一次性反馈动画不得循环：{animation}");
+        }
+
+        for asset in [
+            "panel-left-open-v1.png",
+            "panel-left-close-v1.png",
+            "panel-right-open-v1.png",
+            "panel-right-close-v1.png",
+            "focus-layout-v1.png",
+            "approve-once-v1.png",
+            "approve-rule-v1.png",
+            "reject-feedback-v1.png",
+        ] {
+            let asset_rel = format!("assets/ui-redesign/three-column/control-icons/{asset}");
+            let asset_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(&asset_rel);
+            assert!(
+                std::fs::metadata(&asset_path)
+                    .map(|metadata| metadata.len() > 0)
+                    .unwrap_or(false),
+                "ImageGen 控件资源必须存在且非空：{asset}"
+            );
+            assert!(
+                WEB_INDEX_HTML.contains(&asset_rel) || WEB_APP_JS.contains(&asset_rel),
+                "ImageGen 控件必须有真实运行时引用：{asset}"
+            );
+        }
+        assert!(WEB_APP_JS.contains("function syncChatLayoutControlIcons"));
+        assert!(WEB_APP_JS.contains(
+            "CHAT_LAYOUT_CONTROL_ICON_PATHS.left[leftOpen ? \"close\" : \"open\"]"
+        ));
+        assert!(WEB_APP_JS.contains(
+            "CHAT_LAYOUT_CONTROL_ICON_PATHS.right[rightOpen ? \"close\" : \"open\"]"
+        ));
+        assert!(WEB_APP_JS.contains("syncChatLayoutControlIcons(leftOpen, rightOpen"));
+
+        let top_region_start = WEB_INDEX_HTML
+            .find("<section class=\"layout-top-region\"")
+            .expect("顶部区域必须存在");
+        let top_region_end = WEB_INDEX_HTML
+            .find("<section class=\"layout-workbench\"")
+            .expect("工作台必须存在");
+        let top_region = &WEB_INDEX_HTML[top_region_start..top_region_end];
+        assert!(!top_region.contains("task-summary-card"));
+        assert!(!top_region.contains("data-bind=\"overview.healthPercent\""));
+        assert!(!WEB_INDEX_HTML.contains("task-summary-card"));
+        assert!(!WEB_STYLES_CSS.contains("task-summary-card"));
+        assert!(WEB_STYLES_CSS.contains(".chat-right-task-summary"));
+        let task_panel = WEB_INDEX_HTML
+            .find("id=\"chat-right-panel-tasks\"")
+            .expect("右侧任务面板必须存在");
+        let status_panel = WEB_INDEX_HTML
+            .find("id=\"chat-right-panel-status\"")
+            .expect("右侧状态面板必须存在");
+        let health_detail = WEB_INDEX_HTML
+            .find("data-bind=\"overview.healthPercent\"")
+            .expect("健康度详情必须存在");
+        let task_panel_markup = &WEB_INDEX_HTML[task_panel..status_panel];
+        assert_eq!(
+            task_panel_markup.matches("data-role=\"chat-right-task-summary\"").count(),
+            1,
+            "右栏任务摘要必须唯一"
+        );
+        let task_summary_offset = task_panel_markup
+            .find("class=\"top-status-card chat-right-task-summary\"")
+            .expect("右栏任务摘要必须使用专属摘要类");
+        let task_summary_start = task_panel + task_summary_offset;
+        let task_summary_end = task_summary_start
+            + WEB_INDEX_HTML[task_summary_start..]
+                .find("</article>")
+                .map(|offset| offset + "</article>".len())
+                .expect("右栏任务摘要必须闭合");
+        let task_summary_markup = &WEB_INDEX_HTML[task_summary_start..task_summary_end];
+        assert!(!task_summary_markup.contains("<header"), "右栏摘要不得再嵌套重复页眉");
+        assert!(
+            !task_summary_markup.contains("data-action=\"chat-task-chain\""),
+            "任务链入口应保留在右栏底部，不得重复塞进摘要页眉"
+        );
+        for token in [
+            "data-bind=\"task.currentTitle\"",
+            "data-role=\"task-card-progress\"",
+            "data-role=\"task-card-progress-bar\"",
+            "data-bind=\"task.currentProgress\"",
+            "data-bind=\"task.statusRunning\"",
+            "data-bind=\"task.statusQueued\"",
+            "data-bind=\"task.statusCompleted\"",
+            "data-bind=\"task.statusFailed\"",
+        ] {
+            assert!(task_summary_markup.contains(token), "右栏任务摘要内容契约缺失：{token}");
+        }
+        assert!(task_panel_markup.contains("data-role=\"handoff-drawer\""));
+        assert!(task_panel_markup.contains("data-role=\"handoff-list\""));
+        let footer_start = WEB_INDEX_HTML
+            .find("data-role=\"chat-right-rail-footer\"")
+            .expect("右栏底部操作区必须存在");
+        let footer_end = footer_start
+            + WEB_INDEX_HTML[footer_start..]
+                .find("</footer>")
+                .map(|offset| offset + "</footer>".len())
+                .expect("右栏底部操作区必须闭合");
+        let footer_markup = &WEB_INDEX_HTML[footer_start..footer_end];
+        assert!(footer_markup.contains("data-action=\"chat-task-chain\""));
+        assert!(task_panel < task_summary_start && task_summary_start < status_panel);
+        assert!(status_panel < health_detail && status_panel < footer_start);
+        assert!(WEB_INDEX_HTML.contains("data-action=\"approval-approve-once\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"approval-approve-session\""));
+        assert!(WEB_APP_JS.contains("CHAT_APPROVAL_CONTROL_ICON_PATHS.rule"));
+    }
+
+    #[test]
+    fn web_frontend_p5_topbar_and_real_imagegen_controls_are_wired() {
+        let top_start = WEB_INDEX_HTML
+            .find("<section class=\"layout-top-region\"")
+            .expect("P5 顶栏必须存在");
+        let workbench_start = WEB_INDEX_HTML
+            .find("<section class=\"layout-workbench\"")
+            .expect("P5 工作台必须存在");
+        let top = &WEB_INDEX_HTML[top_start..workbench_start];
+        let brand = top.find("class=\"brand-banner\"").expect("品牌槽必须存在");
+        let identity = top
+            .find("class=\"top-status-card overview-card\"")
+            .expect("Agent/工作区主槽必须存在");
+        let chat = top
+            .find("data-role=\"top-chat-context\"")
+            .expect("聊天室次槽必须存在");
+        assert!(brand < identity && identity < chat, "顶栏槽位顺序必须是品牌、Agent/工作区、聊天室/状态");
+        for token in [
+            "data-role=\"overview-mascot-avatar\"",
+            "data-role=\"overview-agent-trigger\"",
+            "data-action=\"overview-agent-settings\"",
+            "打开聊天导航中的发送对象配置",
+            "data-role=\"overview-agent-label\"",
+            "data-role=\"overview-workspace-name\"",
+            "data-role=\"overview-workspace-label\"",
+            "data-action=\"overview-workspace-settings\"",
+            "打开聊天导航中的工作区设置",
+            "class=\"overview-field overview-agent-field\"",
+            "class=\"overview-field overview-workspace-field\"",
+            "class=\"overview-field-divider\"",
+            "class=\"top-chat-room-entry\"",
+            "data-action=\"top-chat-room\"",
+            "打开聊天导航中的聊天室选择",
+            "assets/icons-wuxia/chevron.svg",
+            "class=\"brand-banner-art\"",
+            "class=\"brand-banner-title\">COOLZHU CODE</span>",
+            "data-role=\"chat-top-status-ready\" data-state=\"idle\"",
+            "data-role=\"chat-top-status-lantern\" data-state=\"idle\"",
+            "data-role=\"chat-top-status-alert\" data-state=\"idle\"",
+            "role=\"img\" aria-label=\"系统状态灯：等待自检\"",
+            "assets/ui-redesign/p6/status-jade-ready-v1.png",
+            "assets/ui-redesign/p6/status-vermilion-alert-v1.png",
+        ] {
+            assert!(top.contains(token), "P5 顶栏交互/叶名标记缺失：{token}");
+        }
+        let identity_end = top
+            .find("</article>")
+            .expect("Agent/工作区主槽必须闭合");
+        let identity_markup = &top[identity..identity_end];
+        assert!(identity_markup.contains("data-role=\"overview-mascot-avatar\""));
+        assert!(identity_markup.contains("data-role=\"overview-agent-label\""));
+        assert!(identity_markup.contains("data-role=\"overview-workspace-label\""));
+        assert!(identity_markup.contains("class=\"overview-field-divider\""));
+        assert!(!identity_markup.contains("data-role=\"overview-status-dot\""));
+        let chat_markup = &top[chat..];
+        assert!(chat_markup.contains("data-role=\"chat-top-status-ready\""));
+        assert!(chat_markup.contains("data-role=\"chat-top-status-lantern\""));
+        assert!(chat_markup.contains("data-role=\"chat-top-status-alert\""));
+        assert_eq!(
+            WEB_INDEX_HTML.matches("data-role=\"chat-top-status-ready\"").count(),
+            1,
+            "健康状态牌必须唯一且位于顶栏"
+        );
+        assert_eq!(
+            WEB_INDEX_HTML.matches("data-role=\"chat-top-status-lantern\"").count(),
+            1,
+            "动态状态灯必须唯一且迁到顶栏"
+        );
+        assert_eq!(
+            WEB_INDEX_HTML.matches("data-role=\"chat-top-status-alert\"").count(),
+            1,
+            "异常状态牌必须唯一且位于顶栏"
+        );
+        assert_eq!(
+            WEB_INDEX_HTML.matches("data-role=\"chat-right-status-lantern\"").count(),
+            0,
+            "右栏不得保留重复动态状态灯"
+        );
+        let right_start = WEB_INDEX_HTML
+            .find("<aside id=\"chat-right-rail\"")
+            .expect("右栏必须存在");
+        let right_end = right_start
+            + WEB_INDEX_HTML[right_start..]
+                .find("</aside>")
+                .expect("右栏必须闭合");
+        assert!(
+            !WEB_INDEX_HTML[right_start..right_end].contains("chat-top-status-lantern"),
+            "顶栏状态灯不得复制到右栏"
+        );
+        for token in [
+            "--top-brand-column: clamp(150px, 13vw, 210px);",
+            "--top-identity-column: minmax(380px, 1.6fr);",
+            "--top-context-column: minmax(260px, .85fr);",
+            "grid-template-columns: clamp(132px, 15vw, 180px) minmax(300px, 1.4fr) minmax(220px, .9fr);",
+            "grid-template-columns: minmax(116px, .8fr) minmax(0, 1.45fr) minmax(190px, .9fr);",
+            "grid-template-columns: minmax(88px, .75fr) minmax(0, 1.45fr) minmax(132px, .95fr);",
+            "topbar-three-plate-scroll-v1.png",
+            "background: url(\"../assets/ui-redesign/p5/topbar-three-plate-scroll-v1.png\") center / 100% auto no-repeat;",
+            "pointer-events: none;",
+            "opacity: 0.1;",
+            "box-sizing: border-box;",
+            "overflow: hidden;",
+            "grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);",
+        ] {
+            assert!(WEB_STYLES_CSS.contains(token), "P5 顶栏布局/装饰契约缺失：{token}");
+        }
+        for token in [
+            "function focusChatRoomSelector()",
+            "toggleChatLayoutRail(\"left\")",
+            "[data-role=\"chat-room-search\"]",
+            "bindChatLayoutAction(\"top-chat-room\", focusChatRoomSelector)",
+            "function focusChatAgentTargets()",
+            "[data-sidebar-group=\"advanced-config\"]",
+            "[data-role=\"agent-trigger\"]",
+            "wrap.classList.add(\"open\");",
+            "trigger.setAttribute(\"aria-expanded\", \"true\");",
+            "function renderChatTopReadyStatus(snapshot = agentHealthSnapshot())",
+            "function renderChatTopAlertStatus({ healthTone = \"idle\", taskState = null } = {})",
+            "renderChatTopReadyStatus(snapshot);",
+            "renderChatTopReadyStatus(healthSnapshot);",
+            "renderChatTopAlertStatus({ healthTone: healthSnapshot.tone, taskState });",
+            "function selectedAgentRecords(registry = agentRegistry)",
+            "getSelectedAgentIds()",
+            "overviewLabel.textContent = names.length ? names.join(\"、\") : \"未配置\";",
+            "function focusChatWorkspaceSettings()",
+            "[data-action=\"chat-workspace-edit\"]",
+            "setOverviewWorkspaceName(full);",
+            "const lantern = document.querySelector('[data-role=\"chat-top-status-lantern\"]')",
+            "lantern.setAttribute(\"aria-label\", stateLabel);",
+        ] {
+            assert!(WEB_APP_JS.contains(token), "P5 顶栏真实动作/状态同步契约缺失：{token}");
+        }
+
+        let logo_rel = "assets/ui-redesign/p5/chat-watermark-jade-sword-v1.png";
+        let logo_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(logo_rel);
+        assert!(
+            std::fs::metadata(&logo_path)
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false),
+            "P5 玉璧剑徽资源必须存在且非空"
+        );
+        assert_eq!(WEB_INDEX_HTML.matches(logo_rel).count(), 1);
+        assert!(WEB_INDEX_HTML.contains("<span>COOLZHU CODE</span>"));
+        assert!(!WEB_INDEX_HTML.contains("layer4-logo-leaftext.png"));
+        assert!(!WEB_STYLES_CSS.contains("layer4-logo-leaftext.png"));
+        let p5_styles_start = WEB_STYLES_CSS
+            .find("/* P5：顶栏三槽与聊天视觉最终契约")
+            .expect("P5 最终视觉样式必须存在");
+        let logo_start = p5_styles_start
+            + WEB_STYLES_CSS[p5_styles_start..]
+                .find("body.ui-3d .workbench-window[data-window-theme=\"communication-bay\"] .chat-atmosphere-logo {")
+                .expect("P5 聊天徽记最终样式必须存在");
+        let logo_rule = &WEB_STYLES_CSS[logo_start..]
+            [..WEB_STYLES_CSS[logo_start..].find('}').expect("P5 聊天徽记最终样式必须闭合")];
+        for token in [
+            "left: 50%;",
+            "top: 50%;",
+            "right: auto;",
+            "bottom: auto;",
+            "width: min(44%, 460px);",
+            "opacity: 0.26;",
+            "transform: translate(-50%, -50%);",
+            "pointer-events: none;",
+            "animation: chatLogoLacquerBreath 9s ease-in-out infinite;",
+        ] {
+            assert!(logo_rule.contains(token), "P5 聊天徽记几何/透明度契约缺失：{token}");
+        }
+        assert!(WEB_STYLES_CSS.contains("color: #d6b866;"));
+        assert!(WEB_STYLES_CSS.contains("#a7d7b2") || WEB_STYLES_CSS.contains("rgba(167, 215, 178"));
+        assert!(WEB_STYLES_CSS.contains("opacity: 0.22;"));
+        assert!(WEB_STYLES_CSS.contains("opacity: 0.32;"));
+        for token in [
+            "#061713",
+            "max-width: 88%;",
+            "max-width: 72%;",
+            "max-width: 82%;",
+            "background: rgba(80, 125, 103, 0.56);",
+            "background: rgba(16, 46, 36, 0.33);",
+            "background: rgba(90, 65, 31, 0.64);",
+            "background: rgba(42, 29, 16, 0.34);",
+            "background: rgba(30, 66, 86, 0.64);",
+            "background: rgba(10, 29, 40, 0.34);",
+            "border-color: #78c99a;",
+            "border-color: #d8b866;",
+            "border-color: #749b91;",
+            "overflow-wrap: anywhere;",
+            "word-break: break-word;",
+            "white-space: pre-wrap;",
+            "overflow: auto;",
+        ] {
+            assert!(WEB_STYLES_CSS.contains(token), "P5 聊天背景/消息卡色阶契约缺失：{token}");
+        }
+
+        let footer_start = WEB_INDEX_HTML
+            .find("data-role=\"chat-right-rail-footer\"")
+            .expect("右栏任务链 footer 必须存在");
+        let footer_end = footer_start
+            + WEB_INDEX_HTML[footer_start..]
+                .find("</footer>")
+                .expect("右栏任务链 footer 必须闭合");
+        let footer = &WEB_INDEX_HTML[footer_start..footer_end];
+        assert!(footer.contains("data-action=\"chat-task-chain\""));
+        assert!(footer.contains("control-icons/queue-v1.png"));
+        assert!(footer.contains("data-action=\"chat-handoff-manual\""));
+        assert!(footer.contains("control-icons/steer-now-v1.png"));
+        for asset in [
+            "queue-v1.png",
+            "steer-now-v1.png",
+            "pause-v1.png",
+            "resume-v1.png",
+            "restore-chat-v1.png",
+        ] {
+            let asset_rel = format!("assets/ui-redesign/three-column/control-icons/{asset}");
+            let asset_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(&asset_rel);
+            assert!(
+                std::fs::metadata(&asset_path)
+                    .map(|metadata| metadata.len() > 0)
+                    .unwrap_or(false),
+                "P5 ImageGen 控件资源必须存在且非空：{asset}"
+            );
+            assert!(
+                WEB_INDEX_HTML.contains(&asset_rel) || WEB_APP_JS.contains(&asset_rel),
+                "P5 ImageGen 控件必须有真实运行时引用：{asset}"
+            );
+        }
+        for token in [
+            "data-goal-action=\"goal-pause\"",
+            "data-goal-action=\"goal-resume\"",
+            "rollback.dataset.historyAction = \"rollback\";",
+            "function rollbackSelectedSession",
+            "method: \"POST\"",
+        ] {
+            assert!(WEB_APP_JS.contains(token), "P5 真实暂停/继续/回滚动作契约缺失：{token}");
+        }
+        for forbidden in ["restore-code-v1.png", "restore-both-v1.png"] {
+            assert!(!WEB_INDEX_HTML.contains(forbidden));
+            assert!(!WEB_APP_JS.contains(forbidden));
+            assert!(!WEB_STYLES_CSS.contains(forbidden));
+        }
+        for unsupported in ["chat-queue", "chat-steer", "chat-checkpoint"] {
+            assert!(!WEB_INDEX_HTML.contains(&format!("data-action=\"{unsupported}\"")));
+            assert!(!WEB_APP_JS.contains(&format!("data-action=\"{unsupported}\"")));
+        }
+        for token in [
+            "min-width: 44px;",
+            "height: 40px;",
+            "min-height: 40px;",
+            "width: 32px;",
+            "height: 32px;",
+            "flex: 0 0 32px;",
+        ] {
+            assert!(WEB_STYLES_CSS.contains(token), "P5 快捷控件尺寸契约缺失：{token}");
+        }
+    }
+
+    #[test]
+    fn web_frontend_p5_handoff_modal_and_streaming_cleanup_are_wired() {
+        let manual_start = WEB_APP_JS
+            .find("async function manualHandoffSelectedMessages()")
+            .expect("手动转交入口必须存在");
+        let manual_end = manual_start
+            + WEB_APP_JS[manual_start..]
+                .find("function availableHandoffTargets()")
+                .expect("手动转交入口必须有明确边界");
+        let manual_source = &WEB_APP_JS[manual_start..manual_end];
+        assert!(!manual_source.contains("window.prompt"));
+        assert!(!manual_source.contains("window.confirm"));
+        assert!(manual_source.contains("const members = availableHandoffTargets();"));
+        assert!(manual_source.contains("没有可转交的目标 Agent"));
+        assert!(manual_source.contains("openManualHandoffModal(members);"));
+
+        let preferred_start = WEB_APP_JS
+            .find("function preferredHandoffTarget()")
+            .expect("转交默认目标函数必须存在");
+        let preferred_end = preferred_start
+            + WEB_APP_JS[preferred_start..]
+                .find("function openManualHandoffModal(members)")
+                .expect("转交默认目标函数必须有明确边界");
+        let preferred_source = &WEB_APP_JS[preferred_start..preferred_end];
+        assert!(!preferred_source.contains("window.prompt"));
+        assert!(!preferred_source.contains("window.confirm"));
+        assert!(preferred_source.contains("getSelectedAgentIds()"));
+        assert!(preferred_source.contains("return available.find"));
+        assert!(preferred_source.contains("|| available[0]"));
+
+        let targets_start = WEB_APP_JS
+            .find("function availableHandoffTargets()")
+            .expect("可用转交目标函数必须存在");
+        let targets_end = targets_start
+            + WEB_APP_JS[targets_start..]
+                .find("function preferredHandoffTarget")
+                .expect("可用转交目标函数必须有明确边界");
+        let targets_source = &WEB_APP_JS[targets_start..targets_end];
+        for token in [
+            "Array.isArray(chatRoster.members)",
+            ".filter((member) => member?.available && member.session_id)",
+        ] {
+            assert!(targets_source.contains(token), "P5 可用转交目标契约缺失：{token}");
+        }
+
+        let modal_start = WEB_APP_JS
+            .find("function openManualHandoffModal(members)")
+            .expect("转交表单函数必须存在");
+        let modal_end = modal_start
+            + WEB_APP_JS[modal_start..]
+                .find("async function submitManualHandoffFromModal(modal, members)")
+                .expect("转交表单函数必须有明确边界");
+        let modal_source = &WEB_APP_JS[modal_start..modal_end];
+        for token in [
+            "task-chain-modal handoff-modal",
+            "task-chain-dialog handoff-dialog",
+            "role=\"dialog\" aria-modal=\"true\"",
+            "data-role=\"handoff-target\"",
+            "<select",
+            "data-role=\"handoff-intent\"",
+            "<textarea",
+            "data-role=\"handoff-selected-count\"",
+            "已选消息：${selectedCount} 条",
+            "data-handoff-cancel",
+            "data-handoff-confirm",
+            "data-handoff-close",
+            "steer-now-v1.png",
+            "modal.addEventListener(\"click\"",
+            "event.target === modal",
+            "closeTaskChainModal(modal)",
+            "data-role=\"handoff-form\"",
+            "event.preventDefault();",
+            "window.requestAnimationFrame(() => targetSelect?.focus",
+            "taskChainReturnFocus = document.activeElement",
+        ] {
+            assert!(modal_source.contains(token), "P5 转交表单契约缺失：{token}");
+        }
+
+        let submit_start = WEB_APP_JS
+            .find("async function submitManualHandoffFromModal(modal, members)")
+            .expect("转交提交函数必须存在");
+        let submit_end = submit_start
+            + WEB_APP_JS[submit_start..]
+                .find("function agentLabel(agentId)")
+                .expect("转交提交函数必须有明确边界");
+        let submit_source = &WEB_APP_JS[submit_start..submit_end];
+        for token in [
+            "const payload = {",
+            "from_agent_id: activeSessionId",
+            "to: target.session_id",
+            "attach: selectedCount ? \"message_ids\" : \"last_assistant\"",
+            "attach_message_ids: Array.from(selectedMessageIds)",
+            "/api/chat/rooms/${encodeURIComponent(activeChatRoomId)}/handoffs/manual",
+            "method: \"POST\"",
+            "setBusy(button, true, \"转交中\")",
+            "response.inbound_message",
+            "response.handoff?.rejected_reason",
+            "转交被拦截：",
+            "转交失败：${error.message}",
+            "selectedMessageIds.clear();",
+            "await refreshChatCollaboration(activeChatRoomId);",
+            "setBusy(button, false);",
+            "closeTaskChainModal(modal);",
+        ] {
+            assert!(submit_source.contains(token), "P5 转交提交/API 契约缺失：{token}");
+        }
+        assert!(!submit_source.contains("window.prompt"));
+        assert!(!submit_source.contains("window.confirm"));
+
+        let cleanup_start = WEB_APP_JS
+            .find("function clearChatStreamingMarkers()")
+            .expect("聊天室流式视觉收口 helper 必须存在");
+        let cleanup_end = cleanup_start
+            + WEB_APP_JS[cleanup_start..]
+                .find("function renderChatMessageEmptyState")
+                .expect("聊天室流式视觉收口 helper 必须有明确边界");
+        let cleanup_source = &WEB_APP_JS[cleanup_start..cleanup_end];
+        for token in [
+            "const list = chatMessageList();",
+            "list.querySelectorAll(\".message.is-streaming\")",
+            "message.classList.remove(\"is-streaming\")",
+        ] {
+            assert!(cleanup_source.contains(token), "流式标记清理契约缺失：{token}");
+        }
+
+        let stream_start = WEB_APP_JS
+            .find("async function streamChat(payload, { signal } = {})")
+            .expect("聊天室 SSE 函数必须存在");
+        let stream_end = stream_start
+            + WEB_APP_JS[stream_start..]
+                .find("function parseSseFrame(frame)")
+                .expect("聊天室 SSE 函数必须有明确边界");
+        let stream_source = &WEB_APP_JS[stream_start..stream_end];
+        assert!(stream_source.contains("clearChatStreamingMarkers();"));
+        assert!(stream_source.contains("if (error?.name === \"AbortError\") throw error;"));
+
+        let event_start = WEB_APP_JS
+            .find("function handleChatStreamEvent({ event, data })")
+            .expect("聊天室 SSE 事件处理函数必须存在");
+        let event_end = event_start
+            + WEB_APP_JS[event_start..]
+                .find("function shouldRenderCompletedMessage")
+                .expect("聊天室 SSE 事件处理函数必须有明确边界");
+        let event_source = &WEB_APP_JS[event_start..event_end];
+        for token in [
+            "if (event === \"message_done\")",
+            "upsertMessage(data, { streaming: false });",
+            "if (event === \"done\")",
+            "[\"completed\", \"interrupted\", \"failed\"].includes(data?.status)",
+            "clearChatStreamingMarkers();",
+            "if (event === \"error\")",
+        ] {
+            assert!(event_source.contains(token), "聊天室终态流式清理契约缺失：{token}");
+        }
+
+        let send_start = WEB_APP_JS
+            .find("async function sendMessage({ replaceActive = false } = {})")
+            .expect("聊天室发送函数必须存在");
+        let send_end = send_start
+            + WEB_APP_JS[send_start..]
+                .find("async function interruptActiveChatTurn")
+                .expect("聊天室发送函数必须有明确边界");
+        let send_source = &WEB_APP_JS[send_start..send_end];
+        assert!(send_source.contains("} finally {\n    clearChatStreamingMarkers();"));
+    }
+
+    #[test]
+    fn web_frontend_p3c_review_corrections_keep_feedback_local_and_current() {
+        let quick_start = WEB_STYLES_CSS
+            .find("/* P3-C 校正：左侧三枚 ImageGen 布局图标")
+            .expect("左侧快捷图标校正样式必须存在");
+        let quick_source = &WEB_STYLES_CSS[quick_start..];
+        for token in [
+            ".chat-quick-layout-controls > .chat-rail-toggle",
+            ".chat-quick-layout-controls > .chat-main-action",
+            ".chat-quick-layout-controls > .chat-rail-toggle > img",
+            ".chat-quick-layout-controls > .chat-main-action > img",
+            "filter: drop-shadow(0 0 3px rgba(111, 211, 173, 0.22))",
+            ":hover:not(:disabled)",
+            ":active:not(:disabled)",
+            "[aria-expanded=\"true\"] > img",
+            "[aria-pressed=\"true\"] > img",
+            ":focus-visible > img",
+            "transition: filter 140ms ease;",
+        ] {
+            assert!(quick_source.contains(token), "快捷图标状态反馈契约缺失：{token}");
+        }
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .chat-quick-layout-controls .chat-rail-toggle"
+        ));
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .chat-quick-layout-controls > .chat-main-action"
+        ));
+        let reduced_motion_start = WEB_STYLES_CSS
+            .rfind("@media (prefers-reduced-motion: reduce)")
+            .expect("reduced-motion 覆盖必须存在");
+        let reduced_motion_end = WEB_STYLES_CSS[reduced_motion_start..]
+            .find("@media (forced-colors: active)")
+            .map(|offset| reduced_motion_start + offset)
+            .expect("reduced-motion 覆盖必须有明确边界");
+        let reduced_motion = &WEB_STYLES_CSS[reduced_motion_start..reduced_motion_end];
+        for token in [
+            ".chat-quick-layout-controls > .chat-rail-toggle",
+            ".chat-quick-layout-controls > .chat-main-action",
+            ".chat-quick-layout-controls > .chat-rail-toggle > img",
+            ".chat-quick-layout-controls > .chat-main-action > img",
+            "transition: none !important;",
+            "animation: none !important;",
+        ] {
+            assert!(reduced_motion.contains(token), "快捷图标 reduced-motion 契约缺失：{token}");
+        }
+
+        let approval_start = WEB_APP_JS
+            .find("function taskRenderApprovals")
+            .expect("审批列表渲染函数必须存在");
+        let approval_end = WEB_APP_JS[approval_start..]
+            .find("function taskPermissionDecisionDisplay")
+            .map(|offset| approval_start + offset)
+            .expect("审批列表渲染函数必须有明确边界");
+        let approval_source = &WEB_APP_JS[approval_start..approval_end];
+        for token in [
+            "const runtimeTasks = mergedRuntimeTaskItems();",
+            "const visibleGoals = taskCardVisibleGoals(taskGoals, runtimeTasks);",
+            "const snapshot = taskStatusSnapshot(visibleGoals, runtimeTasks);",
+            "syncChatTaskFeedback({",
+            "pendingApprovalCount: normalizedPending.length,",
+            "compareTaskCounts: false,",
+        ] {
+            assert!(approval_source.contains(token), "审批渲染反馈同步契约缺失：{token}");
+        }
+        assert!(WEB_APP_JS.contains("const CHAT_SEAL_STAMP_DEDUP_MS = 280;"));
+        assert!(WEB_APP_JS.contains("taskRenderApprovals(taskPendingApprovals);"));
+
+        let feedback_start = WEB_APP_JS
+            .find("function syncChatTaskFeedback")
+            .expect("反馈同步函数必须存在");
+        let feedback_end = WEB_APP_JS[feedback_start..]
+            .find("function renderTaskStatusSummary")
+            .map(|offset| feedback_start + offset)
+            .expect("反馈同步函数必须有明确边界");
+        let feedback_source = &WEB_APP_JS[feedback_start..feedback_end];
+        for token in [
+            "if (taskStatusFeedbackBaseline == null)",
+            "const completedGrew = compareTaskCounts && completed > taskStatusFeedbackBaseline.completed;",
+            "const pendingApprovalsGrew = pendingApprovalCount > taskStatusFeedbackBaseline.pendingApprovalCount;",
+            "const failedGrew = compareTaskCounts && failed > taskStatusFeedbackBaseline.failed;",
+            "if (completedGrew)",
+            "if (failedGrew)",
+            "else if (pendingApprovalsGrew)",
+            "if (compareTaskCounts)",
+        ] {
+            assert!(feedback_source.contains(token), "统一反馈比较契约缺失：{token}");
+        }
+        assert!(!feedback_source.contains("renderTaskStatusSummary("));
+        assert!(!feedback_source.contains("taskRenderApprovals("));
+
+        let task_filter_start = WEB_APP_JS
+            .find("function chatRightRailRelevantTaskRecords")
+            .expect("右栏相关任务过滤函数必须存在");
+        let task_filter_end = WEB_APP_JS[task_filter_start..]
+            .find("function chatRightRailRelevantHandoffRecords")
+            .map(|offset| task_filter_start + offset)
+            .expect("右栏相关任务过滤函数必须有明确边界");
+        let task_filter_source = &WEB_APP_JS[task_filter_start..task_filter_end];
+        for token in [
+            "goals.filter(goalIsCurrentTaskCardCandidate)",
+            "chatRightRailActiveRuntimeTasks(runtimeTasks)",
+            "if (activeTaskRecords.length)",
+            "const terminalTaskRecords = [...goals, ...runtimeTasks].filter(chatRightRailTaskRecordIsTerminal);",
+            "chatSortRecordsByUpdatedAt(terminalTaskRecords).slice(0, 1)",
+        ] {
+            assert!(task_filter_source.contains(token), "右栏任务当前状态过滤契约缺失：{token}");
+        }
+        for token in [
+            "function chatRecordUpdatedAt(record = {})",
+            "function chatSortRecordsByUpdatedAt(records = [])",
+            "hasExplicitTimestamp === false",
+        ] {
+            assert!(WEB_APP_JS.contains(token), "右栏时间排序契约缺失：{token}");
+        }
+        let handoff_filter_start = WEB_APP_JS
+            .find("function chatRightRailRelevantHandoffRecords")
+            .expect("右栏相关 handoff 过滤函数必须存在");
+        let handoff_filter_end = WEB_APP_JS[handoff_filter_start..]
+            .find("function chatRightRailLanternState")
+            .map(|offset| handoff_filter_start + offset)
+            .expect("右栏相关 handoff 过滤函数必须有明确边界");
+        let handoff_filter_source = &WEB_APP_JS[handoff_filter_start..handoff_filter_end];
+        for token in [
+            "const activeHandoffs = handoffs.filter",
+            "if (activeHandoffs.length)",
+            "const terminalHandoffs = handoffs.filter",
+            "chatSortRecordsByUpdatedAt(terminalHandoffs).slice(0, 1)",
+        ] {
+            assert!(handoff_filter_source.contains(token), "右栏 handoff 当前状态过滤契约缺失：{token}");
+        }
+        for token in [
+            "const CHAT_RIGHT_RAIL_ACTIVE_HANDOFF_STATUSES = new Set([",
+            "const CHAT_RIGHT_RAIL_TERMINAL_HANDOFF_STATUSES = new Set([",
+        ] {
+            assert!(WEB_APP_JS.contains(token), "右栏 handoff 状态集合契约缺失：{token}");
+        }
+        let lantern_start = WEB_APP_JS
+            .find("function chatRightRailLanternState")
+            .expect("右栏灯笼状态函数必须存在");
+        let lantern_end = WEB_APP_JS[lantern_start..]
+            .find("function renderChatRightRailStatus")
+            .map(|offset| lantern_start + offset)
+            .expect("右栏灯笼状态函数必须有明确边界");
+        let lantern_source = &WEB_APP_JS[lantern_start..lantern_end];
+        for token in [
+            "const taskRecords = chatRightRailRelevantTaskRecords(taskSnapshot);",
+            "const handoffRecords = chatRightRailRelevantHandoffRecords();",
+            "const statusPriority = [\"approval\", \"error\", \"running\", \"active\", \"idle\"];",
+            "chatRecordsHaveRawStatus(handoffRecords",
+        ] {
+            assert!(lantern_source.contains(token), "右栏灯笼当前状态契约缺失：{token}");
+        }
+        assert!(!lantern_source.contains("const taskRecords = ["));
+        assert!(!lantern_source.contains("const handoffRecords = Array.isArray(chatHandoffs)"));
     }
 
     #[test]
@@ -63283,8 +77425,12 @@ attach: last_assistant
     #[test]
     fn web_frontend_high_dpi_short_viewport_keeps_primary_controls_reachable() {
         assert!(WEB_STYLES_CSS.contains("@media (max-height: 760px)"));
-        assert!(WEB_STYLES_CSS.contains("--workbench-top: 11%;"));
-        assert!(WEB_STYLES_CSS.contains("--dock-width: 62px;"));
+        assert!(WEB_STYLES_CSS.contains("--top-region-height: 48px"));
+        assert!(WEB_STYLES_CSS.contains("--top-region-offset: 4px"));
+        assert!(WEB_STYLES_CSS.contains(
+            "--workbench-top: calc(var(--top-region-offset) + var(--top-region-height) + var(--workbench-top-gap));"
+        ));
+        assert!(WEB_STYLES_CSS.contains("--quick-rail-width: clamp(52px, 3.75vw, 60px)"));
         assert!(WEB_STYLES_CSS.contains(".ide-toolbar {\n  flex-wrap: wrap;"));
         assert!(WEB_STYLES_CSS.contains(".ide-toolbar .ide-omni-search"));
         assert!(
@@ -63302,7 +77448,7 @@ attach: last_assistant
             short_screen_override > last_hidden_task_rule,
             "the short-screen override must follow later themed overflow rules"
         );
-        assert!(WEB_STYLES_CSS.trim_end().ends_with(
+        assert!(WEB_STYLES_CSS.contains(
             "  body.ui-3d .vision-command-rail .vision-window-action-card {\n    min-height: 0;\n    height: auto;\n    overflow: visible;\n  }\n}"
         ));
         assert!(WEB_STYLES_CSS
@@ -63356,7 +77502,7 @@ attach: last_assistant
         assert!(WEB_INDEX_HTML.contains("命令行工具与脚本执行"));
         assert!(WEB_INDEX_HTML.contains("模型上下文协议工具"));
         assert!(WEB_INDEX_HTML.contains("技能 / 插件扩展"));
-        assert!(WEB_INDEX_HTML.contains("计算资源使用控制"));
+        assert!(WEB_INDEX_HTML.contains("鼠标、键盘与浏览器工具"));
         assert!(WEB_INDEX_HTML.contains("按意图选择合适工具与执行路径"));
         assert!(WEB_INDEX_HTML.contains("data-action=\"tool-inventory-manage\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"tool-legacy-controls\""));
@@ -63365,6 +77511,70 @@ attach: last_assistant
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .tool-inventory-row"));
         assert!(WEB_STYLES_CSS.contains("grid-template-columns: 44px minmax(0, 1fr) auto auto;"));
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .tool-legacy-controls"));
+        assert_web_frontend_approval_scope_contract();
+    }
+
+    fn assert_web_frontend_approval_scope_contract() {
+        for token in [
+            "function normalizeApprovalScopeValue",
+            "function approvalRecordMatchesActiveScope",
+            "function approvalScopeIsComplete",
+            "function clearStaleApprovalForActiveScope",
+            "query.set(\"session_id\", requestedScope.session_id)",
+            "query.set(\"chat_room_id\", requestedScope.chat_room_id)",
+            ".filter((record) => approvalRecordMatchesScope(record, requestedScope))",
+            "session_id: activeScope.session_id",
+            "chat_room_id: activeScope.chat_room_id",
+            "approvalRecordMatchesScope(activeRecord, activeScope)",
+            "approvalRecordMatchesScope(listRecord, activeScope)",
+            "clearStaleApprovalForActiveScope();",
+        ] {
+            assert!(WEB_APP_JS.contains(token), "审批作用域契约缺失：{token}");
+        }
+
+        let permission_start = WEB_APP_JS
+            .find("source.addEventListener(\"permission-required\"")
+            .expect("permission-required SSE handler 必须存在");
+        let permission_end = WEB_APP_JS[permission_start..]
+            .find("source.addEventListener(\"approved\"")
+            .map(|offset| permission_start + offset)
+            .expect("permission-required SSE handler 必须有明确边界");
+        let permission_handler = &WEB_APP_JS[permission_start..permission_end];
+        let filter_offset = permission_handler
+            .find("approvalRecordMatchesActiveScope(record)")
+            .expect("permission-required 必须先校验当前作用域");
+        let render_offset = permission_handler
+            .find("renderApprovalPanel(record)")
+            .expect("匹配作用域的 permission-required 必须渲染");
+        assert!(filter_offset < render_offset);
+
+        let respond_start = WEB_APP_JS
+            .find("async function respondToApproval(kind, scope)")
+            .expect("审批响应函数必须存在");
+        let respond_end = WEB_APP_JS[respond_start..]
+            .find("// ---------------------------------------------------------------------------")
+            .map(|offset| respond_start + offset)
+            .expect("审批响应函数必须有明确边界");
+        let respond_body = &WEB_APP_JS[respond_start..respond_end];
+        assert!(respond_body.contains("const activeScope = approvalScopeSnapshot();"));
+        assert!(respond_body.contains("session_id: activeScope.session_id"));
+        assert!(respond_body.contains("chat_room_id: activeScope.chat_room_id"));
+        assert!(respond_body.contains("void refreshPendingApprovals();"));
+        assert!(!respond_body.contains("record.session_id"));
+        assert!(!respond_body.contains("record.chat_room_id"));
+        assert!(!WEB_APP_JS.contains("hasPendingRecord ? record.session_id"));
+        assert!(!WEB_APP_JS.contains("hasPendingRecord ? record.chat_room_id"));
+
+        let session_open_start = WEB_APP_JS
+            .find("async function openSelectedSession()")
+            .expect("会话切换函数必须存在");
+        let room_open_start = WEB_APP_JS
+            .find("async function openSelectedChatRoom()")
+            .expect("聊天室切换函数必须存在");
+        assert!(WEB_APP_JS[session_open_start..room_open_start]
+            .contains("clearStaleApprovalForActiveScope();"));
+        assert!(WEB_APP_JS[room_open_start..]
+            .contains("clearStaleApprovalForActiveScope();"));
     }
 
     #[test]
@@ -63410,7 +77620,7 @@ attach: last_assistant
         assert!(!WEB_INDEX_HTML.contains("class=\"task-permission-column task-config-column\""));
         assert!(WEB_INDEX_HTML.contains("class=\"chat-sidebar-group chat-session-auth\""));
         let chat_left_rail = WEB_INDEX_HTML
-            .find("<aside class=\"chat-left-rail\"")
+            .find("<aside id=\"chat-left-rail\"")
             .expect("chat left rail exists");
         let session_auth = WEB_INDEX_HTML
             .find("<details class=\"chat-sidebar-group chat-session-auth\"")
@@ -63495,6 +77705,17 @@ attach: last_assistant
         assert!(
             WEB_STYLES_CSS.contains("body.ui-3d .task-permission-layout .module-selfcheck-list")
         );
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .chat-tool-host-content > .tasks-workbench-window .module-selfcheck-head .button-row"
+        ));
+        assert!(WEB_STYLES_CSS.contains("flex-direction: row;"));
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .chat-tool-host-content > .tasks-workbench-window .module-selfcheck .logs-window-health-card"
+        ));
+        assert!(WEB_STYLES_CSS.contains("\"meta meta\";"));
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .chat-tool-host-content > .tasks-workbench-window .module-selfcheck .module-selfcheck-runtime-meta > span > span"
+        ));
         assert!(WEB_STYLES_CSS.contains("min-height: 320px;"));
         assert!(WEB_STYLES_CSS.contains(
             "body.ui-3d .task-permission-layout .module-selfcheck-suggestions,\nbody.ui-3d .task-permission-layout .module-selfcheck-plan {\n  display: none;"
@@ -63503,13 +77724,18 @@ attach: last_assistant
     }
 
     #[test]
-    fn web_frontend_bamboo_banner_uses_baked_logo_without_overlay_distortion() {
-        assert!(WEB_INDEX_HTML.contains("class=\"brand-banner-image\""));
-        assert!(WEB_INDEX_HTML.contains("bamboo-leaf-banner-v1.png"));
+    fn web_frontend_p6_banner_uses_html_brand_overlay_without_baked_text() {
+        assert!(WEB_INDEX_HTML.contains("class=\"brand-banner-art\""));
+        assert!(WEB_INDEX_HTML.contains("class=\"brand-banner-title\">COOLZHU CODE</span>"));
+        assert!(!WEB_INDEX_HTML.contains("bamboo-leaf-banner-v1.png"));
         assert!(!WEB_INDEX_HTML.contains("class=\"brand-title\""));
         assert!(!WEB_INDEX_HTML.contains("data-role=\"throne-cat\""));
-        assert!(WEB_STYLES_CSS.contains(".brand-banner-image"));
-        assert!(WEB_STYLES_CSS.contains("body.ui-3d .brand-banner-image {\n  object-fit: cover;"));
+        assert!(WEB_STYLES_CSS.contains(".brand-banner-art"));
+        assert!(WEB_STYLES_CSS.contains(
+            "background-image: url(\"../assets/ui-redesign/p6/brand-banner-wuxia-v1.png\")"
+        ));
+        assert!(WEB_STYLES_CSS.contains(".brand-banner-title"));
+        assert!(!WEB_STYLES_CSS.contains(".brand-banner-image"));
         assert!(!WEB_STYLES_CSS.contains(".brand-title"));
         assert!(!WEB_INDEX_HTML.contains("throne-banner-v5-safe.png"));
         assert!(!WEB_INDEX_HTML.contains("throne-banner-v4-guards.png"));
@@ -63522,10 +77748,11 @@ attach: last_assistant
 
     #[test]
     fn web_frontend_top_region_has_no_blue_seams_between_cards_and_banner() {
-        assert!(WEB_STYLES_CSS.contains("--top-region-gap: 0;"));
-        assert!(WEB_STYLES_CSS.contains("--top-side-column: 26%;"));
-        assert!(WEB_STYLES_CSS.contains("--top-center-column: 48%;"));
-        assert!(WEB_STYLES_CSS.contains("--top-region-offset: 0%;"));
+        assert!(WEB_STYLES_CSS.contains("--top-region-gap: 6px;"));
+        assert!(WEB_STYLES_CSS.contains("--top-brand-column: clamp(150px, 13vw, 210px);"));
+        assert!(WEB_STYLES_CSS.contains("--top-identity-column: minmax(380px, 1.6fr);"));
+        assert!(WEB_STYLES_CSS.contains("--top-context-column: minmax(260px, .85fr);"));
+        assert!(WEB_STYLES_CSS.contains("--top-region-offset: 4px;"));
         assert!(WEB_STYLES_CSS.contains("top: var(--top-region-offset);"));
         assert!(WEB_STYLES_CSS.contains("gap: var(--top-region-gap);"));
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .layout-top-region"));
@@ -63555,12 +77782,39 @@ attach: last_assistant
         assert!(WEB_STYLES_CSS.contains("background-size: cover"));
         assert!(WEB_INDEX_HTML.contains("data-role=\"global-system-bar\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"system-workspace\""));
-        assert!(WEB_INDEX_HTML.contains("data-role=\"system-port\""));
-        assert!(WEB_INDEX_HTML.contains("data-role=\"system-build\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"system-sessions\""));
+        let footer_start = WEB_INDEX_HTML
+            .find("<footer class=\"global-system-bar\"")
+            .expect("global system footer must exist");
+        let footer_tail = &WEB_INDEX_HTML[footer_start..];
+        let footer_end = footer_tail
+            .find("</footer>")
+            .expect("global system footer must close");
+        let footer_source = &footer_tail[..footer_end];
+        assert!(footer_source.contains("<b>工作区</b>"));
+        assert!(footer_source.contains("<b>连接</b>"));
+        assert!(footer_source.contains("<b>会话</b>"));
+        assert!(footer_source.contains("data-role=\"system-connection\""));
+        assert!(!footer_source.contains("data-role=\"system-port\""));
+        assert!(!footer_source.contains("data-role=\"system-build\""));
+        let diagnostic_start = WEB_INDEX_HTML
+            .find("<section class=\"task-permission-column module-selfcheck\"")
+            .expect("module self-check diagnostic region must exist");
+        let diagnostic_tail = &WEB_INDEX_HTML[diagnostic_start..];
+        let diagnostic_end = diagnostic_tail
+            .find("</section>")
+            .expect("module self-check diagnostic region must close");
+        let diagnostic_source = &diagnostic_tail[..diagnostic_end];
+        assert!(diagnostic_source.contains("data-role=\"system-port\""));
+        assert!(diagnostic_source.contains("data-role=\"system-build\""));
         assert!(WEB_STYLES_CSS.contains(".global-system-bar"));
-        assert!(WEB_STYLES_CSS.contains("grid-template-columns: repeat(4, minmax(0, 1fr));"));
+        assert!(WEB_STYLES_CSS.contains("grid-template-columns: repeat(3, minmax(0, 1fr));"));
+        assert!(WEB_STYLES_CSS.contains(".system-dot.is-pending"));
+        assert!(WEB_STYLES_CSS.contains(".system-dot.is-error"));
         assert!(WEB_APP_JS.contains("function refreshSystemInfo"));
+        assert!(WEB_APP_JS.contains("function setSystemConnectionState"));
+        assert!(WEB_APP_JS.contains("setSystemConnectionState(\"ok\", \"已连接\""));
+        assert!(WEB_APP_JS.contains("setSystemConnectionState(\"error\", \"未连接\""));
         assert!(WEB_APP_JS.contains("/api/system/info"));
         assert!(WEB_MAIN_RS.contains(".route(\"/api/system/info\", get(api_system_info))"));
         assert!(WEB_MAIN_RS.contains("struct SystemInfoResponse"));
@@ -63625,100 +77879,80 @@ attach: last_assistant
     fn web_frontend_special_icon_groups_have_generated_asset_coverage() {
         let icon_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets")
-            .join("icons");
+            .join("icons-wuxia");
         for file in [
-            "project-tree.png",
-            "file-tree.png",
-            "file-type.png",
-            "folder.png",
-            "file.png",
-            "screen-cast.png",
-            "camera.png",
-            "inner-vision.png",
-            "roi-on.png",
-            "play-test.png",
-            "image-preview.png",
-            "speaker-on.png",
-            "lock.png",
-            "wheel.png",
-            "warning.png",
-            "warn-log.png",
-            "error-log.png",
-            "chart.png",
-            "task-list.png",
-            "git-modified.png",
-            "git-added.png",
-            "git-deleted.png",
-            "git-untracked.png",
-            "media-audio-wave.png",
-            "media-video-film.png",
-            "permission-shield-lock.png",
-            "permission-unlock.png",
-            "permission-vault-dial.png",
-            "vision-crosshair.png",
-            "diagnostic-spark.png",
-            "diagnostic-pressure-gauge.png",
+            "alert-triangle.svg",
+            "archive.svg",
+            "branch.svg",
+            "browser.svg",
+            "camera.svg",
+            "chat.svg",
+            "check.svg",
+            "chevron.svg",
+            "compute-use.svg",
+            "context-ring.svg",
+            "crosshair.svg",
+            "delete.svg",
+            "diff.svg",
+            "file.svg",
+            "folder.svg",
+            "link.svg",
+            "lock.svg",
+            "logs.svg",
+            "maximize.svg",
+            "media.svg",
+            "memory.svg",
+            "microphone.svg",
+            "pin.svg",
+            "plus.svg",
+            "project.svg",
+            "queue.svg",
+            "refresh.svg",
+            "route-plan.svg",
+            "save.svg",
+            "search.svg",
+            "send.svg",
+            "settings.svg",
+            "shield.svg",
+            "skill-star.svg",
+            "speaker.svg",
+            "split-pane.svg",
+            "stop.svg",
+            "tasks.svg",
+            "terminal.svg",
+            "unlock.svg",
+            "upload.svg",
+            "vision.svg",
+            "worktree.svg",
         ] {
             assert!(icon_root.join(file).is_file(), "missing icon asset: {file}");
         }
-        let redesign_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("assets")
-            .join("ui-redesign");
-        assert!(
-            redesign_root.join("icon-groups-v2-sheet.png").is_file(),
-            "missing generated icon sprite source"
-        );
-        for themed_icon in [
-            "project-tree.png",
-            "settings.png",
-            "chat.png",
-            "screen-cast.png",
-            "cli.png",
-            "wheel.png",
-            "skill.png",
-            "inner-vision.png",
+        for file in [
+            "branch.svg",
+            "check.svg",
+            "context-ring.svg",
+            "crosshair.svg",
+            "plus.svg",
+            "shield.svg",
+            "speaker.svg",
+            "stop.svg",
         ] {
             assert!(
-                WEB_STYLES_CSS.contains(&format!("assets/icons/{themed_icon}")),
-                "theme icon is not referenced by CSS: {themed_icon}"
-            );
-        }
-        for connected_icon in [
-            "git-modified.png",
-            "git-added.png",
-            "git-deleted.png",
-            "git-untracked.png",
-            "media-audio-wave.png",
-            "media-video-film.png",
-            "permission-shield-lock.png",
-            "permission-unlock.png",
-            "permission-vault-dial.png",
-            "diagnostic-spark.png",
-            "diagnostic-pressure-gauge.png",
-        ] {
-            let referenced = WEB_STYLES_CSS.contains(&format!("assets/icons/{connected_icon}"))
-                || WEB_INDEX_HTML.contains(&format!("assets/icons/{connected_icon}"))
-                || WEB_APP_JS.contains(&connected_icon.replace(".png", ""));
-            assert!(referenced, "generated icon is not wired: {connected_icon}");
-        }
-        let wuxia_icon_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("assets")
-            .join("icons-wuxia");
-        for file in ["crosshair.svg", "shield.svg", "speaker.svg", "stop.svg"] {
-            assert!(
-                wuxia_icon_root.join(file).is_file(),
+                icon_root.join(file).is_file(),
                 "missing wuxia icon asset: {file}"
             );
             assert!(
                 WEB_INDEX_HTML.contains(&format!("assets/icons-wuxia/{file}"))
-                    || WEB_STYLES_CSS.contains(&format!("assets/icons-wuxia/{file}")),
+                    || WEB_STYLES_CSS.contains(&format!("assets/icons-wuxia/{file}"))
+                    || WEB_APP_JS.contains(&format!("assets/icons-wuxia/{file}")),
                 "wuxia icon is not wired: {file}"
             );
         }
         assert!(
-            !WEB_INDEX_HTML.contains("assets/icons/vision-crosshair.png")
-                && !WEB_STYLES_CSS.contains("assets/icons/vision-crosshair.png"),
-            "legacy vision crosshair png should not drive the round3 vision controls"
+            !WEB_INDEX_HTML.contains("assets/icons/")
+                && !WEB_STYLES_CSS.contains("assets/icons/")
+                && !WEB_APP_JS.contains("assets/icons/"),
+            "legacy PNG icon references must not return to the frontend"
         );
         assert!(WEB_APP_JS.contains("function projectGitStatus"));
         assert!(WEB_APP_JS.contains("button.dataset.gitStatus = gitStatus;"));
@@ -63740,11 +77974,22 @@ attach: last_assistant
         assert!(WEB_STYLES_CSS.contains("--stage-h: 941"));
         assert!(WEB_STYLES_CSS.contains("--design-width: 1920"));
         assert!(WEB_STYLES_CSS.contains("--design-height: 1080"));
-        assert!(WEB_STYLES_CSS.contains("--top-region-ratio: 12%"));
-        assert!(WEB_STYLES_CSS.contains("--top-side-column: 26%"));
-        assert!(WEB_STYLES_CSS.contains("--top-center-column: 48%"));
-        assert!(WEB_STYLES_CSS.contains("--top-region-gap: 0;"));
-        assert!(WEB_STYLES_CSS.contains("--dock-region-ratio: 5.5%"));
+        assert!(WEB_STYLES_CSS.contains("--top-region-height: 48px"));
+        assert!(WEB_STYLES_CSS.contains("--top-brand-column: clamp(150px, 13vw, 210px)"));
+        assert!(WEB_STYLES_CSS.contains("--top-identity-column: minmax(380px, 1.6fr)"));
+        assert!(WEB_STYLES_CSS.contains("--quick-rail-width: clamp(52px, 3.75vw, 60px)"));
+        assert!(WEB_STYLES_CSS.contains(
+            "grid-template-columns: var(--quick-rail-width) minmax(0, 1fr);"
+        ));
+        assert!(WEB_STYLES_CSS.contains("--top-region-gap: 6px;"));
+        assert!(WEB_STYLES_CSS.contains("--top-region-offset: 4px;"));
+        assert!(WEB_STYLES_CSS.contains("--window-tab-slot-height: clamp(34px, 4vh, 38px)"));
+        assert!(WEB_STYLES_CSS.contains("--right-rail-status-slot: 30px"));
+        assert!(WEB_STYLES_CSS.contains(
+            "--workbench-top: calc(var(--top-region-offset) + var(--top-region-height) + var(--workbench-top-gap));"
+        ));
+        assert!(!WEB_STYLES_CSS.contains("--dock-region-ratio"));
+        assert!(!WEB_STYLES_CSS.contains("--dock-track-ratio"));
         assert!(WEB_STYLES_CSS.contains("--composer-region-ratio: 10%"));
         assert!(WEB_STYLES_CSS.contains("width: min(100vw, calc(100vh * 1672 / 941));"));
         assert!(WEB_STYLES_CSS.contains("height: min(100vh, calc(100vw * 941 / 1672));"));
@@ -63936,16 +78181,216 @@ attach: last_assistant
 
     #[test]
     fn web_frontend_uses_dock_as_the_only_window_navigation_surface() {
-        assert!(WEB_INDEX_HTML.contains("class=\"window-dock\""));
+        let top_region_start = WEB_INDEX_HTML
+            .find("<section class=\"layout-top-region\"")
+            .expect("顶部命令栏必须存在");
+        let workbench_start = WEB_INDEX_HTML
+            .find("<section class=\"layout-workbench\"")
+            .expect("工作台必须存在");
+        let dock_start = WEB_INDEX_HTML
+            .find("<nav class=\"window-dock\"")
+            .expect("窗口 Dock 必须存在");
+        assert!(top_region_start < workbench_start && workbench_start < dock_start);
+        assert_eq!(WEB_INDEX_HTML.matches("class=\"window-dock\"").count(), 1);
+        let dock_end = dock_start
+            + WEB_INDEX_HTML[dock_start..]
+                .find("</nav>")
+                .expect("窗口 Dock 必须闭合");
+        let dock = &WEB_INDEX_HTML[dock_start..dock_end];
+        assert_eq!(dock.matches("data-window-target=\"").count(), 9);
+        assert!(dock.contains("data-role=\"window-dock-more\""));
         assert!(WEB_INDEX_HTML.contains("data-window-target=\"chat\""));
         assert!(!WEB_INDEX_HTML.contains("class=\"window-side-title\""));
         assert!(!WEB_INDEX_HTML.contains("data-window-toggle="));
         assert!(WEB_STYLES_CSS.contains("body.ui-3d .layout-workbench"));
-        assert!(
-            WEB_STYLES_CSS.contains("grid-template-rows: var(--dock-track-ratio) minmax(0, 1fr)")
-        );
+        assert!(WEB_STYLES_CSS.contains("grid-template-rows: minmax(0, 1fr);"));
+        assert!(!WEB_STYLES_CSS.contains("grid-template-rows: var(--dock-height) minmax(0, 1fr)"));
         assert!(WEB_INDEX_HTML.contains("class=\"chat-left-rail\""));
         assert!(!WEB_INDEX_HTML.contains("class=\"window-navigation-rail\""));
+    }
+
+    #[test]
+    fn web_frontend_round4_uses_one_compact_command_bar_contract() {
+        assert!(WEB_INDEX_HTML.contains("<section class=\"layout-top-region\""));
+        assert!(WEB_INDEX_HTML.contains("<nav class=\"window-dock\""));
+        assert_eq!(WEB_INDEX_HTML.matches("class=\"window-dock\"").count(), 1);
+        let workbench_start = WEB_INDEX_HTML
+            .find("<section class=\"layout-workbench\"")
+            .expect("工作台必须存在");
+        let dock_start = WEB_INDEX_HTML
+            .find("<nav class=\"window-dock\"")
+            .expect("窗口 Dock 必须存在");
+        assert!(workbench_start < dock_start, "Dock 必须位于工作台快捷栏内");
+        let dock_end = dock_start
+            + WEB_INDEX_HTML[dock_start..]
+                .find("</nav>")
+                .expect("窗口 Dock 必须闭合");
+        let dock = &WEB_INDEX_HTML[dock_start..dock_end];
+        assert_eq!(dock.matches("data-window-target=\"").count(), 9);
+        assert!(dock.contains("data-role=\"window-dock-more\""));
+        for target in [
+            "project",
+            "settings",
+            "clawbot",
+            "chat",
+            "browser",
+            "terminal",
+            "tasks",
+            "memory",
+            "vision",
+        ] {
+            assert!(
+                dock.contains(&format!("data-window-target=\"{target}\"")),
+                "真实窗口入口不可从 Dock/更多入口丢失：{target}"
+            );
+            let marker = format!("data-window-target=\"{target}\"");
+            let button_start = dock.find(&marker).expect("窗口入口按钮必须存在");
+            let button_end = button_start
+                + dock[button_start..]
+                    .find("</button>")
+                    .expect("窗口入口按钮必须闭合");
+            let button = &dock[button_start..button_end];
+            assert!(!button.contains("data-bind="), "窗口入口不得复制 data-bind：{target}");
+            assert!(!button.contains("data-action="), "窗口入口不得复制 data-action：{target}");
+        }
+        let mut previous = 0;
+        for target in ["chat", "project", "tasks", "terminal", "browser"] {
+            let position = dock
+                .find(&format!("data-window-target=\"{target}\""))
+                .expect("高频窗口入口必须常驻");
+            assert!(position > previous, "高频窗口入口顺序不符合基础信息架构：{target}");
+            previous = position;
+        }
+        for target in ["settings", "clawbot", "memory", "vision"] {
+            let marker = format!("data-window-target=\"{target}\"");
+            let more_start = dock
+                .find("data-role=\"window-dock-more\"")
+                .expect("更多窗口入口必须存在");
+            assert!(
+                dock[more_start..].contains(&marker),
+                "低频窗口必须通过更多入口保持可达：{target}"
+            );
+        }
+        for token in [
+            "--top-region-height: 48px",
+            "--top-region-offset: 4px",
+            "--quick-rail-width: clamp(52px, 3.75vw, 60px)",
+            "--quick-rail-narrow-width: 58px",
+            "--layout-gutter-x: 6px",
+            "grid-template-columns: var(--quick-rail-width) minmax(0, 1fr);",
+            ".workbench-quick-rail",
+            ".chat-quick-layout-controls",
+            "--chat-composer-reserve: clamp(",
+            "--chat-overlay-bottom-clearance: 6px",
+            "--window-tab-icon-size: 18px",
+            "@media (max-width: 1439px)",
+            "@media (max-width: 980px)",
+        ] {
+            assert!(WEB_STYLES_CSS.contains(token), "缺少统一命令栏契约：{token}");
+        }
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .layout-workbench {\n    --quick-rail-width: var(--quick-rail-narrow-width);"
+        ));
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .workbench-window[data-window-theme=\"communication-bay\"] .chat-window-panel > .chat-right-rail {\n    bottom: calc("
+        ));
+        assert!(WEB_STYLES_CSS.contains("min-width: 44px;\n    height: 40px;\n    min-height: 40px;"));
+        assert!(!WEB_STYLES_CSS.contains("--dock-height:"));
+        assert!(!WEB_STYLES_CSS.contains("grid-template-rows: var(--dock-height) minmax(0, 1fr)"));
+    }
+
+    #[test]
+    fn web_frontend_p3c1_chat_grid_uses_two_rows_and_live_overlay_clearance() {
+        let main_selector = "body.ui-3d .workbench-window[data-window-theme=\"communication-bay\"] .chat-window-panel > .chat-main-column";
+        let main_start = WEB_STYLES_CSS
+            .find(&format!("{main_selector} {{"))
+            .expect("通信舱高特异性主列规则必须存在");
+        let main_end = main_start
+            + WEB_STYLES_CSS[main_start..]
+                .find('}')
+                .expect("通信舱高特异性主列规则必须闭合");
+        let main_rule = &WEB_STYLES_CSS[main_start..main_end];
+        assert!(main_rule.contains(
+            "grid-template-rows: minmax(0, 1fr) clamp(62px, var(--composer-region-ratio), 76px);"
+        ));
+        assert!(
+            !main_rule.contains("auto minmax(0, 1fr)"),
+            "高特异性主列规则不得恢复三行布局"
+        );
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .workbench-window[data-window-theme=\"communication-bay\"] .chat-main-column > .chat-panel {\n  grid-row: 1;"
+        ));
+        assert!(WEB_STYLES_CSS.contains(
+            "body.ui-3d .workbench-window[data-window-theme=\"communication-bay\"] .chat-main-column > .composer {\n  grid-row: 2;"
+        ));
+
+        let narrow_start = WEB_STYLES_CSS
+            .find("/* P3-A.1：900 CSS/物理像素映射下")
+            .expect("窄屏通信舱媒体查询必须存在");
+        let narrow_end = narrow_start
+            + WEB_STYLES_CSS[narrow_start..]
+                .find("\n}\n\n@media (max-width: 680px)")
+                .expect("窄屏通信舱媒体查询必须闭合");
+        let narrow_media = &WEB_STYLES_CSS[narrow_start..narrow_end];
+        assert!(narrow_media.contains("--chat-overlay-bottom-clearance: 6px;"));
+        assert!(narrow_media.contains(
+            "bottom: calc(\n      var(--chat-composer-reserve)\n      + var(--chat-overlay-composer-gap)\n      + var(--chat-overlay-bottom-clearance)\n    );"
+        ));
+        assert!(narrow_media.contains(
+            "max-height: calc(\n      100%\n      - var(--chat-composer-reserve)\n      - var(--chat-overlay-composer-gap)\n      - var(--chat-overlay-bottom-clearance)\n    );"
+        ));
+        assert!(!WEB_STYLES_CSS.contains("--chat-composer-reserve: clamp(148px, 24%, 176px)"));
+        assert!(!WEB_STYLES_CSS.contains("--chat-overlay-bottom-clearance: 12px"));
+        assert!(!WEB_STYLES_CSS.contains("y=497"));
+        assert!(WEB_STYLES_CSS.contains("--chat-composer-reserve: clamp(\n    72px,"));
+        assert!(WEB_STYLES_CSS.contains("--chat-overlay-bottom-clearance: 0px;"));
+    }
+
+    #[test]
+    fn web_frontend_chat_composer_has_stable_send_abort_slot() {
+        let composer_selector = "body.ui-3d .ui-redesign .chat-main-column .composer";
+        let composer_start = WEB_STYLES_CSS
+            .find(&format!("{composer_selector} {{"))
+            .expect("聊天 Composer 高特异性规则必须存在");
+        let composer_end = composer_start
+            + WEB_STYLES_CSS[composer_start..]
+                .find('}')
+                .expect("聊天 Composer 高特异性规则必须闭合");
+        let composer_rule = &WEB_STYLES_CSS[composer_start..composer_end];
+        assert!(composer_rule.contains(
+            "grid-template-columns: 40px minmax(0, 1fr) 104px 42px;"
+        ));
+        assert!(composer_rule.contains("gap: 6px;"));
+        assert!(
+            !composer_rule.contains("74px"),
+            "发送/中止槽位不得回退到不足以容纳活动态文案的 74px"
+        );
+
+        let button_selector =
+            "body.ui-3d .ui-redesign .chat-main-column .composer > button";
+        let button_start = WEB_STYLES_CSS
+            .find(&format!("{button_selector} {{"))
+            .expect("聊天 Composer 按钮稳定尺寸规则必须存在");
+        let button_end = button_start
+            + WEB_STYLES_CSS[button_start..]
+                .find('}')
+                .expect("聊天 Composer 按钮稳定尺寸规则必须闭合");
+        let button_rule = &WEB_STYLES_CSS[button_start..button_end];
+        for token in [
+            "width: 100%;",
+            "min-width: 0;",
+            "padding-inline: 4px;",
+            "gap: 6px;",
+            "overflow: visible;",
+            "white-space: nowrap;",
+        ] {
+            assert!(
+                button_rule.contains(token),
+                "聊天 Composer 按钮缺少稳定内容布局契约：{token}"
+            );
+        }
+        assert!(WEB_INDEX_HTML.contains("data-action=\"send-message\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"stt-dictate\""));
     }
 
     #[test]
@@ -64033,7 +78478,7 @@ attach: last_assistant
     }
 
     #[test]
-    fn web_frontend_icon_resolver_only_returns_packaged_assets() {
+    fn web_frontend_icon_resolver_only_returns_wuxia_assets() {
         fn quoted_values(source: &str) -> Vec<String> {
             let mut values = Vec::new();
             let mut rest = source;
@@ -64073,12 +78518,11 @@ attach: last_assistant
 
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let wuxia_dir = manifest_dir.join("assets/icons-wuxia");
-        let legacy_dir = manifest_dir.join("assets/icons");
 
         let alias_section = source_section(
             &WEB_APP_JS,
             "const WUXIA_ICON_ALIASES = new Map([",
-            "]);\n// 仅保留源码资源目录中真实存在",
+            "]);\nconst DEFAULT_PACKAGED_ICON_URL",
         );
         let alias_values = quoted_values(alias_section);
         assert_eq!(
@@ -64097,33 +78541,14 @@ attach: last_assistant
             );
         }
 
-        let legacy_section = source_section(
-            &WEB_APP_JS,
-            "const PACKAGED_LEGACY_PNG_ICON_NAMES = new Set([",
-            "]);\nconst DEFAULT_PACKAGED_ICON_URL",
-        );
-        let legacy_names: std::collections::BTreeSet<String> =
-            quoted_values(legacy_section).into_iter().collect();
-        for name in &legacy_names {
-            assert!(
-                legacy_dir.join(format!("{name}.png")).is_file(),
-                "legacy icon whitelist contains missing {name}.png"
-            );
-        }
-
         let assert_resolves = |name: &str| {
-            if name == "mario" || name == "robot-message" {
+            if name == "mario" {
                 return;
             }
-            if let Some(target) = aliases.get(name) {
-                assert!(wuxia_dir.join(format!("{target}.svg")).is_file());
-            } else {
-                assert!(
-                    legacy_names.contains(name),
-                    "runtime icon {name:?} is neither an SVG alias nor a packaged PNG whitelist entry"
-                );
-                assert!(legacy_dir.join(format!("{name}.png")).is_file());
-            }
+            let target = aliases
+                .get(name)
+                .unwrap_or_else(|| panic!("runtime icon {name:?} has no wuxia SVG alias"));
+            assert!(wuxia_dir.join(format!("{target}.svg")).is_file());
         };
 
         // 静态字面量调用全部解析；icon 属性中的三元表达式只取问号后的结果值。
@@ -64196,11 +78621,11 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("icon.src = iconUrl(\"vision\")"));
         assert!(WEB_APP_JS.contains("return DEFAULT_PACKAGED_ICON_URL;"));
         assert!(
-            !WEB_INDEX_HTML.contains("assets/icons/diff.png")
-                && !WEB_APP_JS.contains("assets/icons/diff.png")
-                && !WEB_INDEX_HTML.contains("assets/icons/vision.png")
-                && !WEB_APP_JS.contains("assets/icons/vision.png"),
-            "the removed PNG fallbacks must never be requested"
+            !WEB_INDEX_HTML.contains("assets/icons/")
+                && !WEB_APP_JS.contains("assets/icons/")
+                && !WEB_STYLES_CSS.contains("assets/icons/")
+                && !WEB_APP_JS.contains("PACKAGED_LEGACY_PNG_ICON_NAMES"),
+            "已移除的旧 PNG 图标与白名单不得重新进入前端"
         );
     }
 
@@ -64455,10 +78880,50 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("/beads/summary"));
         assert!(WEB_APP_JS.contains("/beads/prompt"));
         assert!(WEB_APP_JS.contains("/context-preview"));
+        assert!(WEB_APP_JS.contains("compaction_item"));
+        assert!(WEB_APP_JS.contains("/history"));
         assert!(WEB_APP_JS.contains("function memoryWindowRefreshPreviews"));
         assert!(WEB_APP_JS.contains("context_snapshot_id"));
         assert!(WEB_APP_JS.contains("memory_revision"));
-        assert!(WEB_APP_JS.contains("loaded_memory_ids"));
+        assert!(WEB_APP_JS.contains("runtime_snapshot"));
+        assert!(WEB_APP_JS.contains("runtime.model"));
+        assert!(WEB_APP_JS.contains("tool_catalog_revision"));
+        assert!(WEB_APP_JS.contains("memory_selection"));
+        assert!(WEB_APP_JS.contains("budget_skipped"));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-mode\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-jobs\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"memory-window-history\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"memory-history-validate-events\""));
+        assert!(WEB_INDEX_HTML.contains("data-role=\"memory-history-events-status\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"session-resume\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"session-fork\""));
+        assert!(WEB_INDEX_HTML.contains("data-memory-job-type=\"extraction\""));
+        assert!(WEB_INDEX_HTML.contains("data-memory-job-type=\"consolidation\""));
+        assert!(WEB_APP_JS.contains("/memory-mode"));
+        assert!(WEB_APP_JS.contains("/memory/jobs"));
+        assert!(WEB_APP_JS.contains("/history?limit=6"));
+        assert!(WEB_APP_JS.contains("/events?limit=6"));
+        assert!(WEB_APP_JS.contains("function memoryWindowValidateEvents"));
+        assert!(WEB_APP_JS.contains("coolzhu.agent.event.v1"));
+        assert!(WEB_APP_JS.contains("event.event_type === \"reasoning.completed\""));
+        assert!(WEB_APP_JS.contains("event.event_type === \"tool.call\""));
+        assert!(WEB_APP_JS.contains("event.event_type === \"tool.result\""));
+        assert!(WEB_APP_JS.contains("memoryWindowStartJob"));
+        assert!(WEB_APP_JS.contains("memoryWindowRenderJobs"));
+        assert!(WEB_APP_JS.contains("memoryWindowRenderHistory"));
+        assert!(WEB_APP_JS.contains("/resume"));
+        assert!(WEB_APP_JS.contains("/fork"));
+        assert!(WEB_APP_JS.contains("/rollback"));
+        assert!(WEB_APP_JS.contains("function resumeSelectedSession"));
+        assert!(WEB_APP_JS.contains("function forkSelectedSession"));
+        assert!(WEB_APP_JS.contains("function rollbackSelectedSession"));
+        assert!(WEB_APP_JS.contains("data-history-action"));
+        assert!(WEB_APP_JS.contains("memoryWindowUpdateMode"));
+        assert!(WEB_APP_JS.contains("memory_mode"));
+        assert!(WEB_APP_JS.contains("memory_bead_ids"));
+        assert!(WEB_APP_JS.contains("history_selection"));
+        assert!(WEB_APP_JS.contains("historySelection.source"));
+        assert!(WEB_APP_JS.contains("historyExcluded"));
         assert!(WEB_APP_JS.contains("memory-bead-pin-toggle"));
         assert!(WEB_APP_JS.contains("memory-bead-edit"));
         assert!(!WEB_APP_JS.contains("memoryWindowBeads = memoryWindowBeads.map"));
@@ -64467,6 +78932,9 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("method: \"PATCH\""));
         assert!(WEB_APP_JS.contains("memoryWindowRenderConstellation([])"));
         assert!(WEB_STYLES_CSS.contains(".memory-window-insights"));
+        assert!(WEB_STYLES_CSS.contains(".memory-window-jobs"));
+        assert!(WEB_STYLES_CSS.contains(".memory-window-history"));
+        assert!(WEB_STYLES_CSS.contains("grid-template-rows: auto auto auto auto minmax(0, 1fr)"));
         assert!(WEB_STYLES_CSS.contains(".memory-window-preview-card"));
     }
 
@@ -64474,7 +78942,7 @@ attach: last_assistant
     fn web_frontend_task_window_keeps_protected_paths_in_policy_and_supervision_ui() {
         assert!(WEB_INDEX_HTML.contains("data-role=\"task-protected-rules\""));
         assert!(WEB_INDEX_HTML.contains("运行监督"));
-        assert!(WEB_INDEX_HTML.contains("workspace 内文件读写与命令执行按默认策略放行"));
+        assert!(WEB_INDEX_HTML.contains("工作区内文件读写与命令执行按默认策略放行"));
         assert!(WEB_INDEX_HTML.contains("data-role=\"allowed-root-list\""));
         assert!(WEB_APP_JS.contains("/api/tools/protected-paths"));
         assert!(WEB_APP_JS.contains("function refreshProtectedPaths"));
@@ -64492,7 +78960,7 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("/permissions"));
         assert!(WEB_APP_JS.contains("permission_profile: \"full-access\""));
         assert!(WEB_APP_JS.contains("permission_profile: \"workspace-write\""));
-        assert!(WEB_APP_JS.contains("Confirm full access again for chat room"));
+        assert!(WEB_APP_JS.contains("请再次确认聊天室"));
         assert!(WEB_APP_JS.contains("confirmed_twice: confirmedTwice"));
         assert!(!WEB_APP_JS.contains("/api/tools/full-access"));
         assert!(WEB_APP_JS.contains("function refreshFullAccessStatus"));
@@ -64507,9 +78975,9 @@ attach: last_assistant
         assert!(!WEB_INDEX_HTML.contains("data-action=\"chat-room-diagnostics\""));
         assert!(WEB_APP_JS.contains("data-diagnostics-field=\"real_llm_enabled\""));
         assert!(WEB_APP_JS.contains("data-diagnostics-field=\"computer_use_enabled\""));
-        assert!(WEB_APP_JS.contains("full-access（双重确认 + 审批）"));
+        assert!(WEB_APP_JS.contains("完全访问（双重确认与审批）"));
         assert!(WEB_APP_JS.contains("/api/diagnostics/functional"));
-        assert!(WEB_APP_JS.contains("full-access 未完成双重确认"));
+        assert!(WEB_APP_JS.contains("完全访问未完成双重确认"));
         assert!(WEB_APP_JS.contains("/diagnostics`"));
         assert!(WEB_APP_JS.contains("流式响应中断，未自动递归重试"));
     }
@@ -64537,7 +79005,8 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("function taskScheduleMetaLine"));
         assert!(!WEB_APP_JS.contains("状态 ${escapeHtml(task.status"));
         assert!(!WEB_APP_JS.contains("(task.permissions || []).join"));
-        assert!(WEB_STYLES_CSS.contains(".task-window-auth-grid"));
+        assert!(WEB_INDEX_HTML.contains("class=\"task-permission-layout\""));
+        assert!(WEB_STYLES_CSS.contains(".task-permission-layout"));
         assert!(WEB_STYLES_CSS.contains(".task-schedule-create"));
         assert!(WEB_STYLES_CSS.contains("max-height: min(260px, 28vh);"));
         assert!(WEB_STYLES_CSS.contains(".task-schedule-main-grid"));
@@ -64589,7 +79058,7 @@ attach: last_assistant
         // 定时 loop：前端两类任务（轮询/Goal 推进）的控件与逻辑均已内联。
         assert!(WEB_INDEX_HTML.contains("data-role=\"task-schedule-task-kind\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"task-schedule-goal\""));
-        assert!(WEB_INDEX_HTML.contains(">Goal 推进型<"));
+        assert!(WEB_INDEX_HTML.contains(">目标推进型<"));
         assert!(WEB_APP_JS.contains("function taskScheduleSyncTaskKindVisibility"));
         assert!(WEB_APP_JS.contains("function renderTaskScheduleGoalOptions"));
         assert!(WEB_APP_JS.contains("task_kind: taskKind"));
@@ -64601,9 +79070,10 @@ attach: last_assistant
     fn web_frontend_task_card_connects_goal_progress_api() {
         assert!(WEB_INDEX_HTML.contains("data-bind=\"task.currentTitle\""));
         assert!(WEB_INDEX_HTML.contains("data-bind=\"task.currentProgress\""));
-        // 摘要不回填顶部紧凑任务卡，但在任务中心默认折叠的「运行监督」中恢复可见宿主。
+        // 摘要仍由任务中心与右栏任务摘要承载，不回填已删除的主区重复卡片。
         assert!(WEB_INDEX_HTML.contains("data-bind=\"task.currentSummary\""));
-        assert!(WEB_INDEX_HTML.contains("data-action=\"task-card-chain\""));
+        assert!(WEB_INDEX_HTML.contains("data-action=\"chat-task-chain\""));
+        assert!(!WEB_INDEX_HTML.contains("data-action=\"task-card-chain\""));
         assert!(!WEB_INDEX_HTML.contains("data-role=\"goal-create-title\""));
         assert!(WEB_APP_JS.contains("/api/goals?limit=30"));
         assert!(WEB_APP_JS.contains("function syncTaskCardFromGoals"));
@@ -64626,7 +79096,7 @@ attach: last_assistant
         // GL-13：集合里必须含 "paused"——为等人工确认而暂停的 goal 正是用户要处理的那个，
         // 它此前不在集合里，导致一进入等待就从任务卡消失、批准按钮再也点不到。
         assert!(WEB_APP_JS.contains(
-            "new Set([\"created\", \"planning\", \"planned\", \"pending\", \"running\", \"in_progress\", \"blocked\", \"paused\"])"
+            "new Set([\"created\", \"planning\", \"planned\", \"pending\", \"running\", \"in_progress\", \"awaiting\", \"awaiting_human\", \"blocked\", \"paused\"])"
         ));
         assert!(WEB_APP_JS.contains("const ordered = Array.isArray(goals)"));
         assert!(WEB_APP_JS.contains("return ordered[0] || null;"));
@@ -64659,15 +79129,14 @@ attach: last_assistant
     fn web_frontend_overview_card_can_toggle_showui_service() {
         // Phase 7 T1：ShowUI 服务开关从 Agent 总览卡头部迁到「视觉实验」窗口 vision-command-rail 顶部；
         // 总览头部原位置改放当前工作区名展示（点击复制路径）。
-        let header_start = WEB_INDEX_HTML
-            .find("<header class=\"compact-card-head\">")
-            .expect("overview header exists");
-        let header_end = WEB_INDEX_HTML[header_start..]
-            .find("</header>")
-            .map(|offset| header_start + offset)
-            .expect("overview header closes");
-        let overview_header = &WEB_INDEX_HTML[header_start..header_end];
-        // 总览头部不再承载 ShowUI 开关，改放工作区名按钮
+        let top_region_start = WEB_INDEX_HTML
+            .find("<section class=\"layout-top-region\"")
+            .expect("顶部状态区存在");
+        let workbench_start = WEB_INDEX_HTML
+            .find("<section class=\"layout-workbench\"")
+            .expect("工作台存在");
+        let overview_header = &WEB_INDEX_HTML[top_region_start..workbench_start];
+        // 顶栏只承载紧凑 Agent/工作区识别，不再承载 ShowUI 或总览详情。
         assert!(!overview_header.contains("data-role=\"showui-service-control\""));
         assert!(overview_header.contains("data-role=\"overview-workspace-name\""));
         assert!(overview_header.contains("data-role=\"overview-workspace-label\""));
@@ -64687,11 +79156,13 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("function refreshShowUiServiceStatus"));
         assert!(WEB_APP_JS.contains("function toggleShowUiService"));
         assert!(WEB_APP_JS.contains("const showUiServiceActive ="));
-        assert!(WEB_APP_JS.contains("const nextEnabled = !showUiServiceStatus.running"));
+        assert!(WEB_APP_JS.contains("available: status.available == null"));
+        assert!(WEB_APP_JS.contains("showUiServiceStatus.running && showUiServiceStatus.available"));
         assert!(
             WEB_APP_JS.contains("button.dataset.label = showUiServiceActive ? \"停止\" : \"启动\"")
         );
-        assert!(WEB_APP_JS.contains("ShowUI stopped"));
+        assert!(WEB_APP_JS.contains("ShowUI 已停止"));
+        assert!(WEB_APP_JS.contains("ShowUI 外壳运行中，后端不可用"));
         // 工作区名展示：复用 /api/system/info 的 workspace，点击复制完整路径
         assert!(WEB_APP_JS.contains("function setOverviewWorkspaceName"));
         assert!(WEB_APP_JS.contains("function copyOverviewWorkspacePath"));
@@ -64729,6 +79200,28 @@ attach: last_assistant
         assert!(WEB_MAIN_RS.contains("pet_exit_closes_console"));
         assert!(WEB_MAIN_RS.contains("web_console_shutdown_signal"));
         assert!(WEB_MAIN_RS.contains("with_graceful_shutdown"));
+    }
+
+    #[test]
+    fn web_frontend_refresh_state_does_not_add_connection_debug_bubble() {
+        let refresh_start = WEB_APP_JS
+            .find("async function refreshState()")
+            .expect("refreshState 函数必须存在");
+        let catch_start = WEB_APP_JS[refresh_start..]
+            .find("\n  } catch (error) {")
+            .map(|offset| refresh_start + offset)
+            .expect("refreshState 成功分支必须有 catch 边界");
+        let success_source = &WEB_APP_JS[refresh_start..catch_start];
+        assert!(success_source.contains("requestJson(\"/api/state\")"));
+        assert!(success_source.contains("setText(\"stability.mode\""));
+        assert!(!success_source.contains("addMessage("));
+        assert!(!success_source.contains("后端已连接。稳定性矩阵包含"));
+        let refresh_end = WEB_APP_JS[catch_start..]
+            .find("\n}\n\nfunction setSystemInfoText")
+            .map(|offset| catch_start + offset)
+            .expect("refreshState 函数必须有完整边界");
+        let refresh_source = &WEB_APP_JS[refresh_start..refresh_end];
+        assert!(refresh_source.contains("后端暂未连接：${error.message}"));
     }
 
     #[test]
@@ -64770,6 +79263,20 @@ attach: last_assistant
         assert!(WEB_STYLES_CSS.contains(".overview-dashboard"));
         assert!(WEB_STYLES_CSS.contains(".overview-mascot"));
         assert!(WEB_STYLES_CSS.contains(".overview-health-track"));
+        assert!(WEB_INDEX_HTML.contains("<div class=\"overview-field overview-agent-field\">"));
+        assert!(WEB_STYLES_CSS.contains(
+            ".overview-identity-copy .overview-agent-name"
+        ));
+        assert!(WEB_STYLES_CSS.contains(
+            ".overview-identity-copy .overview-agent-name > span"
+        ));
+        assert!(WEB_STYLES_CSS.contains(
+            ".overview-identity-copy .overview-agent-name > img"
+        ));
+        assert!(WEB_STYLES_CSS.contains("height: 25px"));
+        assert!(WEB_STYLES_CSS.contains("overflow: hidden"));
+        assert!(WEB_STYLES_CSS.contains("white-space: nowrap"));
+        assert!(WEB_STYLES_CSS.contains("flex: 0 0 11px"));
     }
 
     #[test]
@@ -64824,13 +79331,13 @@ attach: last_assistant
     #[test]
     fn web_frontend_runtime_task_chain_shows_uidetr_detector_health() {
         assert!(WEB_APP_JS.contains("function runtimeVisionTaskChainDetails"));
-        assert!(WEB_APP_JS.contains("Detector backend"));
-        assert!(WEB_APP_JS.contains("Detection model"));
-        assert!(WEB_APP_JS.contains("Detection endpoint"));
-        assert!(WEB_APP_JS.contains("Detection service"));
-        assert!(WEB_APP_JS.contains("Detection model path"));
-        assert!(WEB_APP_JS.contains("Detection launcher"));
-        assert!(WEB_APP_JS.contains("Vision resource switch"));
+        assert!(WEB_APP_JS.contains("检测后端："));
+        assert!(WEB_APP_JS.contains("检测模型："));
+        assert!(WEB_APP_JS.contains("服务地址："));
+        assert!(WEB_APP_JS.contains("检测服务："));
+        assert!(WEB_APP_JS.contains("模型路径："));
+        assert!(WEB_APP_JS.contains("启动方式："));
+        assert!(WEB_APP_JS.contains("资源切换："));
         assert!(WEB_APP_JS.contains("let visionRealtimeRuntimeTask = null"));
         assert!(WEB_APP_JS.contains("function visionRealtimeTaskItem"));
         assert!(WEB_APP_JS.contains("function syncVisionRealtimeTask"));
@@ -65180,9 +79687,9 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("function runtimeAudioOutputTaskChainDetails"));
         assert!(WEB_APP_JS.contains("tts_backend"));
         assert!(WEB_APP_JS.contains("index_tts_base_url"));
-        assert!(WEB_APP_JS.contains("IndexTTS endpoint"));
-        assert!(WEB_APP_JS.contains("Configure IndexTTS base_url"));
-        assert!(WEB_APP_JS.contains("Use fallback TTS for realtime replies"));
+        assert!(WEB_APP_JS.contains("IndexTTS 地址："));
+        assert!(WEB_APP_JS.contains("配置可达的 IndexTTS 地址"));
+        assert!(WEB_APP_JS.contains("使用备用语音合成"));
         assert!(WEB_APP_JS.contains("runtimeAudioOutputTaskChainDetails(status)"));
     }
 
@@ -65244,14 +79751,583 @@ attach: last_assistant
     }
 
     #[test]
+    fn chat_turn_interrupt_is_scoped_idempotent_and_pruned_after_terminal_ttl() {
+        let _config_guard = config_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _db_guard = scoped_session_db_env(temp.path());
+        super::clear_chat_turn_registry_for_test();
+        let turn_id = "chat-turn-test-scope-a";
+        let other_turn_id = "chat-turn-test-scope-b";
+        let cancellation = super::register_chat_turn(
+            turn_id,
+            Some("session-scope-a".into()),
+            "room-scope-a".into(),
+        );
+        let other_cancellation = super::register_chat_turn(
+            other_turn_id,
+            Some("session-scope-b".into()),
+            "room-scope-b".into(),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let wrong_scope = rt
+            .block_on(super::api_chat_turn_interrupt(Json(
+                super::ChatTurnInterruptRequest {
+                    session_id: Some("session-scope-b".into()),
+                    chat_room_id: "room-scope-a".into(),
+                    turn_id: turn_id.into(),
+                },
+            )))
+            .expect_err("作用域错误不得中断目标 turn");
+        assert_eq!(wrong_scope.0, super::StatusCode::NOT_FOUND);
+        assert!(!cancellation.is_requested());
+        assert!(!other_cancellation.is_requested());
+
+        let Json(first) = rt
+            .block_on(super::api_chat_turn_interrupt(Json(
+                super::ChatTurnInterruptRequest {
+                    session_id: Some("session-scope-a".into()),
+                    chat_room_id: "room-scope-a".into(),
+                    turn_id: turn_id.into(),
+                },
+            )))
+            .expect("正确作用域应请求中断");
+        assert_eq!(first.status, super::ChatTurnStatus::InterruptRequested);
+        assert_eq!(first.outcome, "interrupt_requested");
+        assert!(!first.idempotent);
+        assert!(cancellation.is_requested());
+        assert!(!other_cancellation.is_requested());
+
+        let Json(repeated) = rt
+            .block_on(super::api_chat_turn_interrupt(Json(
+                super::ChatTurnInterruptRequest {
+                    session_id: Some("session-scope-a".into()),
+                    chat_room_id: "room-scope-a".into(),
+                    turn_id: turn_id.into(),
+                },
+            )))
+            .expect("重复中断应幂等返回");
+        assert_eq!(repeated.status, super::ChatTurnStatus::InterruptRequested);
+        assert_eq!(repeated.outcome, "interrupt_requested");
+        assert!(repeated.idempotent);
+
+        let actual = super::set_chat_turn_status(turn_id, super::ChatTurnStatus::Completed)
+            .expect("turn 应存在");
+        assert_eq!(actual, super::ChatTurnStatus::Interrupted);
+        let Json(terminal) = rt
+            .block_on(super::api_chat_turn_interrupt(Json(
+                super::ChatTurnInterruptRequest {
+                    session_id: Some("session-scope-a".into()),
+                    chat_room_id: "room-scope-a".into(),
+                    turn_id: turn_id.into(),
+                },
+            )))
+            .expect("终态重复中断应清晰返回");
+        assert_eq!(terminal.status, super::ChatTurnStatus::Interrupted);
+        assert_eq!(terminal.outcome, "already_finished");
+        assert!(terminal.idempotent);
+
+        {
+            let mut registry = super::chat_turn_registry().lock().expect("registry lock");
+            let entry = registry.get_mut(turn_id).expect("terminal turn remains for idempotence");
+            entry.finished_at = Some(
+                std::time::Instant::now()
+                    - super::CHAT_TURN_TERMINAL_TTL
+                    - std::time::Duration::from_secs(1),
+            );
+            super::prune_chat_turn_registry(&mut registry);
+            assert!(!registry.contains_key(turn_id));
+            assert!(registry.contains_key(other_turn_id));
+        }
+        super::clear_chat_turn_registry_for_test();
+    }
+
+    #[test]
+    fn chat_stream_started_and_interrupted_done_include_turn_id() {
+        let started = serde_json::to_value(super::ChatStreamStarted {
+            turn_id: "chat-turn-serialization".into(),
+            run_id: None,
+        })
+        .expect("started serialize");
+        assert_eq!(started["turn_id"], "chat-turn-serialization");
+
+        let done = serde_json::to_value(super::ChatStreamDone {
+            turn_id: "chat-turn-serialization".into(),
+            run_id: None,
+            status: super::ChatTurnStatus::Interrupted,
+            accepted_agent_ids: Vec::new(),
+            tasks: Vec::new(),
+        })
+        .expect("done serialize");
+        assert_eq!(done["turn_id"], "chat-turn-serialization");
+        assert_eq!(done["status"], "interrupted");
+        assert!(WEB_MAIN_RS.contains("yield Ok(sse_json_event(\"started\", &ChatStreamStarted"));
+        let stream_start = WEB_MAIN_RS
+            .find("async fn api_chat_send_stream(")
+            .expect("api_chat_send_stream exists");
+        let stream_end = WEB_MAIN_RS[stream_start..]
+            .find("async fn api_agent_diagnostics(")
+            .map(|offset| stream_start + offset)
+            .expect("api_agent_diagnostics follows api_chat_send_stream");
+        let stream_source = &WEB_MAIN_RS[stream_start..stream_end];
+        assert!(stream_source.contains("\"done\""));
+        assert!(stream_source.contains("chat_stream_done(&result, &turn_id, status, tasks)"));
+        assert!(stream_source.contains("run_id = Some(run_id.clone())"));
+    }
+
+    #[test]
+    fn chat_runtime_run_lifecycle_persists_accepted_started_terminal_events() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("chat-runtime-lifecycle.sqlite3");
+        let (run_id, claim_token) = super::new_runtime_run_identifiers().expect("random ids");
+        assert!(run_id.starts_with("run-chat-"));
+        assert_eq!(run_id.len(), "run-chat-".len() + 48);
+        assert!(claim_token.starts_with("claim-"));
+        assert_eq!(claim_token.len(), "claim-".len() + 64);
+
+        let run = super::create_chat_runtime_run_sqlite(
+            &db,
+            &run_id,
+            &claim_token,
+            "workspace-chat-lifecycle",
+            Some("session-chat-lifecycle"),
+            "room-chat-lifecycle",
+            "turn-chat-lifecycle",
+        )
+        .expect("create chat run");
+        assert_eq!(run.state, "accepted");
+        assert!(super::start_chat_runtime_run_sqlite(&db, &run_id, &claim_token)
+            .expect("start chat run"));
+        assert_eq!(
+            super::finalize_chat_runtime_run_sqlite(
+                &db,
+                &run_id,
+                &claim_token,
+                super::ChatTurnStatus::Completed,
+            )
+            .expect("finish chat run"),
+            super::ChatTurnStatus::Completed
+        );
+
+        let stored = super::query_runtime_run_sqlite(&db, &run_id)
+            .expect("query run")
+            .expect("run exists");
+        assert_eq!(stored.state, "completed");
+        let events = super::query_runtime_run_events_sqlite(&db, &run_id, 0).expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run.accepted", "run.started", "run.completed"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.event_type.as_str(),
+                        "run.completed" | "run.failed" | "run.interrupted"
+                    )
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn chat_runtime_stop_then_terminal_converges_to_interrupted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("chat-runtime-stop-first.sqlite3");
+        let (run_id, claim_token) = super::new_runtime_run_identifiers().expect("random ids");
+        super::create_chat_runtime_run_sqlite(
+            &db,
+            &run_id,
+            &claim_token,
+            "workspace-stop-first",
+            Some("session-stop-first"),
+            "room-stop-first",
+            "turn-stop-first",
+        )
+        .expect("create");
+        assert!(super::start_chat_runtime_run_sqlite(&db, &run_id, &claim_token).expect("start"));
+
+        let stop = super::interrupt_runtime_run_sqlite(&db, &run_id, Some("user stop"))
+            .expect("stop request");
+        assert_eq!(stop.state, "stop_requested");
+        assert!(!stop.idempotent);
+        let terminal = super::finalize_chat_runtime_run_sqlite(
+            &db,
+            &run_id,
+            &claim_token,
+            super::ChatTurnStatus::Completed,
+        )
+        .expect("terminal convergence");
+        assert_eq!(terminal, super::ChatTurnStatus::Interrupted);
+
+        let stored = super::query_runtime_run_sqlite(&db, &run_id)
+            .expect("query")
+            .expect("run");
+        assert_eq!(stored.state, "interrupted");
+        let events = super::query_runtime_run_events_sqlite(&db, &run_id, 0).expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "run.accepted",
+                "run.started",
+                "run.stop_requested",
+                "run.interrupted"
+            ]
+        );
+        assert!(!events.iter().any(|event| event.event_type == "run.completed"));
+    }
+
+    #[test]
+    fn chat_runtime_complete_then_interrupt_is_already_finished() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("chat-runtime-complete-first.sqlite3");
+        let (run_id, claim_token) = super::new_runtime_run_identifiers().expect("random ids");
+        super::create_chat_runtime_run_sqlite(
+            &db,
+            &run_id,
+            &claim_token,
+            "workspace-complete-first",
+            Some("session-complete-first"),
+            "room-complete-first",
+            "turn-complete-first",
+        )
+        .expect("create");
+        assert!(super::start_chat_runtime_run_sqlite(&db, &run_id, &claim_token).expect("start"));
+        assert_eq!(
+            super::finalize_chat_runtime_run_sqlite(
+                &db,
+                &run_id,
+                &claim_token,
+                super::ChatTurnStatus::Completed,
+            )
+            .expect("complete"),
+            super::ChatTurnStatus::Completed
+        );
+
+        let interrupt = super::interrupt_runtime_run_sqlite(&db, &run_id, Some("too late"))
+            .expect("interrupt after complete");
+        assert_eq!(interrupt.state, "completed");
+        assert_eq!(interrupt.outcome, "already_finished");
+        assert!(interrupt.idempotent);
+        let events = super::query_runtime_run_events_sqlite(&db, &run_id, 0).expect("events");
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "run.completed")
+                .count(),
+            1
+        );
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "run.stop_requested"));
+    }
+
+    #[test]
+    fn chat_runtime_legacy_interrupt_scope_mismatch_preserves_db_and_memory() {
+        let _config_guard = config_test_guard();
+        super::clear_chat_turn_registry_for_test();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _db_guard = scoped_session_db_env(tmp.path());
+        let db = tmp.path().join("web-sessions.sqlite3");
+        let workspace_id = super::workspace_identity(&super::active_workspace_path());
+        let (run_id, claim_token) = super::new_runtime_run_identifiers().expect("random ids");
+        let turn_id = "turn-scope-mismatch";
+        super::create_chat_runtime_run_sqlite(
+            &db,
+            &run_id,
+            &claim_token,
+            &workspace_id,
+            Some("session-scope-match"),
+            "room-scope-match",
+            turn_id,
+        )
+        .expect("create");
+        let cancellation = super::register_chat_turn_with_run(
+            turn_id,
+            Some(run_id.clone()),
+            Some("session-scope-match".to_string()),
+            "room-scope-match".to_string(),
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let error = rt
+            .block_on(super::api_chat_turn_interrupt(Json(
+                super::ChatTurnInterruptRequest {
+                    session_id: Some("session-scope-wrong".to_string()),
+                    chat_room_id: "room-scope-match".to_string(),
+                    turn_id: turn_id.to_string(),
+                },
+            )))
+            .expect_err("错误 session 不应中断");
+        assert_eq!(error.0, super::StatusCode::NOT_FOUND);
+        assert!(!cancellation.is_requested());
+        let stored = super::query_runtime_run_sqlite(&db, &run_id)
+            .expect("query")
+            .expect("run");
+        assert_eq!(stored.state, "accepted");
+        let events = super::query_runtime_run_events_sqlite(&db, &run_id, 0).expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "run.accepted");
+        super::clear_chat_turn_registry_for_test();
+    }
+
+    #[test]
+    fn chat_runtime_generic_interrupt_wakes_matching_memory_cancellation() {
+        let _config_guard = config_test_guard();
+        super::clear_chat_turn_registry_for_test();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _db_guard = scoped_session_db_env(tmp.path());
+        let db = tmp.path().join("web-sessions.sqlite3");
+        let workspace_id = super::workspace_identity(&super::active_workspace_path());
+        let (run_id, claim_token) = super::new_runtime_run_identifiers().expect("random ids");
+        let turn_id = "turn-generic-interrupt";
+        super::create_chat_runtime_run_sqlite(
+            &db,
+            &run_id,
+            &claim_token,
+            &workspace_id,
+            Some("session-generic-interrupt"),
+            "room-generic-interrupt",
+            turn_id,
+        )
+        .expect("create");
+        assert!(super::start_chat_runtime_run_sqlite(&db, &run_id, &claim_token).expect("start"));
+        let cancellation = super::register_chat_turn_with_run(
+            turn_id,
+            Some(run_id.clone()),
+            Some("session-generic-interrupt".to_string()),
+            "room-generic-interrupt".to_string(),
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let Json(response) = rt
+            .block_on(super::api_run_interrupt(
+                super::AxumPath(run_id.clone()),
+                Json(super::RunInterruptRequest {
+                    reason: Some("generic stop".to_string()),
+                }),
+            ))
+            .expect("generic interrupt");
+        assert_eq!(response.run_id, run_id);
+        assert_eq!(response.state, "stop_requested");
+        assert_eq!(response.outcome, "interrupt_requested");
+        assert!(!response.idempotent);
+        assert!(cancellation.is_requested());
+        let stored = super::query_runtime_run_sqlite(&db, &run_id)
+            .expect("query")
+            .expect("run");
+        assert_eq!(stored.state, "stop_requested");
+        super::clear_chat_turn_registry_for_test();
+    }
+
+    #[test]
+    fn chat_stream_json_keeps_turn_id_and_optional_run_id_compatibility() {
+        let started = serde_json::to_value(super::ChatStreamStarted {
+            turn_id: "turn-with-run".to_string(),
+            run_id: Some("run-chat-serialization".to_string()),
+        })
+        .expect("started serialize");
+        assert_eq!(started["turn_id"], "turn-with-run");
+        assert_eq!(started["run_id"], "run-chat-serialization");
+
+        let done = serde_json::to_value(super::ChatStreamDone {
+            turn_id: "turn-with-run".to_string(),
+            run_id: Some("run-chat-serialization".to_string()),
+            status: super::ChatTurnStatus::Interrupted,
+            accepted_agent_ids: Vec::new(),
+            tasks: Vec::new(),
+        })
+        .expect("done serialize");
+        assert_eq!(done["turn_id"], "turn-with-run");
+        assert_eq!(done["run_id"], "run-chat-serialization");
+        assert_eq!(done["status"], "interrupted");
+
+        let legacy = serde_json::to_value(super::ChatStreamStarted {
+            turn_id: "legacy-turn".to_string(),
+            run_id: None,
+        })
+        .expect("legacy started serialize");
+        assert_eq!(legacy["turn_id"], "legacy-turn");
+        assert!(legacy.get("run_id").is_none());
+    }
+
+    #[test]
+    fn chat_runtime_guard_drop_and_terminal_failure_never_report_completed() {
+        let _config_guard = config_test_guard();
+        super::clear_chat_turn_registry_for_test();
+
+        let failure_tmp = tempfile::tempdir().expect("failure tempdir");
+        let failure_db = failure_tmp.path().join("chat-runtime-terminal-failure.sqlite3");
+        let (failure_run_id, failure_claim_token) =
+            super::new_runtime_run_identifiers().expect("random ids");
+        super::create_chat_runtime_run_sqlite(
+            &failure_db,
+            &failure_run_id,
+            &failure_claim_token,
+            "workspace-terminal-failure",
+            Some("session-terminal-failure"),
+            "room-terminal-failure",
+            "turn-terminal-failure",
+        )
+        .expect("create failure run");
+        assert!(
+            super::start_chat_runtime_run_sqlite(
+                &failure_db,
+                &failure_run_id,
+                &failure_claim_token
+            )
+            .expect("start failure run")
+        );
+        failure_db_connection_with_trigger(&failure_db);
+        let failure_cancellation = super::register_chat_turn_with_run(
+            "turn-terminal-failure",
+            Some(failure_run_id.clone()),
+            Some("session-terminal-failure".to_string()),
+            "room-terminal-failure".to_string(),
+        );
+        let mut guard = super::ChatTurnGuard::new_runtime(
+            "turn-terminal-failure".to_string(),
+            failure_run_id.clone(),
+            failure_claim_token,
+            failure_db.clone(),
+        );
+        let actual = guard.finish(super::ChatTurnStatus::Completed);
+        assert_eq!(actual, super::ChatTurnStatus::Failed);
+        assert!(!failure_cancellation.is_requested());
+        let stored = super::query_runtime_run_sqlite(&failure_db, &failure_run_id)
+            .expect("query failure run")
+            .expect("failure run");
+        assert_eq!(stored.state, "running");
+        let failure_events =
+            super::query_runtime_run_events_sqlite(&failure_db, &failure_run_id, 0)
+                .expect("failure events");
+        assert!(!failure_events
+            .iter()
+            .any(|event| event.event_type == "run.completed"));
+
+        let drop_tmp = tempfile::tempdir().expect("drop tempdir");
+        let drop_db = drop_tmp.path().join("chat-runtime-drop.sqlite3");
+        let (drop_run_id, drop_claim_token) =
+            super::new_runtime_run_identifiers().expect("random ids");
+        super::create_chat_runtime_run_sqlite(
+            &drop_db,
+            &drop_run_id,
+            &drop_claim_token,
+            "workspace-drop",
+            Some("session-drop"),
+            "room-drop",
+            "turn-drop",
+        )
+        .expect("create drop run");
+        assert!(super::start_chat_runtime_run_sqlite(&drop_db, &drop_run_id, &drop_claim_token)
+            .expect("start drop run"));
+        super::register_chat_turn_with_run(
+            "turn-drop",
+            Some(drop_run_id.clone()),
+            Some("session-drop".to_string()),
+            "room-drop".to_string(),
+        );
+        {
+            let _guard = super::ChatTurnGuard::new_runtime(
+                "turn-drop".to_string(),
+                drop_run_id.clone(),
+                drop_claim_token,
+                drop_db.clone(),
+            );
+        }
+        let stored = super::query_runtime_run_sqlite(&drop_db, &drop_run_id)
+            .expect("query drop run")
+            .expect("drop run");
+        assert_eq!(stored.state, "failed");
+        let drop_events = super::query_runtime_run_events_sqlite(&drop_db, &drop_run_id, 0)
+            .expect("drop events");
+        assert!(drop_events.iter().any(|event| event.event_type == "run.failed"));
+        assert!(!drop_events
+            .iter()
+            .any(|event| event.event_type == "run.completed"));
+        super::clear_chat_turn_registry_for_test();
+
+        fn failure_db_connection_with_trigger(path: &Path) {
+            let connection = super::open_session_connection(path).expect("open failure db");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TRIGGER deny_chat_terminal_events
+                    BEFORE INSERT ON runtime_run_events
+                    WHEN NEW.event_type IN ('run.completed', 'run.failed', 'run.interrupted')
+                    BEGIN
+                        SELECT RAISE(ABORT, 'blocked terminal event');
+                    END;
+                    "#,
+                )
+                .expect("terminal trigger");
+        }
+    }
+
+    #[test]
     fn web_frontend_send_button_stops_active_model_stream() {
         assert!(WEB_APP_JS.contains("let activeChatAbortController = null"));
-        assert!(WEB_APP_JS.contains("activeChatAbortController.abort()"));
+        assert!(WEB_APP_JS.contains("let activeServerTurnId = null"));
+        assert!(WEB_APP_JS.contains("async function interruptActiveChatTurn"));
+        assert!(WEB_APP_JS.contains("/api/chat/turn/interrupt"));
+        assert!(WEB_APP_JS.contains("waitForDone: true"));
+        assert!(WEB_APP_JS.contains("activeChatInterruptPending = true"));
+        assert!(WEB_APP_JS.contains("CHAT_TURN_START_TIMEOUT_MS = 1800"));
+        assert!(WEB_APP_JS.contains("Promise.race([readyPromise, timeout])"));
+        assert!(WEB_APP_JS.contains("activeChatTurnReadyResolve?.(turnId)"));
+        assert!(WEB_APP_JS.contains("if (activeChatInterruptPromise)"));
         assert!(WEB_APP_JS.contains("function setSendButtonRunning"));
         assert!(WEB_APP_JS.contains("setSendButtonRunning(true)"));
+        assert!(WEB_APP_JS.contains("running ? \"中止本轮\" : button.dataset.label"));
+        assert!(WEB_APP_JS.contains(
+            "中止当前回复；服务端将停止后续模型轮次、工具派发与后续写回"
+        ));
+        assert!(!WEB_APP_JS.contains(
+            "停止接收当前流式回复；不会伪装成已中断后端模型或工具运行"
+        ));
+        assert!(WEB_APP_JS.contains("./assets/icons-wuxia/send.svg"));
+        assert!(WEB_APP_JS.contains("./assets/icons-wuxia/stop.svg"));
         assert!(WEB_APP_JS.contains("signal: abortController.signal"));
         assert!(WEB_APP_JS.contains("resetComposerSelection(input);"));
         assert!(WEB_APP_JS.contains("error?.name === \"AbortError\""));
+        assert!(WEB_APP_JS.contains("server-interrupt-request-failed"));
+    }
+
+    #[test]
+    fn web_frontend_pending_interrupt_is_single_flight_and_replace_waits_for_terminal() {
+        assert!(WEB_APP_JS.contains("let activeChatTurnReadyPromise = null"));
+        assert!(WEB_APP_JS.contains("let activeChatTurnReadyResolve = null"));
+        assert!(WEB_APP_JS.contains("activeChatInterruptPromise = promise"));
+        assert!(WEB_APP_JS.contains("if (activeChatInterruptPromise)"));
+        assert!(WEB_APP_JS.contains("activeChatInterruptPending = true"));
+        assert!(WEB_APP_JS.contains("turnId = await Promise.race([readyPromise, timeout])"));
+        assert!(WEB_APP_JS.contains("activeChatTurnReadyResolve?.(turnId)"));
+        assert!(WEB_APP_JS.contains("await activeChatStreamPromise.catch(() => null)"));
+        assert!(WEB_APP_JS.contains("await interruptActiveChatTurn({"));
+        assert!(WEB_APP_JS.contains("reason: replaceActive ? \"replace\" : \"user\""));
+        assert!(WEB_APP_JS.contains("if (activeChatInterruptPending && !activeServerTurnId)"));
+        assert!(WEB_APP_JS.contains("await sendMessage({ replaceActive: true })"));
+        assert!(WEB_APP_JS.contains("activeChatLocalAbortReason = \"local-before-turn\""));
+        assert!(WEB_APP_JS.contains("activeChatLocalAbortReason = \"server-interrupt-request-failed\""));
+        assert!(WEB_APP_JS.contains("./assets/icons-wuxia/stop.svg"));
     }
 
     #[test]
@@ -65262,19 +80338,48 @@ attach: last_assistant
         assert!(!WEB_MAIN_RS
             .contains("yield Ok(sse_json_event(\"message_done\", &reasoning_message));"));
         assert!(WEB_APP_JS.contains("function shouldRenderCompletedMessage"));
+        assert!(WEB_APP_JS.contains("includeReasoning = false"));
+        assert!(WEB_APP_JS.contains("includeReasoning: true"));
         assert!(WEB_APP_JS.contains("function isGoalPhaseMessage"));
-        assert!(WEB_APP_JS.contains("message.kind !== \"reasoning\""));
-        assert!(WEB_APP_JS.contains("message.kind !== \"tool-call\""));
+        assert!(WEB_APP_JS.contains("reasoning && !includeReasoning"));
+        assert!(WEB_APP_JS.contains("const toolCall = message.kind === \"tool-call\""));
         assert!(!WEB_APP_JS.contains("function hideReasoningForAssistant"));
         assert!(!WEB_APP_JS.contains("hideReasoningForAssistant(data.id)"));
         assert!(WEB_APP_JS.contains("if (data?.kind === \"reasoning\")"));
         assert!(WEB_APP_JS.contains("upsertMessage(data, { streaming: false });"));
+        assert!(WEB_APP_JS.contains("const CHAT_CONTEXT_USAGE_FOOTER_RE"));
+        assert!(WEB_APP_JS.contains("function stripContextUsageFooter"));
+        assert!(WEB_APP_JS.contains("(?:Remote )?Context usage:"));
+        assert!(
+            WEB_APP_JS.contains(
+                "const CHAT_CONTEXT_USAGE_FOOTER_RE = /(?:^|\\r?\\n)\\s*---\\s*\\r?\\n\\s*(?:Remote )?Context usage:[\\s\\S]*$/i;"
+            ),
+            "聊天尾注正则必须以独立 --- 行为前置、匹配到字符串尾部，并以 /i 兼容 Remote context usage:"
+        );
+        assert!(WEB_APP_JS.contains("source.slice(0, match.index).replace(/\\s+$/, \"\")"));
+        assert!(WEB_APP_JS.contains("function renderChatMessageText"));
+        assert!(WEB_APP_JS.contains("normalizedRole === \"assistant\""));
+        assert!(WEB_APP_JS.contains("normalizedKind === \"assistant-reply\""));
+        assert!(WEB_APP_JS.contains(
+            "const displayText = isStandardAssistant ? stripContextUsageFooter(rawText) : rawText;"
+        ));
+        assert!(WEB_APP_JS.contains("container.dataset.rawText = rawText;"));
+        assert!(WEB_APP_JS.contains("role: message.role,"));
+        assert!(WEB_APP_JS.contains("renderChatMessageText(content, message.content || \"\", {"));
+        assert!(WEB_APP_JS.contains("renderChatMessageText(content, nextText, {"));
+        assert!(WEB_APP_JS.contains(
+            ".forEach((message) => upsertMessage(message, { sessionId: activeSessionId }));"
+        ));
     }
 
     #[test]
-    fn web_frontend_provider_table_includes_bailian_glm_51() {
-        assert!(WEB_APP_JS.contains("\"glm-5.1\""));
-        assert!(WEB_APP_JS.contains("\"glm-5.1\": [\"low\", \"medium\", \"high\"]"));
+    fn reasoning_capability_catalog_includes_bailian_glm_51_without_frontend_matrix() {
+        assert!(api::reasoning_capability_catalog().iter().any(|item| {
+            item.provider_id == "alibaba-bailian" && item.model_id == "glm-5.1"
+        }));
+        assert!(WEB_APP_JS.contains("/api/models/capabilities"));
+        assert!(!WEB_APP_JS.contains("PROVIDER_MODELS"));
+        assert!(!WEB_APP_JS.contains("REASONING_EFFORT_MATRIX"));
         assert!(!WEB_APP_JS.contains("\"ZHIPU/GLM-5.1\""));
     }
 
@@ -65373,22 +80478,22 @@ attach: last_assistant
     fn web_frontend_task_window_can_request_goal_commander_review() {
         assert!(WEB_APP_JS.contains("commander-review"));
         assert!(WEB_APP_JS.contains("/commander/review"));
-        assert!(WEB_APP_JS.contains("Goal commander review failed"));
+        assert!(WEB_APP_JS.contains("目标指挥官审查失败"));
     }
 
     #[test]
     fn web_frontend_task_window_can_dispatch_ready_goal_phases() {
         assert!(WEB_APP_JS.contains("dispatch-ready"));
         assert!(WEB_APP_JS.contains("/dispatch-ready"));
-        assert!(WEB_APP_JS.contains("Dispatch"));
+        assert!(WEB_APP_JS.contains("派发"));
     }
 
     #[test]
     fn web_frontend_task_window_can_run_goal_phase() {
         assert!(WEB_APP_JS.contains("phase-run"));
         assert!(WEB_APP_JS.contains("/phases/${encodeURIComponent(phaseId)}/run"));
-        assert!(WEB_APP_JS.contains("Goal phase run failed"));
-        assert!(WEB_APP_JS.contains("Run phase"));
+        assert!(WEB_APP_JS.contains("目标阶段执行失败"));
+        assert!(WEB_APP_JS.contains("执行阶段"));
         assert!(WEB_STYLES_CSS.contains(".task-goal-phase-buttons"));
     }
 
@@ -65397,8 +80502,8 @@ attach: last_assistant
         assert!(WEB_MAIN_RS.contains("/api/goals/{goal_id}/run-next"));
         assert!(WEB_APP_JS.contains("run-next"));
         assert!(WEB_APP_JS.contains("/run-next"));
-        assert!(WEB_APP_JS.contains("Goal run next failed"));
-        assert!(WEB_APP_JS.contains("Run next"));
+        assert!(WEB_APP_JS.contains("目标执行下一阶段失败"));
+        assert!(WEB_APP_JS.contains("执行下一阶段"));
     }
 
     #[test]
@@ -65406,8 +80511,8 @@ attach: last_assistant
         assert!(WEB_MAIN_RS.contains("/api/goals/{goal_id}/run-all"));
         assert!(WEB_APP_JS.contains("run-all"));
         assert!(WEB_APP_JS.contains("/run-all"));
-        assert!(WEB_APP_JS.contains("Goal run all failed"));
-        assert!(WEB_APP_JS.contains("Run all"));
+        assert!(WEB_APP_JS.contains("目标执行全部失败"));
+        assert!(WEB_APP_JS.contains("执行全部"));
     }
 
     #[test]
@@ -65418,8 +80523,8 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("loop-start"));
         assert!(WEB_APP_JS.contains("loop-stop"));
         assert!(WEB_APP_JS.contains("loop-status"));
-        assert!(WEB_APP_JS.contains("Start loop"));
-        assert!(WEB_APP_JS.contains("Stop loop"));
+        assert!(WEB_APP_JS.contains("启动循环"));
+        assert!(WEB_APP_JS.contains("停止循环"));
     }
 
     #[test]
@@ -65430,9 +80535,9 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("/pause"));
         assert!(WEB_APP_JS.contains("goal-resume"));
         assert!(WEB_APP_JS.contains("/resume"));
-        assert!(WEB_APP_JS.contains("Goal status"));
-        assert!(WEB_APP_JS.contains("Pause"));
-        assert!(WEB_APP_JS.contains("Resume"));
+        assert!(WEB_APP_JS.contains("状态"));
+        assert!(WEB_APP_JS.contains("暂停"));
+        assert!(WEB_APP_JS.contains("继续"));
     }
 
     #[test]
@@ -65515,7 +80620,10 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("data-goal-action=\"phase-reject\""));
         assert!(WEB_APP_JS.contains("/ack"));
         // GL-14：路由因果字段要真的渲染出来。
-        assert!(WEB_APP_JS.contains("route=${payload.route_reason}"));
+        assert!(WEB_APP_JS.contains(
+            "路由原因：${taskChainReadableDetailText(String(payload.route_reason))}"
+        ));
+        assert!(!WEB_APP_JS.contains("route=${payload.route_reason}"));
     }
 
     #[test]
@@ -65543,6 +80651,47 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("function refreshOpenGoalTaskChain"));
         assert!(WEB_APP_JS.contains("function goalTaskChainRows"));
         assert!(WEB_APP_JS.contains("function goalTaskChainEventDetail"));
+        assert!(WEB_APP_JS.contains("chatTaskRuntimeSummary(runtimeTask)"));
+        assert!(WEB_APP_JS.contains("chatTaskRuntimeDisplayTitle(runtimeTask)"));
+        for token in [
+            "function runtimeVisionTaskChainDetails",
+            "function runtimeAudioOutputTaskChainDetails",
+            "function runtimeAudioInputTaskChainDetails",
+            "function runtimeModelProbeTaskChainDetails",
+            "已处理帧：",
+            "检测后端：",
+            "目标状态：${chatTaskValueLabel(payload.goal_status, \"status\")}",
+            "路由原因：${taskChainReadableDetailText(String(payload.route_reason))}",
+        ] {
+            assert!(WEB_APP_JS.contains(token), "任务链中文展示契约缺失：{token}");
+        }
+        let runtime_rows_start = WEB_APP_JS
+            .find("function runtimeTaskChainRows")
+            .expect("runtime 任务链行函数必须存在");
+        let runtime_rows_end = WEB_APP_JS[runtime_rows_start..]
+            .find("function taskChainEventDotClass")
+            .map(|offset| runtime_rows_start + offset)
+            .expect("runtime 任务链行函数必须有边界");
+        let runtime_rows_source = &WEB_APP_JS[runtime_rows_start..runtime_rows_end];
+        for forbidden in ["model_probe=", "payload_chunks=", "frames=", "backend="] {
+            assert!(!runtime_rows_source.contains(forbidden), "runtime 任务链不得回归 raw debug 拼接：{forbidden}");
+        }
+        let goal_detail_start = WEB_APP_JS
+            .find("function goalTaskChainEventDetail")
+            .expect("Goal 事件详情函数必须存在");
+        let goal_detail_end = WEB_APP_JS[goal_detail_start..]
+            .find("function taskRenderGoalPlaceholder")
+            .map(|offset| goal_detail_start + offset)
+            .expect("Goal 事件详情函数必须有边界");
+        let goal_detail_source = &WEB_APP_JS[goal_detail_start..goal_detail_end];
+        for forbidden in [
+            "phase=${payload.phase_id}",
+            "role=${payload.assigned_role}",
+            "route=${payload.route_reason}",
+            "status=${payload.goal_status}",
+        ] {
+            assert!(!goal_detail_source.contains(forbidden), "Goal 事件不得回归 raw debug 拼接：{forbidden}");
+        }
         assert!(WEB_APP_JS.contains("task-chain-modal"));
         assert!(WEB_STYLES_CSS.contains(".task-chain-modal"));
     }
@@ -65591,6 +80740,10 @@ attach: last_assistant
         assert!(normalized_source.contains(
             "agent_message_request_with_context_messages_for_room( agent, false, &loop_system_prompt,"
         ));
+        assert!(WEB_MAIN_RS
+            .contains("let stream_turn_id = diagnostics::TraceIdType::generate().to_hex();"));
+        assert!(WEB_MAIN_RS.contains("assembly.turn_id = Some(turn_id.to_string());"));
+        assert!(WEB_MAIN_RS.contains("Some(stream_turn_id.clone())"));
         assert!(!WEB_MAIN_RS.contains(
             "let round_messages = vec![\n                    InputMessage::user_text(result.user_content.clone())"
         ));
@@ -65732,9 +80885,9 @@ attach: last_assistant
 
     #[test]
     fn web_frontend_tool_matrix_includes_multi_agent_counting_scenario() {
-        assert!(WEB_APP_JS.contains("Multi-agent counting"));
-        assert!(WEB_APP_JS.contains("ordered targets + isolated rosters"));
-        assert!(WEB_APP_JS.contains("multi_agent_counting_dispatch_preserves_requested_order"));
+        assert!(WEB_APP_JS.contains("多智能体调度"));
+        assert!(WEB_APP_JS.contains("按顺序调度并隔离成员上下文"));
+        assert!(WEB_APP_JS.contains("聊天调度与目标成员上下文"));
     }
 
     #[test]
@@ -66493,7 +81646,7 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("tts_backend"));
         assert!(WEB_APP_JS.contains("index_tts_base_url"));
         assert!(WEB_APP_JS.contains("streaming_tts_url_configured"));
-        assert!(WEB_APP_JS.contains("Streaming TTS endpoint"));
+        assert!(WEB_APP_JS.contains("流式语音地址："));
         assert!(WEB_APP_JS.contains("status.index_tts_available"));
         assert!(WEB_APP_JS.contains("tts=available"));
         assert!(WEB_APP_JS.contains("tts=missing"));
@@ -66647,9 +81800,9 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("function runtimeTaskReadinessGateTodoItems"));
         assert!(WEB_APP_JS.contains("task.readiness_gates"));
         assert!(WEB_APP_JS.contains("gate.reason"));
-        assert!(WEB_APP_JS.contains("Provider-native partial ASR"));
-        assert!(WEB_APP_JS.contains("Streaming TTS output"));
-        assert!(WEB_APP_JS.contains("Full streaming gate"));
+        assert!(WEB_APP_JS.contains("原生流式语音识别"));
+        assert!(WEB_APP_JS.contains("流式语音输出"));
+        assert!(WEB_APP_JS.contains("全流式门控"));
     }
 
     #[test]
@@ -67499,7 +82652,9 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("requested_mode"));
         assert!(WEB_APP_JS.contains("active_mode"));
         assert!(WEB_APP_JS.contains("mode_downgrade_reason"));
-        assert!(WEB_APP_JS.contains("mode=half_duplex_guarded"));
+        assert!(WEB_APP_JS.contains("function realtimeModeLabel"));
+        assert!(WEB_APP_JS.contains("half_duplex_guarded: \"受控半双工\""));
+        assert!(WEB_APP_JS.contains("const modeStateLabel = `模式=${realtimeModeLabel(activeMode)}`"));
     }
 
     #[test]
@@ -68021,7 +83176,9 @@ attach: last_assistant
         assert!(WEB_APP_JS.contains("function handleRealtimeBargeInDecision"));
         assert!(WEB_APP_JS.contains("handleRealtimeBargeInDecision({"));
         assert!(WEB_APP_JS.contains("audioRealtimeResumeAfterTts = false;"));
-        assert!(WEB_APP_JS.contains("activeChatAbortController.abort();"));
+        assert!(WEB_APP_JS.contains(
+            "void interruptActiveChatTurn({ reason: \"barge-in\", waitForDone: true });"
+        ));
         assert!(WEB_APP_JS.contains("function realtimeSessionTaskItem"));
         assert!(WEB_APP_JS.contains("function mergedRuntimeTaskItems"));
         assert!(WEB_APP_JS.contains("/api/realtime/session/status"));
@@ -68563,9 +83720,39 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            turn_id: None,
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
+            memory_selection: super::ContextMemorySelectionEvidence {
+                strategy: "test".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                expired_or_invalid_ids: Vec::new(),
+                superseded_ids: Vec::new(),
+                budget_skipped_ids: Vec::new(),
+                used_tokens: 0,
+                token_budget: 0,
+            },
+            history_selection: super::ContextHistorySelectionEvidence {
+                source: "chat_room.messages".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                excluded_ids: Vec::new(),
+            },
+            compaction_item: None,
+            runtime_snapshot: super::ContextRuntimeSnapshot {
+                snapshot_id: "ctx-test".to_string(),
+                workspace_id: "ws-test".to_string(),
+                chat_room_id: None,
+                permission_profile: "workspace-write".to_string(),
+                model: "glm-5.1".to_string(),
+                provider: "test".to_string(),
+                tool_catalog_revision: "tools-test".to_string(),
+                memory_revision: "mem-test".to_string(),
+                memory_mode: "enabled".to_string(),
+                history_floor_millis: None,
+            },
             history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
@@ -68581,6 +83768,11 @@ attach: last_assistant
 
         let footer = super::context_usage_footer_for_assembly_with_usage(&agent, &assembly, None);
         assert!(footer.contains("Context usage:"));
+        assert!(footer.contains("Context turn: none"));
+        assert!(footer.contains("Context snapshot: ctx-test"));
+        assert!(footer.contains("history source: chat_room.messages"));
+        assert!(footer.contains("history loaded: 0"));
+        assert!(footer.contains("memory revision: mem-test"));
         // 2026-05-31 容量更正：glm-5.1 上下文 200K。
         assert!(footer.contains("1000/200000"));
     }
@@ -68646,9 +83838,39 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            turn_id: None,
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
+            memory_selection: super::ContextMemorySelectionEvidence {
+                strategy: "test".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                expired_or_invalid_ids: Vec::new(),
+                superseded_ids: Vec::new(),
+                budget_skipped_ids: Vec::new(),
+                used_tokens: 0,
+                token_budget: 0,
+            },
+            history_selection: super::ContextHistorySelectionEvidence {
+                source: "chat_room.messages".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                excluded_ids: Vec::new(),
+            },
+            compaction_item: None,
+            runtime_snapshot: super::ContextRuntimeSnapshot {
+                snapshot_id: "ctx-test".to_string(),
+                workspace_id: "ws-test".to_string(),
+                chat_room_id: None,
+                permission_profile: "workspace-write".to_string(),
+                model: "glm-5.1".to_string(),
+                provider: "test".to_string(),
+                tool_catalog_revision: "tools-test".to_string(),
+                memory_revision: "mem-test".to_string(),
+                memory_mode: "enabled".to_string(),
+                history_floor_millis: None,
+            },
             history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
@@ -68691,9 +83913,39 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            turn_id: None,
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
+            memory_selection: super::ContextMemorySelectionEvidence {
+                strategy: "test".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                expired_or_invalid_ids: Vec::new(),
+                superseded_ids: Vec::new(),
+                budget_skipped_ids: Vec::new(),
+                used_tokens: 0,
+                token_budget: 0,
+            },
+            history_selection: super::ContextHistorySelectionEvidence {
+                source: "chat_room.messages".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                excluded_ids: Vec::new(),
+            },
+            compaction_item: None,
+            runtime_snapshot: super::ContextRuntimeSnapshot {
+                snapshot_id: "ctx-test".to_string(),
+                workspace_id: "ws-test".to_string(),
+                chat_room_id: None,
+                permission_profile: "workspace-write".to_string(),
+                model: "glm-5.1".to_string(),
+                provider: "test".to_string(),
+                tool_catalog_revision: "tools-test".to_string(),
+                memory_revision: "mem-test".to_string(),
+                memory_mode: "enabled".to_string(),
+                history_floor_millis: None,
+            },
             history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
@@ -68740,9 +83992,39 @@ attach: last_assistant
             system_prompt: String::new(),
             messages: Vec::new(),
             memory_beads: Vec::new(),
+            turn_id: None,
             context_snapshot_id: "ctx-test".to_string(),
             memory_revision: "mem-test".to_string(),
             memory_bead_ids: Vec::new(),
+            memory_selection: super::ContextMemorySelectionEvidence {
+                strategy: "test".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                expired_or_invalid_ids: Vec::new(),
+                superseded_ids: Vec::new(),
+                budget_skipped_ids: Vec::new(),
+                used_tokens: 0,
+                token_budget: 0,
+            },
+            history_selection: super::ContextHistorySelectionEvidence {
+                source: "chat_room.messages".to_string(),
+                candidate_ids: Vec::new(),
+                selected_ids: Vec::new(),
+                excluded_ids: Vec::new(),
+            },
+            compaction_item: None,
+            runtime_snapshot: super::ContextRuntimeSnapshot {
+                snapshot_id: "ctx-test".to_string(),
+                workspace_id: "ws-test".to_string(),
+                chat_room_id: None,
+                permission_profile: "workspace-write".to_string(),
+                model: "glm-5.1".to_string(),
+                provider: "test".to_string(),
+                tool_catalog_revision: "tools-test".to_string(),
+                memory_revision: "mem-test".to_string(),
+                memory_mode: "enabled".to_string(),
+                history_floor_millis: None,
+            },
             history_floor_millis: None,
             history_message_count: 0,
             token_budget: super::ContextTokenBudget {
@@ -68870,6 +84152,7 @@ attach: last_assistant
         assert!(session.context_reset_at > 0);
         assert!(session.memory_beads.iter().any(|bead| {
             bead.source == "context:auto-compact"
+                && bead.kind == "compaction"
                 && bead.summary.contains("clawd-on-desk-main")
                 && !bead.summary.contains("goal-artifacts")
         }));
@@ -68915,6 +84198,7 @@ attach: last_assistant
                 image_token_estimate: 512,
                 max_memory_beads: 8,
                 history_floor_millis: None,
+                chat_room_id: None,
             },
         );
         let joined = assembly

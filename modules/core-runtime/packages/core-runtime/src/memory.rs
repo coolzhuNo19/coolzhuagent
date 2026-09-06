@@ -39,9 +39,8 @@ impl MemoryLayer {
 pub fn memory_layer_for_kind(kind: Option<&str>) -> MemoryLayer {
     match kind.unwrap_or("note").trim().to_ascii_lowercase().as_str() {
         "person" | "profile" | "preference" => MemoryLayer::L1,
-        "task" | "decision" | "tool" | "tool-summary" | "vision" | "computer-use" | "chat-room" => {
-            MemoryLayer::L2
-        }
+        "task" | "decision" | "tool" | "tool-summary" | "vision" | "computer-use" | "chat-room"
+        | "compaction" => MemoryLayer::L2,
         "knowledge" | "code" | "fact" | "semantic" | "experience" | "lesson" | "pattern" => {
             MemoryLayer::L3
         }

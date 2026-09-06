@@ -6,7 +6,7 @@ fn main() {
     // Windows icon resources are compiled into the Tauri PE. Without these
     // explicit dependencies, an incremental build can keep an old resource
     // section after the ICO/PNG changes and ship the wrong icon.
-    println!("cargo:rerun-if-changed=icons/icon.ico");
-    println!("cargo:rerun-if-changed=icons/icon.png");
+    println!("cargo:rerun-if-changed=icons/app-icon-cz-moon-gate-lantern-v1.ico");
+    println!("cargo:rerun-if-changed=icons/app-icon-cz-moon-gate-lantern-v1.png");
     tauri_build::build()
 }
