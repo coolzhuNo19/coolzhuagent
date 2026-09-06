@@ -113,3 +113,11 @@
 - 用户明确要求“先打包安装提交PR”。据此先将已审核修正纳入0.2.11 Release候选、安装验证并提交PR；GUI截图与全控件验收缺口继续记录，不再作为创建PR的前置条件，也不因此宣称它们已完成。
 - 源码提交仅纳入本轮已审核的Web选择器/消息布局/工具状态修正、可重复控件测试、Tauri测量测试修复及本工作日志。不提交tmp、运行时会话、凭据、安装包或截图；不自动合并PR，不强推分支。
 - 后续安装结果、产物hash和PR链接须以实际输出补记。本条仅记录发布顺序变更，不代表安装或PR已完成。
+
+### 0.2.11 实际构建与安装尝试
+
+- 已审核源码提交为 `a00f52428397c651f1c397508490b6934a2d12b9`，执行Release完整打包，build-msi exit0。产物 `dist/CoolzhuAgent-0.2.11.msi` 为196401612 bytes，SHA-256 `A2CAB83F70EBFFAB66069FD50EA6B7FD9B5EB6CC7B56C3AE481149E3F19D6CC4`，803 files、safe=true、findings为空、unsigned；旧0.2.10产物保留。
+- 构建证据为 `tmp/p7-release-preflight-2026-09-06/build-msi-0.2.11-release.log`、对应exit文件及 `tmp/package-reports/package-report-release-20260906-121303233.json`。staged CLI为0.2.11、source a00f524、target x86_64-pc-windows-msvc、build date 2026-09-06。
+- 独立测试会话核验staging全部10个artifact哈希一致，安装目录无运行中的用户实例后，针对该批准MSI请求一次RunAs升级。用户取消UAC，helper退出1，MSI实际exit_code=null，错误为 `The operation was canceled by the user.`；未启动msiexec，未产生安装日志，不自动重试或绕过确认。
+- 取消后只读核对：旧ProductCode `{B422037C-FCBE-4D18-8A10-0B9FFA3F6EC2}` / 0.2.10仍在，新0.2.11条目不存在，已装CLI仍为0.2.10。证据为 `tmp/qa-p7-installed-0.2.11-2026-09-06/01-0.2.11-preflight.log`、`02-msiexec-0.2.11-result.json`、`03-post-cancel-readonly-state.log`。0.2.11安装及安装后验收保持未完成。
+- 继续执行用户已授权的PR提交，正文披露安装取消和GUI缺口；这不代表用户再次批准弹出UAC。PR只推送到已认证的coolzhuNo19分叉，再向coolzhulike/coolzhuagent的main提出，不强推、不自动合并。
