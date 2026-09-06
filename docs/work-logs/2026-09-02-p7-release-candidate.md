@@ -36,7 +36,7 @@
 ## 后续状态
 
 - （P7-B2 阶段历史状态）候选版本 0.2.9 的 Release 打包、安装与 MSI 独立验收仍待后续任务执行；当时本记录不宣称已打包、已安装或已完成全路线。供应商 reasoning 目录同样未被表述为 9 家真实请求联调完成。
-- 当前状态（截至 2026-09-03，P7-C.3 attempt 2 已完成）：0.2.9 Release MSI 已正常升级安装成功；`tmp/qa-p7-installed-2026-09-02/logs/msiexec-upgrade-0.2.8-to-0.2.9-attempt2-2026-09-03.log` 记录 ProductVersion=0.2.9、安装成功或错误状态=0、MainEngineThread returning 0。安装后的 10 个 binary SHA-256 已与 `tmp/package-reports/package-report-release-20260903-011838146.json` 中的候选值逐项匹配。普通消息/SSE 真实 UI 短轮使用隔离 `127.0.0.1:18766` fixture 已通过，相关请求记录为 `tmp/qa-p7-installed-2026-09-02/fixture/mock-llm-requests.jsonl`，真实截图为 `tmp/qa-p7-installed-2026-09-02/screenshots/installed-p7-local-message-sky-2026-09-03.png`。安装后的界面恢复场景因当前策略拒绝待用户；独立 Browser 小轮因工具不可用未执行。0.2.10 尚未构建或安装。
+- （P7-C.3 阶段历史状态）0.2.9 Release MSI 已正常升级安装成功；`tmp/qa-p7-installed-2026-09-02/logs/msiexec-upgrade-0.2.8-to-0.2.9-attempt2-2026-09-03.log` 记录 ProductVersion=0.2.9、安装成功或错误状态=0、MainEngineThread returning 0。安装后的 10 个 binary SHA-256 已与 `tmp/package-reports/package-report-release-20260903-011838146.json` 中的候选值逐项匹配。普通消息/SSE 真实 UI 短轮使用隔离 `127.0.0.1:18766` fixture 已通过，相关请求记录为 `tmp/qa-p7-installed-2026-09-02/fixture/mock-llm-requests.jsonl`，真实截图为 `tmp/qa-p7-installed-2026-09-02/screenshots/installed-p7-local-message-sky-2026-09-03.png`。此前用户恢复 0.2.9 后的左右栏收展与任务中心右停靠也通过，稳定图为 `tmp/qa-p7-installed-2026-09-02/screenshots/installed-p7c4-left-collapsed-stable-sky-2026-09-03.png`；该图仅是 0.2.9 历史证据，不作为 0.2.10 最终证据。独立 Browser 小轮因工具不可用未执行。
 
 ## P7-C WebView2 发布前自检修正
 
@@ -64,3 +64,52 @@
 - 独立 Tauri 全套基线记录于 `tmp/qa-p7-installed-2026-09-02/logs/cargo-test-tauri-shell-c4-full-2026-09-03.log`：36 passed / 10 failed / 0 ignored。失败分类为 3 个 CRLF 源文本契约（`quit_app`、`report_throne_zone`、diagnostics count）、3 个过时 blink overlay 契约、1 个 audio→blink 数据映射缺口及 3 个缺失历史 metrics fixture；本轮仅分别做测试期换行规范化、按现有 8 帧 overlay/PNG 锚点更新契约及 theme 数据修复，未伪造 metrics 结果。
 - 独立修复后 Tauri 全套记录于 `tmp/qa-p7-installed-2026-09-02/logs/cargo-test-tauri-shell-c4-final-2026-09-03.log`：43 passed / 3 failed / 0 ignored，exit 101；3 个失败均为缺失历史 `stabilized-metrics.json` fixture（`pet_martial_frames_keep_character_scale_consistent_with_idle`、`pet_success_frames_do_not_mix_closeup_character_scales`、`pet_wuxia_frames_keep_policy_stable_scale_and_anchors`）。C.4 启动/托盘/被动 state 行为、audio→blink 映射、8 帧 overlay 与实际 PNG 几何契约均通过；测试编译保留两个 test-only dead-code warning，未因此改测或生产代码。
 - `cargo fmt --manifest-path modules/gui-desktop/packages/tauri-shell/src-tauri/Cargo.toml -- --check`：通过；`git diff --check`：通过（仅 LF→CRLF 提示）。`cargo build --manifest-path modules/gui-desktop/packages/tauri-shell/src-tauri/Cargo.toml --offline`：通过，22.74s；日志为 `tmp/p7-release-preflight-2026-09-03/p7c4-tauri-build-after-blink-fix.log`。当前 `main.rs` SHA-256 为 `1F424ABAFA3179C4BCD0A7516F699AE3A0B2250FD55819B3AEB9F7D2298D5650`，`pet-theme.json` SHA-256 为 `5F177647AD33E472A5EC6921AC33A14DDC50E53A61842A10168B68EF73A35DE3`；全套不宣称绿色，3 个历史 metrics fixture 缺失保持为明确失败。
+
+## P7-C.5 0.2.10 Release MSI 构建
+
+- 已由 source commit `72446dd9fbf0cff0d14f82cb5329835f79f6d432` 执行 `scripts/build-msi.ps1 -Version 0.2.10 -Configuration release`，build-msi exit 0；Release build target 为 `x86_64-pc-windows-msvc`，staging 为 `tmp/p7-release-preflight-2026-09-03/staging/package-0.2.10-release`。
+- 0.2.10 MSI 位于 `dist/CoolzhuAgent-0.2.10.msi`，大小 196393420 bytes，SHA-256 为 `22C018A4DCDC8448A694BD34DBF803E50EE7DD8628E0915D4D1F59F619246487`；installer report 为 `dist/CoolzhuAgent-0.2.10-installer-report.json`，package safety report 为 `dist/CoolzhuAgent-0.2.10-package-safety.json`，报告显示 803 files、`safe=true`、`findings=[]`，签名状态为 unsigned。
+- 完整构建日志为 `tmp/p7-release-preflight-2026-09-03/build-msi-0.2.10-release.log`，package report 为 `tmp/package-reports/package-report-release-20260903-082404084.json`。staged CLI 纯 stdout 证据为 `tmp/p7-release-preflight-2026-09-03/staged-cli-version-0.2.10.stdout.txt`，核验 `Version=0.2.10`、`Git SHA=72446dd9fbf0cff0d14f82cb5329835f79f6d432`、target 同上、build date=`2026-09-03`（UTC；日期来自 staged CLI，不是 installer report）。
+- MSI 只读属性证据为 `tmp/p7-release-preflight-2026-09-03/msi-properties-0.2.10-readonly.txt`：ProductVersion=`0.2.10`，ProductCode=`{B422037C-FCBE-4D18-8A10-0B9FFA3F6EC2}`，UpgradeCode=`{7873714F-87EE-4DFA-8AAB-2A2402B4ABEA}`。P7-C.5 attempt 2 verbose 安装日志 `tmp/qa-p7-installed-0.2.10-2026-09-03/logs/msiexec-upgrade-attempt2-2026-09-03.log`（22:40:03）记录 ProductVersion=`0.2.10`、status=`0`、MainEngineThread returning `0`；安装核验汇总为 `tmp/qa-p7-installed-0.2.10-2026-09-03/logs/p7c5-install-verification-2026-09-03.log`，其中注册表版本为 `0.2.10`，已安装 10 个 binary 的 SHA-256 与 `tmp/package-reports/package-report-release-20260903-082404084.json` 逐项匹配。
+- P7-C.5 隔离实装证据目录为 `tmp/qa-p7-installed-0.2.10-2026-09-03/`。默认原生主窗仅启动 1 个 Tauri、无桌宠通过：`screenshots/p7c5-0.2.10-default-main-window-sky-2026-09-04.png`（1267x657，446331 bytes，SHA-256 `2633F394FB3F7B618050B8311F8BC63388F41CE76AD38AF2BCCDD94BFFB3FE7C`）。右栏收起后中央扩展且左栏可用通过：`screenshots/p7c5-layout-left-open-right-collapsed-sky-2026-09-04.png`（507411 bytes，SHA-256 `0C426E18CBE91C27EAE282A742FC4481C4910D6964FEA34469EB1D5269E4FB09`）。左快捷任务中心转右工具且不覆盖中央通过：`screenshots/p7c5-left-task-center-right-tool-sky-2026-09-04.png`（534172 bytes，SHA-256 `131B5BEBFEB4D4AAA0D3EB7D297F9640F1C5ED1BE20D0459BAB2B7FD98DF4FBC`）。
+- Custom `127.0.0.1:18766` fixture 的唯一普通消息/SSE 请求通过，`stream=true`、custom model、无外联且结束后无桌宠：`screenshots/p7c5-local-sse-no-pet-task-center-sky-2026-09-04.png`（608449 bytes，SHA-256 `C2F31BD92473F1E6556FA1F2E6CAF7D61B1DE75C95781DD45DF38EFA8437ABC3`）；请求记录 `fixture/mock-llm-requests.jsonl` SHA-256 为 `5BCB592DBC2E9B34E13CD2B833DBB91AFFEEDE2347446DE981DB65BDF764DF9E`，且恰 1 条请求。旧 Haiku UI 保存 `none` 与 API 回读通过：raw `claude-haiku-4-5-20251213` 保留、canonical `claude-haiku-4-5-20251001` 能力 alias、`requested/effective=none`、status=`exact`、Anthropic strategy/protocol 正确、无消息无外联；截图 `screenshots/p7c5-old-haiku-none-settings-sky-2026-09-04.png`（676364 bytes，SHA-256 `55BEE68FED2F91625EF3A3E6F4CDBDA15A8F6189C1A36E98940D4411B79FAEBB`），API 证据 `api/p7c5-old-haiku-none-evidence.json` SHA-256 `B8485C6BFA1E8C1B78DA7E37A4F3BBB6182C1D4E8815193AEC7167048E5AE6BE`。
+- 只读桌面快捷方式文件核查发现 `C:\Users\Public\Desktop\COOLZHU CODE Agent.lnk` 的 target 为 `C:\Program Files\CoolzhuAgent\COOLZHU-AGENT.exe`，IconLocation 为 `C:\WINDOWS\Installer\{B422037C-FCBE-4D18-8A10-0B9FFA3F6EC2}\CoolzhuApplicationIcon,0`；缓存 ICO、最终 CZ ICO 与 Tauri ICO 的 SHA-256 均为 `A8852F903D7F0C5246F9567E59666CC8FEF763E0A3E0095A2CE3DB26703E4DB9`。这是快捷方式/图标文件级证据，不替代桌面截图或视觉验收。
+- 桌面视觉仍为 `NOT_CAPTURED`：Sky 不暴露 desktop，Snipping 两次只抓到 Codex 且未另存；用户需手动补传真实桌面图。公共 `.lnk` target/IconLocation 与最终 CZ/Tauri ICO hash 的文件证据已通过，但不替代桌面视觉验收。
+- Tauri 最终 43 passed / 3 failed / 0 ignored（3 个历史 metrics fixture 缺失）保持已知限制；上述隔离实装五项已通过，桌面视觉证据仍待用户补传。
+
+## P7-C.5 全控件与后端对齐验收（2026-09-05，进行中）
+
+- 真实模型验收使用已配置的 GLM-5.2 与 agnes，不以 Haiku 代替：GLM-5.2 文本短轮已成功，原生证据为 `tmp/qa-p7-installed-0.2.10-2026-09-03/screenshots/p7c5-real-glm-5.2-text-success-sky-2026-09-04.png`；agnes 对自建 QA 聊天室中的截图附件给出了对应界面描述，Web 证据为 `tmp/qa-p7-control-alignment-2026-09-05/01-agnes-web-ui-browser-cua.png`。agnes 返回消息未提供完整执行来源字段，因此仅记录未观察到回退提示，不宣称已由全链路字段证明无回退。本轮恢复后未重复这些已成功请求。
+- 修复前控件库存包含 248 个静态原生交互元素、111 组 `data-action`；按真实源码已分为 93 组后端 route/method/handler 核验、12 组纯前端、6 组浏览器/Tauri 宿主分支。这是静态链路分类，不是测试通过数；动态生成控件和分隔线仍在独立补漏。
+- 自建 QA 会话/房间的创建、保存、激活、分叉、空历史重置、权限读取等有接口证据；项目文件、搜索、记忆、MCP、音频及视觉 readiness 已做有限检查。详细证据为 `tmp/qa-p7-control-alignment-2026-09-05/07-request-evidence.json`，区分 45 条本轮请求与 14 条此前变更记录。历史未捕获的 HTTP 状态和时刻保持 null，不反推或补造。
+- 项目测试曾临时切换到 tmp fixture，随后恢复原工作区、主聊天室与 GLM-5.2；这包含状态变更，不能称纯只读。fixture 没有独立 Git 根，worktree diff 可能解析父仓库，因此不计为隔离 diff PASS。空 QA 房间附件真实为 `total=0/items.length=0`，全局附件索引数量不混入房间结果。
+- 当前依赖状态：浏览器桥接未连接，STT 不可用，MCP 服务尚未连接，部分视觉接口为预留/未运行。HTTP 200 和接口存在不代表这些功能已实装通过；未通过自动提权、安装服务或连接第三方来消除依赖限制。
+- 主任务只读截图与 DOM 几何确认 1280×720 双侧栏下中央为 418 px，但用户消息正文仅约 98 px、助手正文约 158 px，属于真实窄正文布局问题；截图与审核在 `tmp/qa-p7-control-alignment-2026-09-05/07-supervisor-current-web-layout.png` 和同目录 `07-supervisor-layout-review.md`。另有会话选择器仅 click 的键盘缺口，以及工具目录按条目存在假报可用的静态问题，已交代码会话进行最小修正，尚未在本条记录中宣称修复完成。
+- 独立测试会话的浏览器 provider 当前不可用，Windows 原生通道亦不可用；主任务 Web 只读审核图不能冒充独立 GUI 操作、Tauri 或桌面图标截图。全控件验收、修后安装包与最终 PR 仍未闭环。
+
+## P7-C.5 控件修正与候选复验（2026-09-06，进行中）
+
+- 已取消并删除五小时启动定时 `5-p7-c-5`；本轮由用户手动继续，未创建替代定时，未使用新的额度恢复券。
+- 实现会话已将会话选择器及选项改为原生 button，补充展开状态 ARIA、Escape 关闭与选中后回焦；局部样式恢复普通、悬停、焦点和选中金色，选中项悬停不再被全局 button 样式覆盖。主任务已审核源码，但键盘实际操作和选中态截图仍待独立 GUI 验收。
+- 消息列表新增基于容器宽度的 560px 紧凑布局：头像 28px，正文单独一列，时间移到正文下一行；宽区保留既有三列及金、玉、蓝透明光泽。工具目录状态改为按 `executable_now === true` 计数，空目录、全部不可执行、部分可执行分开显示；“计算资源”改为“电脑操作”，按钮保持“管理”，不再用目录存在假报可执行。
+- 最终候选离线构建 exit 0，二进制 SHA-256 为 `187F86CC0A92D674A3233C8E4D72F33DC86066E64E5641B05A114A45F5D0D26E`。独立最终 Web 测试为 8 + 1 + 925 = 934 passed / 0 failed，exit 0；Node 语法检查与临时工具三态执行测试均 exit 0。证据在 `tmp/qa-p7-control-alignment-2026-09-06/12-web-console-build.*`、`13-final-*`，不以早先陈旧 exit 文件替代最终日志。
+- 隔离候选 `127.0.0.1:18765` 使用自建样例会话与四条合成消息，真实 LLM 关闭。独立测试保存原始 1280×720 截图 `14-layout-bottom.png`、`15-layout-top.png`，主任务逐张查看确认宽区消息可读与颜色层次保留；两图均为左栏收起、右栏展开，不能替代双栏展开的窄区验收。Rust 围栏目前是普通文本，本轮未将其记为 Markdown 渲染通过。
+- 双栏展开顶部/底部及右栏收起的三张补图尚未取得：独立测试续轮时 CUA 返回无浏览器，原生 Sky 通道亦未恢复。候选服务与测试数据保留，未使用其他截图通道绕过限制；主任务请求重新打开候选预览仅返回 queued，不能宣称连接恢复。后续须先补这三张图及真实控件操作，再进入修后打包安装与 PR。
+- 新增仓库内可重复测试入口 `modules/gui-web/packages/web-console/tests/ui-control-contracts.cjs`。主任务审核后由独立测试执行 `node modules/gui-web/packages/web-console/tests/ui-control-contracts.cjs`，真实 exit 0、stderr 空；前三项在 DOM stub 上执行真实渲染函数验证工具三态，第四项仅作会话与窄布局的源契约断言，均不冒充 GUI 操作。原始日志为同证据目录的 `19-ui-control-contracts.stdout.log`、`.stderr.log`、`.exit.txt`。
+- 独立代码会话补齐14个遗漏动态控件族的源码链路，记录于同证据目录 `20-inventory-gap-mapping.md`，逐项标明前端状态、读取、写入、删除、系统选择器和模型进程依赖。主任务抽核真实路由与 IDE 关闭处理，校正“关闭未保存标签”并非写盘，并将后续用例限制在常用成功路径及必要的取消/恢复。此为 STATIC 映射补充，未改旧库存，不计14项 GUI 通过。
+
+## P7-C.5 三项 Tauri 失败修复（2026-09-06）
+
+- 用户要求修复未通过项。根查明：三项测试依赖 `generated-previews-20260617/stabilized-metrics.json`，而 `scripts/project-delivery.ps1:37` 明确排除该临时预览目录；历史 metrics 与生成 manifest 均缺失，不能从最终 PNG 假造生成时 scale 数值。
+- 代码会话 `p7c5_code_r4` 仅修改 Tauri `src/main.rs` 的 `#[cfg(test)]` 模块：移除历史 JSON 依赖，按旧 Python `face_bbox` 算法读取当前 `pet_action_frames` 素材，保留肤色条件、8邻域、边界坐标、候选选择以及原 1.08 / 0.08 / 1.05 比例阈值。未识别到脸部则明确失败；未删除或忽略原三项测试，未放宽当前 PNG 的其他几何断言。
+- 生成过程的 uniform_fit/face_scale 部分改为已跟踪生成脚本的限定区段源码契约，明确只证明当前生成策略；当前 PNG 的脸部比例及其他几何属性直接测量。没有声称恢复历史 scale_min/max，也不将源码策略或像素测量冒充 GUI 验收。未改 PNG、主题、交付过滤、生产窗口逻辑或后端业务。
+- 主任务审核算法及全部差异后，由原独立测试会话 `p7c5_test_r3` 执行三个原失败用例：每项 1 passed / 0 failed / exit 0。再执行 Tauri 完整套件：**46 passed / 0 failed / 0 ignored，exit 0**，用时1.89秒。此前43/3属于历史基线，本节取代其作为当前源码的最终结果，但不反改历史日志。
+- 独立 Python 基线与 Rust `--nocapture` 日志的24帧路径、bbox、宽高完全一致，`matched=24/mismatches=0`；武术帧内比例45/42≈1.07143，与idle中点偏差≈0.02247，成功帧比例1.0。原始证据在 `tmp/qa-p7-control-alignment-2026-09-06/21-current-pet-face-baseline.json`、`24-python-rust-parity.json`、`24-pet_*.log`、`25-tauri-full.log` 与对应退出码文件。
+- 测试代码离线 `cargo build --tests`、fmt及差异检查通过；24张基线PNG哈希不变。实现构建和hash证据为同目录 `23-*`；根审核的 Tauri 源文件 SHA-256 为 `A0BD83F354C4B3A15E9F2B230202231D803CAA90B4AD2A4713B903E02205D536`。本轮未重复Web934项或已成功的真实模型请求。
+- Computer Use更新至26.901.51231后，独立测试再次检查仍为 CUA `apps: [] / browsers: []`、Sky `Trusted RPC service is not configured: sky`。18765隔离候选服务正常；新GUI截图、会话键盘和金色选中态操作仍受阻，不能称每个控件均已通过。当前修正尚未打包安装，尚未提交/推送PR，五小时定时仍已取消。
+
+## P7-C.6 用户调整发布顺序（2026-09-06）
+
+- 用户明确要求“先打包安装提交PR”。据此先将已审核修正纳入0.2.11 Release候选、安装验证并提交PR；GUI截图与全控件验收缺口继续记录，不再作为创建PR的前置条件，也不因此宣称它们已完成。
+- 源码提交仅纳入本轮已审核的Web选择器/消息布局/工具状态修正、可重复控件测试、Tauri测量测试修复及本工作日志。不提交tmp、运行时会话、凭据、安装包或截图；不自动合并PR，不强推分支。
+- 后续安装结果、产物hash和PR链接须以实际输出补记。本条仅记录发布顺序变更，不代表安装或PR已完成。

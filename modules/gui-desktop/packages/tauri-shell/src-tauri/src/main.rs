@@ -1606,8 +1606,9 @@ mod tests {
     const MAIN_RS: &str = include_str!("main.rs");
     const CARGO_TOML: &str = include_str!("../Cargo.toml");
     const PET_MINI_HTML: &str = include_str!("../../ui/pet-mini.html");
-    const PET_STABILIZED_METRICS_RELATIVE_PATH: &str =
-        "../ui/assets/pet-actions/generated-previews-20260617/stabilized-metrics.json";
+    const PET_STABILIZER_PY: &str = include_str!(
+        "../../ui/assets/pet-actions/generated-sheets-20260617/stabilize_pet_frames.py"
+    );
     const PET_FRAME_CANVAS: u32 = 256;
     const PET_FRAME_RENDER_SCALE: f32 = 0.5;
     const PET_FRAME_DEFAULT_CENTER_DRIFT_TOLERANCE: f32 = 24.0;
@@ -1615,25 +1616,95 @@ mod tests {
     const PET_FRAME_VISUAL_DRIFT_TOLERANCE: f32 = 14.0;
     const PET_FRAME_EDGE_CUT_RATIO_TOLERANCE: f32 = 0.35;
 
-    fn pet_stabilized_metrics() -> serde_json::Value {
-        let path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PET_STABILIZED_METRICS_RELATIVE_PATH);
-        let contents = std::fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!(
-                "historical pet metrics fixture is required at {}: {error}",
-                path.display()
-            )
-        });
-        serde_json::from_str(&contents).unwrap_or_else(|error| {
-            panic!(
-                "historical pet metrics fixture at {} must be valid JSON: {error}",
-                path.display()
-            )
-        })
-    }
-
     fn normalized_main_source() -> String {
         MAIN_RS.replace("\r\n", "\n").replace('\r', "\n")
+    }
+
+    fn normalized_pet_stabilizer_source() -> String {
+        PET_STABILIZER_PY.replace("\r\n", "\n").replace('\r', "\n")
+    }
+
+    fn bounded_source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start_index = source
+            .find(start)
+            .unwrap_or_else(|| panic!("未找到源码契约起点: {start}"));
+        let section_start = start_index + start.len();
+        let end_index = source[section_start..]
+            .find(end)
+            .unwrap_or_else(|| panic!("未找到源码契约终点: {end}"));
+        &source[section_start..section_start + end_index]
+    }
+
+    fn assert_stabilizer_source_line(section: &str, expected: &str, description: &str) {
+        assert!(
+            section.lines().any(|line| line.trim() == expected),
+            "{description}源码契约缺少精确语句: {expected}"
+        );
+    }
+
+    fn assert_pet_stabilizer_policy_contract() {
+        let source = normalized_pet_stabilizer_source();
+        let policies = bounded_source_section(
+            &source,
+            "STATE_POLICIES = {",
+            "\n}\n\nSTATE_FRAME_SELECTIONS",
+        );
+        for (state, expected) in [
+            (
+                "working",
+                "\"working\": {\"mode\": \"uniform_fit\", \"anchor\": \"baseline\"},",
+            ),
+            (
+                "sweeping",
+                "\"sweeping\": {\"mode\": \"uniform_fit\", \"anchor\": \"baseline\"},",
+            ),
+            (
+                "sword-flight",
+                "\"sword-flight\": {\"mode\": \"uniform_fit\", \"anchor\": \"center\", \"center_y\": 132},",
+            ),
+            (
+                "sleeping",
+                "\"sleeping\": {\"mode\": \"uniform_fit\", \"anchor\": \"center\", \"center_y\": 134},",
+            ),
+            (
+                "success",
+                "\"success\": {\"mode\": \"face_scale\", \"anchor\": \"baseline\"},",
+            ),
+            (
+                "perform_martial",
+                "\"perform_martial\": {\"mode\": \"face_scale\", \"anchor\": \"baseline\"},",
+            ),
+        ] {
+            assert_stabilizer_source_line(
+                policies,
+                expected,
+                &format!("{state} 的状态策略"),
+            );
+        }
+
+        let stabilize =
+            bounded_source_section(&source, "def stabilize() -> None:\n", "\n\nif __name__");
+        let uniform_fit = bounded_source_section(
+            stabilize,
+            "        if policy[\"mode\"] == \"uniform_fit\":\n",
+            "        elif policy[\"mode\"] == \"face_scale\":\n",
+        );
+        assert_stabilizer_source_line(
+            uniform_fit,
+            "scales = [uniform_fit_scale(frames, state)] * len(frames)",
+            "uniform_fit 分支的共享 scale",
+        );
+
+        let face_scale = bounded_source_section(
+            stabilize,
+            "        elif policy[\"mode\"] == \"face_scale\":\n",
+            "        elif policy[\"mode\"] == \"height_crop\":\n",
+        );
+        assert_stabilizer_source_line(
+            face_scale,
+            "scales = [per_frame_face_scale(frame) for frame in frames]",
+            "face_scale 分支",
+        );
     }
 
     #[test]
@@ -2571,20 +2642,9 @@ mod tests {
 
     #[test]
     fn pet_wuxia_frames_keep_policy_stable_scale_and_anchors() {
-        let metrics = pet_stabilized_metrics();
-        for state in ["working", "sweeping", "sword-flight", "sleeping"] {
-            let summary = &metrics[state]["summary"];
-            assert_eq!(
-                metrics[state]["policy"]["mode"], "uniform_fit",
-                "{state} should preserve one generated-sheet scale across the whole action"
-            );
-            let min_scale = summary["scale_min"].as_f64().unwrap_or_default();
-            let max_scale = summary["scale_max"].as_f64().unwrap_or_default();
-            assert!(
-                (max_scale - min_scale).abs() <= f64::EPSILON,
-                "{state} should not have per-frame scale changes: min={min_scale}, max={max_scale}"
-            );
-        }
+        // 生成时的 uniform_fit scale 无法从最终 PNG 反推；这里仅锁定已跟踪脚本的
+        // 四个状态策略与共享 scale 分支，几何断言仍直接读取当前运行时 PNG。
+        assert_pet_stabilizer_policy_contract();
 
         for state in [
             "idle",
@@ -2647,25 +2707,32 @@ mod tests {
 
     #[test]
     fn pet_martial_frames_keep_character_scale_consistent_with_idle() {
-        let metrics = pet_stabilized_metrics();
-        let martial = &metrics["perform_martial"];
-        assert_eq!(
-            martial["policy"]["mode"], "face_scale",
-            "martial effects must not control the character scale"
-        );
-
-        let martial_min = martial["summary"]["face_height_min"]
-            .as_f64()
-            .expect("martial face height minimum");
-        let martial_max = martial["summary"]["face_height_max"]
-            .as_f64()
-            .expect("martial face height maximum");
-        let idle_min = metrics["idle"]["summary"]["face_height_min"]
-            .as_f64()
-            .expect("idle face height minimum");
-        let idle_max = metrics["idle"]["summary"]["face_height_max"]
-            .as_f64()
-            .expect("idle face height maximum");
+        // 面部测量只覆盖当前 pet_action_frames 指向的 PNG；不读取、生成或回填历史 metrics。
+        assert_pet_stabilizer_policy_contract();
+        let martial = pet_face_measurements("perform_martial");
+        let idle = pet_face_measurements("idle");
+        let martial_min = martial
+            .iter()
+            .map(|measurement| measurement.height)
+            .min()
+            .expect("perform_martial 当前 PNG 必须识别到至少一帧面部")
+            as f64;
+        let martial_max = martial
+            .iter()
+            .map(|measurement| measurement.height)
+            .max()
+            .expect("perform_martial 当前 PNG 必须识别到至少一帧面部")
+            as f64;
+        let idle_min = idle
+            .iter()
+            .map(|measurement| measurement.height)
+            .min()
+            .expect("idle 当前 PNG 必须识别到至少一帧面部") as f64;
+        let idle_max = idle
+            .iter()
+            .map(|measurement| measurement.height)
+            .max()
+            .expect("idle 当前 PNG 必须识别到至少一帧面部") as f64;
 
         assert!(
             martial_max / martial_min <= 1.08,
@@ -2750,22 +2817,201 @@ mod tests {
 
     #[test]
     fn pet_success_frames_do_not_mix_closeup_character_scales() {
-        let metrics = pet_stabilized_metrics();
-        let success = &metrics["success"];
-        assert_eq!(
-            success["policy"]["mode"], "face_scale",
-            "success poses should be normalized by the character face, not effects"
-        );
-        let min = success["summary"]["face_height_min"]
-            .as_f64()
-            .expect("success face height minimum");
-        let max = success["summary"]["face_height_max"]
-            .as_f64()
-            .expect("success face height maximum");
+        // 成功帧同样只验证当前 PNG 的 face_bbox；无法识别面部时 helper 会直接失败。
+        assert_pet_stabilizer_policy_contract();
+        let success = pet_face_measurements("success");
+        let min = success
+            .iter()
+            .map(|measurement| measurement.height)
+            .min()
+            .expect("success 当前 PNG 必须识别到至少一帧面部") as f64;
+        let max = success
+            .iter()
+            .map(|measurement| measurement.height)
+            .max()
+            .expect("success 当前 PNG 必须识别到至少一帧面部") as f64;
         assert!(
             max / min <= 1.05,
             "success frames should not jump in size: min={min}, max={max}"
         );
+    }
+
+    #[derive(Debug)]
+    struct PetFaceMeasurement {
+        bbox: (u32, u32, u32, u32),
+        width: u32,
+        height: u32,
+    }
+
+    fn pet_face_measurements(state: &str) -> Vec<PetFaceMeasurement> {
+        pet_action_frames(state)
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let bbox = read_png_face_bbox(frame);
+                let measurement = PetFaceMeasurement {
+                    bbox,
+                    width: bbox.2 - bbox.0,
+                    height: bbox.3 - bbox.1,
+                };
+                println!(
+                    "pet_face_measurement state={state} frame={index} path={frame} bbox=[{}, {}, {}, {}] face_width={} face_height={}",
+                    measurement.bbox.0,
+                    measurement.bbox.1,
+                    measurement.bbox.2,
+                    measurement.bbox.3,
+                    measurement.width,
+                    measurement.height
+                );
+                measurement
+            })
+            .collect()
+    }
+
+    fn read_png_face_bbox(frame: &str) -> (u32, u32, u32, u32) {
+        let asset_path = frame.split('?').next().unwrap_or(frame);
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../ui")
+            .join(asset_path);
+        let file = File::open(&path).unwrap_or_else(|error| {
+            panic!("无法打开当前桌宠 PNG {}: {error}", path.display());
+        });
+        let decoder = png::Decoder::new(file);
+        let mut reader = decoder.read_info().unwrap_or_else(|error| {
+            panic!("无法读取当前桌宠 PNG {}: {error}", path.display());
+        });
+        let mut buffer = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buffer).unwrap_or_else(|error| {
+            panic!("无法解码当前桌宠 PNG {}: {error}", path.display());
+        });
+        assert!(
+            info.width > 0 && info.height > 0,
+            "当前桌宠 PNG {} 不能为空尺寸",
+            path.display()
+        );
+        assert!(
+            matches!(info.bit_depth, png::BitDepth::Eight),
+            "当前桌宠 PNG {} 必须是 8-bit，实际为 {:?}",
+            path.display(),
+            info.bit_depth
+        );
+        let bytes = &buffer[..info.buffer_size()];
+        let channels = match info.color_type {
+            png::ColorType::Rgba => 4,
+            png::ColorType::Rgb => 3,
+            png::ColorType::GrayscaleAlpha => 2,
+            png::ColorType::Grayscale => 1,
+            png::ColorType::Indexed => {
+                panic!(
+                    "当前桌宠 PNG {} 使用了不支持的 indexed 色彩类型",
+                    path.display()
+                );
+            }
+        };
+        let pixel_count = (info.width * info.height) as usize;
+        let mut skin = vec![false; pixel_count];
+        for y in 0..info.height {
+            for x in 0..info.width {
+                let index = ((y * info.width + x) as usize) * channels;
+                let (red, green, blue, alpha) = match info.color_type {
+                    png::ColorType::Rgba => (
+                        bytes[index],
+                        bytes[index + 1],
+                        bytes[index + 2],
+                        bytes[index + 3],
+                    ),
+                    png::ColorType::Rgb => (bytes[index], bytes[index + 1], bytes[index + 2], 255),
+                    png::ColorType::GrayscaleAlpha => {
+                        let gray = bytes[index];
+                        (gray, gray, gray, bytes[index + 1])
+                    }
+                    png::ColorType::Grayscale => {
+                        let gray = bytes[index];
+                        (gray, gray, gray, 255)
+                    }
+                    png::ColorType::Indexed => unreachable!("indexed 色彩类型已在上方拒绝"),
+                };
+                if alpha > 80
+                    && red > 145
+                    && green > 70
+                    && green < 220
+                    && blue > 45
+                    && f64::from(red) > f64::from(green) * 1.04
+                    && f64::from(green) > f64::from(blue) * 1.03
+                    && red - blue > 45
+                {
+                    skin[(y * info.width + x) as usize] = true;
+                }
+            }
+        }
+
+        let mut seen = vec![false; pixel_count];
+        let mut candidates = Vec::new();
+        for y in 0..info.height {
+            for x in 0..info.width {
+                let start = (y * info.width + x) as usize;
+                if !skin[start] || seen[start] {
+                    continue;
+                }
+
+                let mut queue = VecDeque::from([(x, y)]);
+                seen[start] = true;
+                let mut area = 0u32;
+                let mut left = x;
+                let mut right = x + 1;
+                let mut top = y;
+                let mut bottom = y + 1;
+
+                while let Some((current_x, current_y)) = queue.pop_front() {
+                    area += 1;
+                    left = left.min(current_x);
+                    right = right.max(current_x + 1);
+                    top = top.min(current_y);
+                    bottom = bottom.max(current_y + 1);
+
+                    let x_start = current_x.saturating_sub(1);
+                    let x_end = current_x.saturating_add(1).min(info.width - 1);
+                    let y_start = current_y.saturating_sub(1);
+                    let y_end = current_y.saturating_add(1).min(info.height - 1);
+                    for next_y in y_start..=y_end {
+                        for next_x in x_start..=x_end {
+                            if next_x == current_x && next_y == current_y {
+                                continue;
+                            }
+                            let index = (next_y * info.width + next_x) as usize;
+                            if skin[index] && !seen[index] {
+                                seen[index] = true;
+                                queue.push_back((next_x, next_y));
+                            }
+                        }
+                    }
+                }
+
+                let face_width = right - left;
+                let face_height = bottom - top;
+                let aspect = f64::from(face_width) / f64::from(face_height.max(1));
+                let center_x = f64::from(left + right) / 2.0;
+                if area >= 200
+                    && (0.7..=1.4).contains(&aspect)
+                    && (20..=120).contains(&face_width)
+                    && (20..=120).contains(&face_height)
+                    && (center_x - f64::from(info.width) / 2.0).abs()
+                        <= f64::from(info.width) * 0.28
+                    && f64::from(top) < f64::from(info.height) * 0.65
+                {
+                    // 元组顺序与 Python max(candidates) 相同，保留同面积时的 tie-break。
+                    candidates.push((area, left, top, right, bottom));
+                }
+            }
+        }
+
+        let (_, left, top, right, bottom) = candidates.into_iter().max().unwrap_or_else(|| {
+            panic!(
+                "当前桌宠 PNG {} 无法识别角色面部（skin_components 无合格候选）",
+                path.display()
+            )
+        });
+        (left, top, right, bottom)
     }
 
     #[derive(Debug)]

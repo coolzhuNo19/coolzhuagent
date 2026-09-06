@@ -8153,6 +8153,56 @@ body.ui-3d .ui-redesign button[data-action*="revoke"] {
   background: linear-gradient(180deg, rgba(62, 31, 31, 0.88), rgba(24, 17, 18, 0.96));
 }
 
+/* 会话下拉选项是原生 button；局部恢复普通、悬停/焦点与选中态的明确层级。 */
+body.ui-3d .ui-redesign .session-select-dropdown .session-option {
+  min-height: 24px;
+  padding: 2px 6px;
+  color: var(--control-text);
+  text-align: left;
+  border-color: rgba(111, 143, 131, 0.42);
+  background: linear-gradient(180deg, rgba(15, 34, 34, 0.92), rgba(5, 16, 19, 0.96));
+  box-shadow: var(--control-inner-highlight), var(--control-shadow);
+  cursor: pointer;
+}
+
+body.ui-3d .ui-redesign .session-select-dropdown .session-option:hover:not(:disabled) {
+  color: #eff8f2;
+  border-color: rgba(143, 211, 177, 0.76);
+  background: var(--control-surface-hover);
+  box-shadow:
+    inset 0 1px 0 rgba(236, 255, 244, 0.12),
+    0 7px 17px rgba(0, 0, 0, 0.32),
+    0 0 12px rgba(92, 170, 134, 0.1);
+}
+
+body.ui-3d .ui-redesign .session-select-dropdown .session-option:focus-visible {
+  outline: 2px solid rgba(143, 211, 177, 0.96);
+  outline-offset: 2px;
+  border-color: var(--control-border-focus);
+  box-shadow:
+    inset 0 2px 7px rgba(0, 0, 0, 0.42),
+    0 0 0 2px rgba(92, 170, 134, 0.2),
+    0 0 18px rgba(92, 170, 134, 0.12);
+}
+
+body.ui-3d .ui-redesign .session-select-dropdown .session-option.is-active,
+body.ui-3d .ui-redesign .session-select-dropdown .session-option[aria-selected="true"],
+body.ui-3d .ui-redesign .session-select-dropdown .session-option.is-active:hover:not(:disabled),
+body.ui-3d .ui-redesign .session-select-dropdown .session-option[aria-selected="true"]:hover:not(:disabled) {
+  color: #1b1300;
+  border-color: #8a650d;
+  background: linear-gradient(180deg, #ffe36d, #ffb11a);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 241, 190, 0.58),
+    0 0 12px rgba(215, 179, 90, 0.3);
+}
+
+body.ui-3d .ui-redesign .session-select-dropdown .session-option.is-active:focus-visible,
+body.ui-3d .ui-redesign .session-select-dropdown .session-option[aria-selected="true"]:focus-visible {
+  outline: 2px solid rgba(143, 211, 177, 0.96);
+  outline-offset: 2px;
+}
+
 body.ui-3d .ui-redesign button:not(.avatar-select-trigger):not(.avatar-choice):not(.window-tab):not(.link-button):not(.agent-dropdown-trigger):not(.chat-main-action):not(.chat-rail-toggle):not(.chat-rail-overlay-close):not(.overview-workspace-name):not(.chat-right-tab):not(.chat-right-footer-action) > img,
 body.ui-3d .ui-redesign .icon-line > img,
 body.ui-3d .ui-redesign h2 > img,
@@ -15729,6 +15779,64 @@ body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message-con
 
 body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message-content pre {
   overflow: auto;
+}
+
+/* P7-C.5：由聊天消息容器宽度触发紧凑布局，避免窄中央列把时间挤占正文列。 */
+body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message-list {
+  container-type: inline-size;
+  container-name: chat-message-list;
+}
+
+@container chat-message-list (max-width: 560px) {
+  body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message {
+    grid-template-columns: 28px minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    column-gap: 8px;
+    row-gap: 3px;
+    width: min(96%, 100%);
+    max-width: 96%;
+    padding: 8px 10px 6px;
+  }
+
+  body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message > div {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message > time {
+    grid-column: 2;
+    grid-row: 2;
+    justify-self: start;
+    padding-inline: 2px;
+    font-size: 11px;
+    line-height: 1.2;
+  }
+
+  body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message .portrait,
+  body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message.thought .portrait,
+  body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message.tool .portrait,
+  body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message.computer-use .portrait {
+    width: 28px;
+    height: 28px;
+  }
+
+  body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message.user {
+    width: min(94%, 100%);
+    max-width: 94%;
+    margin-left: auto;
+    margin-right: 0;
+  }
+
+  body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message.reasoning,
+  body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message.thought,
+  body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message.tool,
+  body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message.vision-computer-use,
+  body.ui-3d .workbench-window[data-window-theme="communication-bay"] .message.computer-use {
+    width: min(94%, 100%);
+    max-width: 94%;
+    margin-left: auto;
+    margin-right: auto;
+  }
 }
 
 body.ui-3d .workbench-window[data-window-theme="communication-bay"] .chat-quick-layout-controls .chat-rail-toggle,

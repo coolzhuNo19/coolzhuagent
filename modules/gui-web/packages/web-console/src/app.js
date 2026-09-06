@@ -363,11 +363,21 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const sessionTrigger = document.querySelector('[data-role="session-trigger"]');
   const sessionWrap = document.querySelector(".session-select-wrap");
-  sessionTrigger?.addEventListener("click", () => sessionWrap?.classList.toggle("open"));
+  const setSessionListOpen = (open, { focusTrigger = false } = {}) => {
+    const isOpen = Boolean(open);
+    sessionWrap?.classList.toggle("open", isOpen);
+    sessionTrigger?.setAttribute("aria-expanded", String(isOpen));
+    if (!isOpen && focusTrigger) {
+      sessionTrigger?.focus({ preventScroll: true });
+    }
+  };
+  sessionTrigger?.addEventListener("click", () => {
+    setSessionListOpen(!sessionWrap?.classList.contains("open"));
+  });
 
   document.addEventListener("click", (event) => {
     if (!event.target.closest(".session-select-wrap")) {
-      sessionWrap?.classList.remove("open");
+      setSessionListOpen(false);
     }
     if (!event.target.closest(".agent-dropdown-wrap")) {
       const agentDropdownWrap = document.querySelector(".agent-dropdown-wrap");
@@ -380,7 +390,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   document.querySelector('[data-role="session-list"]')?.addEventListener("click", async (event) => {
-    const option = event.target.closest("[data-session-id]");
+    const option = event.target.closest("button[data-session-id]");
     if (!option) {
       return;
     }
@@ -389,7 +399,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (trigger) {
       trigger.textContent = option.textContent;
     }
-    sessionWrap?.classList.remove("open");
+    setSessionListOpen(false, { focusTrigger: true });
     await openSelectedSession();
   });
 
@@ -555,6 +565,11 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && sessionWrap?.classList.contains("open")) {
+      event.preventDefault();
+      setSessionListOpen(false, { focusTrigger: true });
+      return;
+    }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
       const active = ideState.tabs.find((tab) => tab.id === ideState.activeTabId);
       if (active?.kind === "view" && active.payload?.editable) {
@@ -11859,7 +11874,8 @@ function renderSessionList(sessions, activeId) {
   }
   list.replaceChildren();
   sessions.forEach((session) => {
-    const option = document.createElement("div");
+    const option = document.createElement("button");
+    option.type = "button";
     option.className = "session-option";
     option.dataset.sessionId = session.id;
     option.textContent = session.display_name;
@@ -13055,7 +13071,7 @@ function onToolInventoryManage(event) {
     "catalog-cli": "CLI 工具管理",
     "catalog-mcp": "MCP 工具管理",
     "catalog-skill": "Skill / 插件管理",
-    "catalog-compute-use": "compute-use 管理",
+    "catalog-compute-use": "电脑操作工具管理",
     "semantic-dispatch": "语义调度计划配置",
   };
   const title = controls.querySelector('[data-role="tool-legacy-title"]');
@@ -13266,15 +13282,32 @@ async function runMcpCall(event) {
 }
 
 function renderToolInventoryCatalogStatus(catalog) {
+  const summarize = (items) => {
+    const total = items.length;
+    const executable = items.filter((item) => item?.executable_now === true).length;
+    if (total === 0) {
+      return { executable, text: "无条目" };
+    }
+    if (executable === 0) {
+      return {
+        executable,
+        text: `可执行 0/${total}`,
+        title: `已收录 ${total} 项，当前不可执行`,
+      };
+    }
+    return { executable, text: `可执行 ${executable}/${total}` };
+  };
+
   TOOL_GROUP_DEFS.forEach((def) => {
-    const count = toolGroupItems(catalog, def, "").length;
+    const summary = summarize(toolGroupItems(catalog || {}, def, ""));
     const status = document.querySelector(`[data-role="tool-inventory-status-${def.key}"]`);
     if (!status) {
       return;
     }
-    status.textContent = count > 0 ? `可用 ${count}/${count}` : "未启用";
-    status.classList.toggle("is-online", count > 0);
-    status.classList.toggle("is-offline", count === 0);
+    status.textContent = summary.text;
+    status.title = summary.title || "";
+    status.classList.toggle("is-online", summary.executable > 0);
+    status.classList.toggle("is-offline", summary.executable === 0);
   });
 
   const items = flattenToolCatalog(catalog);
@@ -13282,22 +13315,17 @@ function renderToolInventoryCatalogStatus(catalog) {
   if (!computeRow) {
     return;
   }
-  const available = items.some((item) => {
-    const identity = `${item?.id || ""} ${item?.name || ""} ${item?.display_name || ""}`.toLowerCase();
-    return identity.includes("compute-use")
-      || identity.includes("computer-use")
-      || identity.includes("computer_use")
-      || identity.includes("computer.");
-  });
+  const summary = summarize(items.filter((item) => String(item?.id || "").toLowerCase().startsWith("computer.")));
   const status = computeRow.querySelector(".tool-inventory-status");
   const button = computeRow.querySelector('[data-action="tool-inventory-manage"]');
   if (status) {
-    status.textContent = available ? "可用" : "未启用";
-    status.classList.toggle("is-online", available);
-    status.classList.toggle("is-offline", !available);
+    status.textContent = summary.text;
+    status.title = summary.title || "";
+    status.classList.toggle("is-online", summary.executable > 0);
+    status.classList.toggle("is-offline", summary.executable === 0);
   }
   if (button) {
-    button.textContent = available ? "管理" : "启用";
+    button.textContent = "管理";
   }
 }
 

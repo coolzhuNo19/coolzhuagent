@@ -169,8 +169,8 @@
               <section class="settings-section session-settings">
                 <h2>会话与模型</h2>
                 <div class="session-select-wrap">
-                  <div class="session-select-trigger" data-role="session-trigger">尚未选择会话</div>
-                  <div class="session-select-dropdown" data-role="session-list" role="listbox"></div>
+                  <button type="button" class="session-select-trigger" data-role="session-trigger" aria-controls="session-list" aria-expanded="false" aria-haspopup="listbox">尚未选择会话</button>
+                  <div id="session-list" class="session-select-dropdown" data-role="session-list" role="listbox"></div>
                 </div>
                 <div class="session-agent-grid">
                   <label class="config-field">
@@ -295,11 +295,11 @@
                   <article class="tool-inventory-row" data-tool-inventory="compute-use">
                     <span class="tool-inventory-icon"><img src="./assets/icons-wuxia/compute-use.svg" alt="" /></span>
                     <span class="tool-inventory-copy">
-                      <strong>计算资源</strong>
-                      <small>计算资源使用控制</small>
+                      <strong>电脑操作</strong>
+                      <small>鼠标、键盘与浏览器工具</small>
                     </span>
-                    <b class="tool-inventory-status is-offline">未启用</b>
-                    <button type="button" class="mini-button" data-action="tool-inventory-manage" data-tool-target="catalog-compute-use" aria-expanded="false">启用</button>
+                    <b class="tool-inventory-status is-offline">加载中</b>
+                    <button type="button" class="mini-button" data-action="tool-inventory-manage" data-tool-target="catalog-compute-use" aria-expanded="false">管理</button>
                   </article>
                   <article class="tool-inventory-row tool-inventory-plan" data-tool-inventory="semantic-dispatch">
                     <span class="tool-inventory-icon"><img src="./assets/icons-wuxia/route-plan.svg" alt="" /></span>

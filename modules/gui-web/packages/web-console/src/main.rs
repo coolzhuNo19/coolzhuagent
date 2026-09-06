@@ -77502,7 +77502,7 @@ attach: last_assistant
         assert!(WEB_INDEX_HTML.contains("命令行工具与脚本执行"));
         assert!(WEB_INDEX_HTML.contains("模型上下文协议工具"));
         assert!(WEB_INDEX_HTML.contains("技能 / 插件扩展"));
-        assert!(WEB_INDEX_HTML.contains("计算资源使用控制"));
+        assert!(WEB_INDEX_HTML.contains("鼠标、键盘与浏览器工具"));
         assert!(WEB_INDEX_HTML.contains("按意图选择合适工具与执行路径"));
         assert!(WEB_INDEX_HTML.contains("data-action=\"tool-inventory-manage\""));
         assert!(WEB_INDEX_HTML.contains("data-role=\"tool-legacy-controls\""));
