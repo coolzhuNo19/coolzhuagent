@@ -7,6 +7,8 @@
 1. `WebSearch` 工具 30s 硬超时、无 stdout/无 result，只返回 `runtime-timeout`。
 2. 回复消息疑似被截断（长回复在句子中间戛然而止，发生在跨 agent handoff 交接消息里）。
 
+用户追加：桌面版**在标题栏点击关闭无法退出**（见第五节）。
+
 按 `docs/plans/2026-09-14-chat-tool-observability-backlog.md` 的要求，先重新取证再改代码：
 附件里 `search.coolzhu.dev`、网络保护层、截断根因都只是推测，不作为实施依据。本轮**未**按附件
 建议硬编码"Bing 抓取降级特例"，而是把后端做成可配置项 + 有限预算。
@@ -221,7 +223,54 @@ curl -X POST http://127.0.0.1:8765/api/tools/runtime-execute \
 但 `build-msi.ps1` 记录的 `COOLZHU_GIT_SHA` 取的是 `git rev-parse HEAD`（`457d980`），
 所以 `build_version` 里的 SHA 并不对应实际编译的内容。要发布可追溯的版本，需先提交再重新打包。
 
-## 五、未闭环 / 后续建议
+## 五、标题栏点击关闭无法退出（用户追加）
+
+### 5.1 复现与定位
+
+装好的 0.2.12 上点控制台窗口标题栏的关闭按钮：**窗口消失，但 `coolzhu-tauri-shell`、
+`coolzhu-web-console` 和 `coolzhu-browser-native-host` 三个进程全部存活**，8765 端口的 agent
+继续驻留——用户看到的就是"点了退出却没退出"。
+
+原因在 `build_console_window`（`modules/gui-desktop/.../src-tauri/src/main.rs`）：
+窗口的 `CloseRequested` 被改写成了
+
+```rust
+api.prevent_close();
+console_for_close.hide().ok();
+```
+
+即"拦截 + 隐藏到托盘"，窗口关闭语义被彻底占用，X 永远不可能退出应用。仓库里没有任何测试
+把这一行为钉成预期（既有的 `hide_pet` 测试只约束托盘菜单的「隐藏桌宠」）。
+
+### 5.2 修复
+
+- 关闭改为真正退出：`prevent_close()` 后调用与桌宠关闭、托盘退出同一个 `quit_application`。
+  隐藏到托盘的能力保留（托盘菜单「隐藏控制台」+ 托盘左键切换），不再借用窗口关闭语义。
+- `quit_application` 增加进程退出兜底：`app.exit(0)` 只是向事件循环投递 `RequestExit`，
+  实测在该调用路径下事件循环并未因此退出——taskkill 已成功回收 web-console（日志可见
+  `成功: 已终止 PID 8904`），但 Tauri 进程与窗口仍在。补 `std::process::exit(0)` 之后，
+  标题栏关闭 / 托盘退出 / 桌宠关闭三条路径都拿到确定的退出结果。
+- 新增回归测试 `console_window_close_quits_instead_of_only_hiding`：断言关闭路径调用
+  `quit_application`、**不出现** `.hide()`，且 `quit_application` 的兜底退出在 `app.exit` 之后。
+  该测试在修复前必然失败。
+
+### 5.3 GUI 验收
+
+在隔离 workspace（`[pet] enabled=false`，避免 web-console 自己拉起桌宠 shell 造成单实例干扰）
+下启动 web-console + 打完补丁的 tauri-shell，用桌面自动化点击窗口关闭按钮：
+
+| | 修复前（0.2.12 已安装产物） | 修复后 |
+| --- | --- | --- |
+| 窗口 | 消失（hide） | 关闭 |
+| `coolzhu-tauri-shell` | **存活** | 退出 |
+| `coolzhu-web-console` | **存活** | 被回收 |
+| 8765 agent | **继续驻留** | 结束 |
+
+排查插曲：最初带 `--web-console-pid=` 启动时壳总是秒退（exit 0），一度以为是新 bug；
+实际是 web-console 自己按 `[pet]` 配置拉起了桌宠 shell 成为"第一实例"，
+我手工启动的进程被 `tauri-plugin-single-instance` 转发参数后正常退出。关掉 `[pet]` 后复现稳定。
+
+## 六、未闭环 / 后续建议
 
 1. **`finish_reason == "length"` 仍未被消费**（问题二的最后一条候选链）：
    固定 16_384 天花板已在 2.5 移除，撞长度的概率大幅下降，但"撞上了也不告诉用户"这一点还在——
